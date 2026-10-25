@@ -1875,13 +1875,34 @@ async fn a_candidate_names_the_undrained_attempt_its_interrupted_job_waits_on() 
     store
         .db
         .execute(
-            "UPDATE attempts SET body=json_set(body,'$.lapsed',?) WHERE id=?",
-            rusqlite::params![patchweft::now() - 601.0, silent],
+            "UPDATE attempts SET body=json_set(body,'$.heal_until',?) WHERE id=?",
+            rusqlite::params![patchweft::now() - 1.0, silent],
         )
         .unwrap();
     assert_eq!(dep(&lab)["awaiting_drain"]["may_self_heal"], false);
     assert_eq!(verdict(&lab), "failed");
-    patchweft::authority::confirm_drained(&mut store, &silent).unwrap();
+    // The deadline was fixed at expiry: raising mindy's lease now does not reopen the verdict,
+    // and a report that comes later only drains the attempt.
+    configure(
+        &lab,
+        "mindy",
+        patchweft::authority::ConfigureRequest {
+            lease_seconds: Some(3600),
+            ..Default::default()
+        },
+    );
+    assert_eq!(verdict(&lab), "failed");
+    let (status, body) = executor_post(
+        &lab,
+        "claim",
+        MINDY,
+        json!({"claim_key":"silent","verified":[lab.profile],"unrecorded":silent}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(attempt_row(&lab, &silent).1);
+    assert_eq!(dep(&lab), json!({"action":action,"state":"interrupted"}));
+    assert_eq!(verdict(&lab), "failed");
     engine::retry(&mut store, &candidate.id, &[]).unwrap();
     // A report recorded undrained ends the attempt: only an operator's confirmation clears it,
     // whether the job was interrupted, failed or canceled, since `retry` refuses each.

@@ -132,7 +132,9 @@ stays interrupted for an operator. An action nobody requests any more is cancele
 instead, whatever the report.
 
 The store waits for those reports for a bounded time: two of the executor's leases
-after expiry interrupted the attempt (10 minutes for a 300-second lease). Until then,
+after expiry interrupted the attempt (10 minutes for a 300-second lease). The deadline
+is fixed when the lease expires, from the lease the executor had then, and recorded as
+the attempt's `heal_until`: changing the lease later never reopens or shortens it. Until then,
 while no report of the attempt is recorded, the job may still heal itself: the
 candidate is `pending`, as while a job is queued or running, so `wait` keeps
 waiting. A report that arrives in time settles the job as above. Once the bound

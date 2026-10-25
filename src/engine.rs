@@ -1074,19 +1074,19 @@ fn candidate_status_db(
 /// or an operator confirms it, its capacity stays held and `retry` refuses the job.
 /// `may_self_heal` is the authority's bounded judgement that its executor may still settle it.
 fn awaiting_drain(db: &Connection, action: &str) -> Result<Option<Value>> {
-    let row: Option<(String, String)> = db
+    let body: Option<String> = db
         .query_row(
-            "SELECT t.state,t.body FROM actions a JOIN attempts t ON t.id=a.attempt
+            "SELECT t.body FROM actions a JOIN attempts t ON t.id=a.attempt
              WHERE a.id=? AND t.drained=0",
             [action],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| r.get(0),
         )
         .optional()?;
-    let Some((state, body)) = row else {
+    let Some(body) = body else {
         return Ok(None);
     };
     let attempt: Attempt = serde_json::from_str(&body)?;
-    let may_self_heal = authority::may_self_heal(db, &state, false, &attempt, now())?;
+    let may_self_heal = authority::may_self_heal(db, &attempt.id, now())?;
     Ok(Some(json!({"attempt":attempt.id,
         "executor":attempt.executor.as_deref().unwrap_or(authority::LOCAL),
         "lease_expires":attempt.lease_expires,"may_self_heal":may_self_heal})))
