@@ -126,7 +126,8 @@ is judged the same way: an attempt that never started, a lost supervisor, or a
 command stopped by an interruption (`supervisor-stop`, `partition`, `fenced`,
 `revoked`) queues the action again, so a short partition heals like a long one. A
 command that had already failed on its own before such a stop keeps its exit code
-and is a failure; the evidence records the stop as `stopped_after_exit`. Requeues
+and is a failure, including one that exited before a SIGTERM reached its supervisor
+(an executor deploy); the evidence records the stop as `stopped_after_exit`. Requeues
 share one budget: three since the action's last `retry`, after which the action
 stays interrupted for an operator. An action nobody requests any more is canceled
 instead, whatever the report.

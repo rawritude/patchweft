@@ -103,6 +103,26 @@ fn reap_adopted(main: u32) {
     }
 }
 
+/// Polls the job's command until it has exited. On the exit, records whether the command ended on
+/// its own: before this supervisor signalled anything (`signaled`), and before a SIGTERM reached
+/// the supervisor. That flag is read just after the reap, so a group-wide SIGTERM that also ended
+/// the command is already set; one that came later, as an executor deploy sends, leaves the
+/// command's own exit standing.
+fn reap_command(
+    child: &mut std::process::Child,
+    status: &mut Option<std::process::ExitStatus>,
+    on_its_own: &mut bool,
+    signaled: bool,
+) -> Result<()> {
+    if status.is_none() {
+        *status = child.try_wait()?;
+        if status.is_some() {
+            *on_its_own = !signaled && !STOP.load(Ordering::SeqCst);
+        }
+    }
+    Ok(())
+}
+
 /// Operator scheduling priority for an owner; 0 (the default) removes it. Priority only orders
 /// admission: it never preempts running work or changes action identity.
 pub fn set_priority(store: &Store, owner: &str, priority: i64) -> Result<Value> {
@@ -446,7 +466,7 @@ fn execute_command(
     let mut child = command.spawn()?;
     let mut status = None;
     let mut terminating: Option<(Instant, String)> = None;
-    // Whether the command's exit was seen before any stop: only then did nothing here signal it.
+    // Whether the command ended on its own, before any stop could have ended it (`reap_command`).
     let mut exited_first = false;
     loop {
         if terminating.is_none() {
@@ -462,7 +482,10 @@ fn execute_command(
             } else {
                 None
             };
-            exited_first = reason.is_some() && status.is_some();
+            if reason.is_some() {
+                // An exit since the last poll still came before the tree is signalled below.
+                reap_command(&mut child, &mut status, &mut exited_first, false)?;
+            }
             terminating = reason.map(|reason| (Instant::now(), reason));
         }
         if let Some((time, _)) = &terminating {
@@ -472,9 +495,12 @@ fn execute_command(
                 libc::SIGKILL
             });
         }
-        if status.is_none() {
-            status = child.try_wait()?;
-        }
+        reap_command(
+            &mut child,
+            &mut status,
+            &mut exited_first,
+            terminating.is_some(),
+        )?;
         reap_adopted(child.id());
         if status.is_some() && descendants(std::process::id()).is_empty() {
             // Descendants keep the timer running, so this bounds every timeout check above.
@@ -489,11 +515,10 @@ fn execute_command(
         .code()
         .unwrap_or(128);
     let mut reason = terminating.map(|(_, reason)| reason);
-    // A command that failed on its own before the stop keeps that verdict: the stop only ended
-    // what it left running. Not after `supervisor-stop`, whose signal may have reached the command
-    // too, nor after an exit 0, since a job is not done while its descendants run.
+    // A command that failed on its own keeps that verdict: the stop only ended what it left
+    // running. An exit 0 is not one, since a job is not done while its descendants run.
     let mut stopped_after_exit = None;
-    if exited_first && code != 0 && reason.as_deref() != Some("supervisor-stop") {
+    if exited_first && code != 0 && reason.is_some() {
         stopped_after_exit = reason.take();
     } else if reason.is_some() {
         code = 124;
