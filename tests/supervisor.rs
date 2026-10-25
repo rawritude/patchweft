@@ -370,6 +370,62 @@ fn supervisor_records_its_own_timeout_as_stopping() {
     assert!(!lab.control(&claim).join("stop").exists());
 }
 
+#[test]
+fn a_command_that_failed_before_a_stop_keeps_its_own_exit() {
+    // Each command leaves a descendant the supervisor waits for, then a stop arrives. A command
+    // that had already failed on its own (or been killed, as by the OOM killer) keeps that
+    // verdict: the stop ended only what it left running. One that exited 0 is not done while its
+    // descendants run, and one still running is stopped. A SIGTERM to the supervisor may have
+    // reached the command too, so that stop decides.
+    let lab = Lab::new();
+    for (name, script, exit_code, reason) in [
+        ("failed", "exit 3", 3, None),
+        ("killed", "kill -KILL $$", 128, None),
+        ("passed", "exit 0", 124, Some("partition")),
+        ("running", "sleep 30", 124, Some("partition")),
+        ("signaled", "exit 3", 124, Some("supervisor-stop")),
+    ] {
+        let marker = lab.root.join(name);
+        let claim = lab.claim(
+            &format!("sleep 30 & touch \"$PATCHWEFT_STATE/{name}\"; {script}"),
+            None,
+            60,
+        );
+        lab.write(&claim);
+        lab.register(&claim);
+        let supervisor = lab.spawn(&claim);
+        let started = Instant::now();
+        while !marker.exists() {
+            assert!(started.elapsed() < Duration::from_secs(30), "{name}");
+            thread::sleep(Duration::from_millis(20));
+        }
+        // Several of the supervisor's polls: it has seen a command that exited.
+        thread::sleep(Duration::from_millis(400));
+        if name == "signaled" {
+            unsafe {
+                assert_eq!(libc::kill(supervisor.0.id() as i32, libc::SIGTERM), 0);
+            }
+        } else {
+            lab.stop(&claim, "partition");
+        }
+        let result = lab.result(&claim, supervisor);
+        assert_eq!(
+            (result.outcome, result.exit_code, result.reason.as_deref()),
+            (Outcome::Completed, exit_code, reason),
+            "{name}"
+        );
+        assert_eq!(result.evidence["exit_code"], exit_code, "{name}");
+        let after = reason.is_none().then_some("partition");
+        assert_eq!(result.evidence["reason"].as_str(), reason, "{name}");
+        assert_eq!(
+            result.evidence["stopped_after_exit"].as_str(),
+            after,
+            "{name}"
+        );
+        assert!(result.drained, "{name}");
+    }
+}
+
 /// A dependency of `claim` at `path` named `name`, whose digest is that of `content`.
 fn dependency(lab: &Lab, name: &str, path: PathBuf, content: &str) -> DependencyFile {
     let sample = lab.root.join(format!("sample-{}", unique()));

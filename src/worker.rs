@@ -446,6 +446,8 @@ fn execute_command(
     let mut child = command.spawn()?;
     let mut status = None;
     let mut terminating: Option<(Instant, String)> = None;
+    // Whether the command's exit was seen before any stop: only then did nothing here signal it.
+    let mut exited_first = false;
     loop {
         if terminating.is_none() {
             // A stop recorded elsewhere wins over this supervisor's own timeout.
@@ -460,6 +462,7 @@ fn execute_command(
             } else {
                 None
             };
+            exited_first = reason.is_some() && status.is_some();
             terminating = reason.map(|reason| (Instant::now(), reason));
         }
         if let Some((time, _)) = &terminating {
@@ -485,8 +488,14 @@ fn execute_command(
         .context("child result missing")?
         .code()
         .unwrap_or(128);
-    let reason = terminating.map(|(_, reason)| reason);
-    if reason.is_some() {
+    let mut reason = terminating.map(|(_, reason)| reason);
+    // A command that failed on its own before the stop keeps that verdict: the stop only ended
+    // what it left running. Not after `supervisor-stop`, whose signal may have reached the command
+    // too, nor after an exit 0, since a job is not done while its descendants run.
+    let mut stopped_after_exit = None;
+    if exited_first && code != 0 && reason.as_deref() != Some("supervisor-stop") {
+        stopped_after_exit = reason.take();
+    } else if reason.is_some() {
         code = 124;
     }
     logs_within(directory, LIMITS)?;
@@ -501,18 +510,20 @@ fn execute_command(
     } else {
         BTreeMap::new()
     };
-    Ok((
-        code,
-        json!({"exit_code":code,"reason":reason,"elapsed_seconds":started.elapsed().as_secs_f64(),
-                    "command_seconds":command_seconds,"preparation":preparation,
-                    "artifact_capture_seconds":capture_started.elapsed().as_secs_f64(),
-                    "report":report,"log_sha256":file_hash(&directory.join("output.log"))?,
-                    "artifacts":artifacts,"revision":action.revision,"profile":profile.id,"job":job.name,
-                    "identity":evidence_identity(action),"timer_seconds":timer_seconds,"host":host(),
-                    "executor":claim.executor,
-                    "budget":{"slots":claim.attempt.slots,"memory_mb":claim.attempt.memory_mb,
-                              "timeout_seconds":timeout_seconds}}),
-    ))
+    let mut evidence = json!({"exit_code":code,"reason":reason,
+        "elapsed_seconds":started.elapsed().as_secs_f64(),
+        "command_seconds":command_seconds,"preparation":preparation,
+        "artifact_capture_seconds":capture_started.elapsed().as_secs_f64(),
+        "report":report,"log_sha256":file_hash(&directory.join("output.log"))?,
+        "artifacts":artifacts,"revision":action.revision,"profile":profile.id,"job":job.name,
+        "identity":evidence_identity(action),"timer_seconds":timer_seconds,"host":host(),
+        "executor":claim.executor,
+        "budget":{"slots":claim.attempt.slots,"memory_mb":claim.attempt.memory_mb,
+                  "timeout_seconds":timeout_seconds}});
+    if let Some(stop) = stopped_after_exit {
+        evidence["stopped_after_exit"] = json!(stop);
+    }
+    Ok((code, evidence))
 }
 
 pub(crate) fn evidence_identity(action: &Action) -> Value {
