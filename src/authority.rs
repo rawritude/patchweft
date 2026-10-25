@@ -1134,7 +1134,8 @@ fn record_completion(
     let Some((action, _)) = holding(&transaction, scope, &attempt, &state)? else {
         // A2: the holder of an expired lease may still report that its attempt drained. A late
         // verdict is never recorded, so it leaves the action for an operator; without one (nothing
-        // ran, the supervisor was lost, the job was interrupted) the action is queued again.
+        // ran, the supervisor was lost, the job was interrupted) the action is queued again. Work
+        // nobody wants is canceled either way.
         if state == "interrupted" && !drained && request.drained {
             let verdictless = match request.outcome {
                 Outcome::Completed => {
@@ -1144,7 +1145,10 @@ fn record_completion(
                             .as_deref()
                             .is_some_and(|reason| INTERRUPTIONS.contains(&reason))
                 }
-                Outcome::NotStarted | Outcome::Lost | Outcome::Undeliverable => true,
+                // A result that could not be delivered may be a pass or a failure; a held lease's
+                // undeliverable report is never requeued either.
+                Outcome::Undeliverable => false,
+                Outcome::NotStarted | Outcome::Lost => true,
             };
             let detail = json!({"executor":executor,"outcome":request.outcome,
                                 "exit_code":request.exit_code});
@@ -1329,8 +1333,9 @@ fn settle_action(db: &Connection, action: &str, attempt: &str, state: &str) -> R
 }
 
 /// Drains an attempt whose lease lapsed (A2, or a claim its executor never recorded) and records
-/// `detail` with whether it was requeued. Without a verdict, an action still waiting on it goes
-/// where a lost supervisor's would; otherwise it stays interrupted.
+/// `detail` with whether it was requeued. An action still waiting on it that nobody wants is
+/// canceled; otherwise, without a verdict, it goes where a lost supervisor's would, and with one
+/// it stays interrupted.
 fn drain_lapsed(
     db: &Connection,
     attempt: &Attempt,
@@ -1343,13 +1348,16 @@ fn drain_lapsed(
         params![attempt.action, attempt.id],
         |r| r.get(0),
     )?;
-    let action_state = if verdictless && waiting > 0 {
+    let action_state = if waiting > 0 {
         let state = unsettled(db, attempt, true)?;
-        settle_action(db, &attempt.action, &attempt.id, state)?;
-        Some(state)
+        // Nobody wanting the work decides before any verdict does.
+        (state == "canceled" || verdictless).then_some(state)
     } else {
         None
     };
+    if let Some(state) = action_state {
+        settle_action(db, &attempt.action, &attempt.id, state)?;
+    }
     detail["requeued"] = json!(action_state == Some("queued"));
     event(db, "attempt.drain_reported", &attempt.id, &detail)?;
     Ok(())
@@ -1398,6 +1406,8 @@ pub fn record_result(
         Outcome::NotStarted => {
             let (state, action_state) = match reason {
                 Some("no-requesters") => ("canceled", "canceled"),
+                // Drained work nobody wants, whatever stopped it, as for a lost supervisor.
+                _ if unsettled == "canceled" => ("canceled", "canceled"),
                 // Nothing of the attempt ran, so tool drift or an infrastructure failure (setup,
                 // materialize, launch, registration) says nothing about the revision: the action
                 // waits for another claim. Undrained resources keep it held until confirmed, and
@@ -4121,6 +4131,7 @@ mod tests {
             "undeliverable",
             "spent",
             "unwanted",
+            "unwanted-verdict",
             "moved",
         ];
         let mut claims = BTreeMap::new();
@@ -4132,33 +4143,36 @@ mod tests {
             .db
             .execute("INSERT INTO requeues VALUES ('spent',3)", [])
             .unwrap();
-        stopping(
-            &store.db,
-            "unwanted",
-            &claims["unwanted"].attempt.id,
-            Some("no-requesters"),
-        )
-        .unwrap();
-        assert_eq!(expire(&mut store, now() + 3600.0, 0.0).unwrap().len(), 11);
+        for name in ["unwanted", "unwanted-verdict"] {
+            stopping(
+                &store.db,
+                name,
+                &claims[name].attempt.id,
+                Some("no-requesters"),
+            )
+            .unwrap();
+        }
+        assert_eq!(expire(&mut store, now() + 3600.0, 0.0).unwrap().len(), 12);
         // A verdict too late to record is not acted on: the action waits for an operator, and a
         // failure that might pass on a rerun keeps its human checkpoint. A command that exited 0
         // as it was stopped passed, and a timeout is a failure, as `record_result` judges them.
-        for (name, reason, exit_code) in [
-            ("failed", None, 1),
-            ("passed", None, 0),
-            ("passed-while-stopped", Some("fenced"), 0),
-            ("timed-out", Some("timeout"), 124),
-        ] {
-            let detail = late_report(
-                &mut store,
-                &claims[name],
+        // An undeliverable report may hide either, and `record_result` never requeues it.
+        for (name, outcome, reason, exit_code) in [
+            ("failed", Outcome::Completed, None, 1),
+            ("passed", Outcome::Completed, None, 0),
+            (
+                "passed-while-stopped",
                 Outcome::Completed,
-                reason,
-                exit_code,
-            );
+                Some("fenced"),
+                0,
+            ),
+            ("timed-out", Outcome::Completed, Some("timeout"), 124),
+            ("undeliverable", Outcome::Undeliverable, None, 125),
+        ] {
+            let detail = late_report(&mut store, &claims[name], outcome, reason, exit_code);
             assert_eq!(
                 detail,
-                json!({"executor":"mindy","outcome":"completed","exit_code":exit_code,
+                json!({"executor":"mindy","outcome":outcome,"exit_code":exit_code,
                        "requeued":false}),
                 "{name}"
             );
@@ -4176,7 +4190,6 @@ mod tests {
             ),
             ("lost", Outcome::Lost, None, 125),
             ("interrupted", Outcome::Completed, Some("fenced"), 143),
-            ("undeliverable", Outcome::Undeliverable, None, 125),
         ] {
             let detail = late_report(&mut store, &claims[name], outcome, reason, exit_code);
             assert_eq!(
@@ -4193,12 +4206,23 @@ mod tests {
         assert_eq!(detail["requeued"], false);
         assert_eq!(state(&store.db, "spent"), "interrupted");
         assert_eq!(requeues(&store.db, "spent"), 3);
-        // Nobody wants it any more: canceled, never queued (P3-C).
-        assert_eq!(state(&store.db, "unwanted"), "interrupted");
-        let detail = late_report(&mut store, &claims["unwanted"], Outcome::Lost, None, 125);
-        assert_eq!(detail["requeued"], false);
-        assert_eq!(state(&store.db, "unwanted"), "canceled");
-        assert_eq!(requeues(&store.db, "unwanted"), 0);
+        // Nobody wants it any more: canceled, never queued (P3-C), whether or not the report
+        // carries a verdict.
+        for (name, outcome, reason, exit_code) in [
+            ("unwanted", Outcome::Lost, None, 125),
+            (
+                "unwanted-verdict",
+                Outcome::Completed,
+                Some("no-requesters"),
+                143,
+            ),
+        ] {
+            assert_eq!(state(&store.db, name), "interrupted");
+            let detail = late_report(&mut store, &claims[name], outcome, reason, exit_code);
+            assert_eq!(detail["requeued"], false, "{name}");
+            assert_eq!(state(&store.db, name), "canceled", "{name}");
+            assert_eq!(requeues(&store.db, name), 0, "{name}");
+        }
         // An action no longer waiting on the attempt is left as it is.
         store
             .db
@@ -4218,10 +4242,12 @@ mod tests {
         register(&store.db, "mindy", 4, 4096);
         queued(&store.db, "unrecorded", 1.0);
         queued(&store.db, "reported", 2.0);
+        queued(&store.db, "verdict", 2.5);
         let first = grant(&mut store, "k1");
         let second = grant(&mut store, "k2");
+        let fourth = grant(&mut store, "k4");
         expire(&mut store, now() + 3600.0, 0.0).unwrap();
-        for name in ["unrecorded", "reported"] {
+        for name in ["unrecorded", "reported", "verdict"] {
             crate::engine::cancel(&mut store, name, "lane").unwrap();
             assert_eq!(state(&store.db, name), "interrupted");
         }
@@ -4238,12 +4264,76 @@ mod tests {
         assert_eq!(detail["requeued"], false);
         assert_eq!(state(&store.db, "reported"), "canceled");
         assert_eq!(requeues(&store.db, "reported"), 0);
+        // Nobody wanting it decides before a late verdict does.
+        let detail = late_report(&mut store, &fourth, Outcome::Completed, None, 1);
+        assert_eq!(detail["requeued"], false);
+        assert_eq!(state(&store.db, "verdict"), "canceled");
         // A requester again: a later lapse of the same work is queued as before.
         queued(&store.db, "wanted", 3.0);
         let third = lapsed_claim(&mut store, "k3");
         let id = third.attempt.id.clone();
         claim_for(&mut store, "mindy", &Scope::all(), &unrecorded("k3", &id)).unwrap();
         assert_eq!(state(&store.db, "wanted"), "queued");
+    }
+
+    #[test]
+    fn a_drained_report_nobody_requests_any_more_is_canceled_whatever_its_outcome() {
+        // The action is already stopping for its own reason when its last requester cancels, so
+        // no no-requesters stop is recorded: not started or lost, nobody wants it requeued.
+        let (_root, mut store) = lab();
+        register(&store.db, "mindy", 4, 4096);
+        queued(&store.db, "not-started", 1.0);
+        queued(&store.db, "lost", 2.0);
+        let mut claims = BTreeMap::new();
+        for (name, key) in [("not-started", "k1"), ("lost", "k2")] {
+            let claim = grant(&mut store, key);
+            let reason = stopping(&store.db, name, &claim.attempt.id, Some("timeout")).unwrap();
+            assert_eq!(reason.as_deref(), Some("timeout"));
+            crate::engine::cancel(&mut store, name, "lane").unwrap();
+            assert_eq!(state(&store.db, name), "stopping");
+            assert_eq!(
+                store.attempt(&claim.attempt.id).unwrap().stop.as_deref(),
+                Some("timeout")
+            );
+            claims.insert(name, claim);
+        }
+        for (name, outcome) in [
+            ("not-started", Outcome::NotStarted),
+            ("lost", Outcome::Lost),
+        ] {
+            let claim = &claims[name];
+            let request = finish(claim, outcome, Some("timeout"), 125, json!({}));
+            complete(
+                &mut store,
+                "mindy",
+                &Scope::all(),
+                &request,
+                Outputs::InPlace,
+            )
+            .unwrap();
+            assert_eq!(row(&store.db, &claim.attempt.id), ("canceled".into(), true));
+            assert_eq!(state(&store.db, name), "canceled", "{name}");
+            assert_eq!(requeues(&store.db, name), 0, "{name}");
+        }
+        // A reported no-requesters reason is canceled as before.
+        queued(&store.db, "reported", 3.0);
+        let claim = grant(&mut store, "k3");
+        let request = finish(
+            &claim,
+            Outcome::NotStarted,
+            Some("no-requesters"),
+            125,
+            json!({}),
+        );
+        complete(
+            &mut store,
+            "mindy",
+            &Scope::all(),
+            &request,
+            Outputs::InPlace,
+        )
+        .unwrap();
+        assert_eq!(state(&store.db, "reported"), "canceled");
     }
 
     fn unrecorded(key: &str, attempt: &str) -> ClaimRequest {

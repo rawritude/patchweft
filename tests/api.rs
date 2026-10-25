@@ -1830,7 +1830,7 @@ async fn a_candidate_names_the_undrained_attempt_its_interrupted_job_waits_on() 
         dep(&lab),
         json!({"action":action,"state":"interrupted",
                "awaiting_drain":{"attempt":attempt,"executor":"mindy","lease_expires":lease_expires,
-                                 "self_heals":true}})
+                                 "may_self_heal":true}})
     );
     // The replayed key says mindy never recorded the attempt: drained, and the job queued again.
     let (status, body) = executor_post(
@@ -1874,7 +1874,7 @@ async fn a_candidate_names_the_undrained_attempt_its_interrupted_job_waits_on() 
         let job = dep(&lab);
         assert_eq!(job["state"], state);
         assert_eq!(job["awaiting_drain"]["attempt"], json!(attempt), "{state}");
-        assert_eq!(job["awaiting_drain"]["self_heals"], false, "{state}");
+        assert_eq!(job["awaiting_drain"]["may_self_heal"], false, "{state}");
         // Confirmed drained: nothing is awaited.
         patchweft::authority::confirm_drained(&mut store, &attempt).unwrap();
         assert_eq!(dep(&lab), json!({"action":action,"state":state}));

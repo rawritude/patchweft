@@ -785,7 +785,7 @@ fn a_lost_claim_response_is_drained_and_run_again_without_an_operator() {
     assert_eq!(
         status["jobs"]["lost"]["awaiting_drain"],
         json!({"attempt":attempt,"executor":"mindy",
-               "lease_expires":lab.body("attempts", &attempt)["lease_expires"],"self_heals":true})
+               "lease_expires":lab.body("attempts", &attempt)["lease_expires"],"may_self_heal":true})
     );
     assert!(status["jobs"]["kept"].get("awaiting_drain").is_none());
     let log = lab.log("mindy");

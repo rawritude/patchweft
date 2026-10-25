@@ -120,15 +120,19 @@ never held the attempt, nothing of it ran on that host and the coordinator says
 so; the store then drains the attempt, provided it never started. A lapsed lease
 gives no verdict, so either report queues the action again, unless the late drain
 report carries one: a completed command's exit, other than a stop the store counts as
-an interruption, is never recorded and leaves the action interrupted for an operator.
-Requeues share one budget with attempts that never started: three since the
-action's last `retry`, after which the action stays interrupted for an operator. An
-action nobody requests any more is canceled instead. Until a drain is reported or
-confirmed, the job's entry in `status CANDIDATE` and in the `candidate` query
-carries `awaiting_drain`, whether the job is interrupted, failed or canceled: the
-attempt, the executor holding it, its `lease_expires`, and `self_heals`, true when
-nothing of the attempt was recorded, so its coordinator's own report can still
-settle it.
+an interruption, or a result that could not be delivered is never recorded and
+leaves the action interrupted for an operator. Requeues share one budget with
+attempts that never started: three since the action's last `retry`, after which the
+action stays interrupted for an operator. An action nobody requests any more is
+canceled instead, whatever the report. Until a drain is reported or confirmed, the
+job's entry in `status CANDIDATE` and in the `candidate` query carries
+`awaiting_drain`, whether the job is interrupted, failed or canceled: the attempt,
+the executor holding it, its `lease_expires`, and `may_self_heal`, true while nothing
+of the attempt is recorded. It says only that the coordinator's own report could
+still settle the attempt, not that one will come: a coordinator whose only report
+was refused (undrained, after its lease lapsed) never reports again. A consumer must
+bound any wait on it and then fall back to an operator's
+`recover --confirm-drained`.
 
 A remote executor's work directory holds `lock`, `pending-claim`, `ledger/`,
 `attempts/`, `repos/` (bare mirrors), `cas/` (read-only artifacts by SHA-256),
@@ -157,8 +161,9 @@ recorded the claim (see [executors](#executors)). Uncertain process or
 external-resource cleanup keeps reservations held, and so does a lapsed lease
 nothing reports: the coordinator or its work directory is gone, its binary predates
 these reports, or the job had started and its cleanup is uncertain. The job's
-`awaiting_drain` names the attempt and its executor; `self_heals: false` means a
-report was recorded undrained and only an operator can settle it. Only after
+`awaiting_drain` names the attempt and its executor; `may_self_heal: false` means a
+report was recorded undrained and only an operator can settle it, and `true` is no
+promise (see [executors](#executors)). Only after
 inspecting and draining those resources on the attempt's host should an
 authorized operator use
 `recover --confirm-drained ATTEMPT_ID`. That command records the operator's
