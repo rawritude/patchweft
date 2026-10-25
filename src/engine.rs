@@ -1031,9 +1031,15 @@ fn candidate_status_db(
     visited.remove(id);
     let mut jobs = BTreeMap::new();
     for (name, action) in &candidate.required {
-        let mut job = json!({"action":action,"state":action_state(db, action)?});
+        let state = action_state(db, action)?;
+        let mut job = json!({"action":action,"state":state});
         if let Some(reused) = candidate.reused.get(name) {
             job["reused"] = json!(reused);
+        }
+        if ["interrupted", "failed", "canceled"].contains(&state.as_str())
+            && let Some(awaiting) = awaiting_drain(db, action)?
+        {
+            job["awaiting_drain"] = awaiting;
         }
         jobs.insert(name, job);
     }
@@ -1043,10 +1049,12 @@ fn candidate_status_db(
         "blocked"
     } else if jobs.values().all(|v| v["state"] == "passed") {
         "passed"
-    } else if jobs
-        .values()
-        .any(|v| v["state"] == "failed" || v["state"] == "interrupted")
-    {
+    } else if jobs.values().any(|v| {
+        // A lapse its executor may still settle is no verdict yet: pending, as while the job is
+        // queued or running, until the report comes or the authority's bound passes (gate P2-1).
+        (v["state"] == "failed" || v["state"] == "interrupted")
+            && v["awaiting_drain"]["may_self_heal"] != true
+    }) {
         "failed"
     } else if jobs.values().all(|v| v["state"] == "canceled") {
         "canceled"
@@ -1060,6 +1068,28 @@ fn candidate_status_db(
     }
     memo.insert(id.into(), value.clone());
     Ok(value)
+}
+
+/// The undrained attempt a finished action still points at: until its executor reports the drain
+/// or an operator confirms it, its capacity stays held and `retry` refuses the job.
+/// `may_self_heal` is the authority's bounded judgement that its executor may still settle it.
+fn awaiting_drain(db: &Connection, action: &str) -> Result<Option<Value>> {
+    let body: Option<String> = db
+        .query_row(
+            "SELECT t.body FROM actions a JOIN attempts t ON t.id=a.attempt
+             WHERE a.id=? AND t.drained=0",
+            [action],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(body) = body else {
+        return Ok(None);
+    };
+    let attempt: Attempt = serde_json::from_str(&body)?;
+    let may_self_heal = authority::may_self_heal(db, &attempt.id, now())?;
+    Ok(Some(json!({"attempt":attempt.id,
+        "executor":attempt.executor.as_deref().unwrap_or(authority::LOCAL),
+        "lease_expires":attempt.lease_expires,"may_self_heal":may_self_heal})))
 }
 
 pub fn eligible(db: &Connection, action: &Action) -> Result<bool> {

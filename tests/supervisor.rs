@@ -370,6 +370,117 @@ fn supervisor_records_its_own_timeout_as_stopping() {
     assert!(!lab.control(&claim).join("stop").exists());
 }
 
+#[test]
+fn a_command_that_failed_before_a_stop_keeps_its_own_exit() {
+    // Each command leaves a descendant the supervisor waits for, then a stop arrives. A command
+    // that had already failed on its own (or been killed, as by the OOM killer) keeps that
+    // verdict: the stop ended only what it left running. That holds for a SIGTERM to the
+    // supervisor alone too, as an executor deploy sends, and for a stop that arrives within the
+    // same poll as the exit. One that exited 0 is not done while its descendants run, one still
+    // running is stopped, and one a group-wide SIGTERM ended is stopped by it.
+    enum Stop {
+        File,
+        Supervisor,
+        Group,
+        /// The command's own descendant writes the stop just after the command exits.
+        Itself,
+    }
+    let lab = Lab::new();
+    let writer = "(sleep 0.001; c=\"$PATCHWEFT_STATE/attempts/$PATCHWEFT_ATTEMPT/control\"; \
+                  printf '{\"reason\":\"partition\"}' > \"$c/stop.new\"; mv \"$c/stop.new\" \"$c/stop\") & ";
+    for (name, script, stop, exit_code, reason, after) in [
+        ("failed", "exit 3", Stop::File, 3, None, Some("partition")),
+        (
+            "killed",
+            "kill -KILL $$",
+            Stop::File,
+            128,
+            None,
+            Some("partition"),
+        ),
+        ("passed", "exit 0", Stop::File, 124, Some("partition"), None),
+        (
+            "running",
+            "sleep 30",
+            Stop::File,
+            124,
+            Some("partition"),
+            None,
+        ),
+        (
+            "deploy",
+            "exit 3",
+            Stop::Supervisor,
+            3,
+            None,
+            Some("supervisor-stop"),
+        ),
+        (
+            "group",
+            "sleep 30",
+            Stop::Group,
+            124,
+            Some("supervisor-stop"),
+            None,
+        ),
+        (
+            "same-poll",
+            "exit 3",
+            Stop::Itself,
+            3,
+            None,
+            Some("partition"),
+        ),
+    ] {
+        let marker = lab.root.join(name);
+        let writes = if matches!(stop, Stop::Itself) {
+            writer
+        } else {
+            ""
+        };
+        let claim = lab.claim(
+            &format!("sleep 30 & touch \"$PATCHWEFT_STATE/{name}\"; {writes}{script}"),
+            None,
+            60,
+        );
+        lab.write(&claim);
+        lab.register(&claim);
+        let supervisor = lab.spawn(&claim);
+        let started = Instant::now();
+        while !marker.exists() {
+            assert!(started.elapsed() < Duration::from_secs(30), "{name}");
+            thread::sleep(Duration::from_millis(20));
+        }
+        // Several of the supervisor's polls: it has seen a command that exited.
+        thread::sleep(Duration::from_millis(400));
+        let pid = supervisor.0.id() as i32;
+        match stop {
+            Stop::File => lab.stop(&claim, "partition"),
+            Stop::Supervisor => unsafe {
+                assert_eq!(libc::kill(pid, libc::SIGTERM), 0);
+            },
+            Stop::Group => unsafe {
+                assert_eq!(libc::kill(-pid, libc::SIGTERM), 0);
+            },
+            Stop::Itself => {}
+        }
+        let result = lab.result(&claim, supervisor);
+        assert_eq!(
+            (result.outcome, result.exit_code, result.reason.as_deref()),
+            (Outcome::Completed, exit_code, reason),
+            "{name}"
+        );
+        assert_eq!(result.evidence["exit_code"], exit_code, "{name}");
+        assert_eq!(result.evidence["reason"].as_str(), reason, "{name}");
+        assert_eq!(
+            result.evidence["stopped_after_exit"].as_str(),
+            after,
+            "{name}"
+        );
+        assert!(result.drained, "{name}");
+    }
+}
+
 /// A dependency of `claim` at `path` named `name`, whose digest is that of `content`.
 fn dependency(lab: &Lab, name: &str, path: PathBuf, content: &str) -> DependencyFile {
     let sample = lab.root.join(format!("sample-{}", unique()));

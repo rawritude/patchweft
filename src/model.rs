@@ -284,6 +284,17 @@ pub struct Attempt {
     pub completion: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop: Option<String>,
+    /// When expiry interrupted the attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lapsed: Option<f64>,
+    /// Until when its executor's own report may still settle it, fixed at expiry from the lease
+    /// the executor had then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heal_until: Option<f64>,
+    /// The holder's late, undrained report, refused after its lease lapsed: that executor will
+    /// not report the attempt again. Outcome, exit code, reason and time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -433,6 +444,10 @@ pub struct ClaimRequest {
     pub engine: Option<String>,
     #[serde(default)]
     pub loopback: Option<String>,
+    /// The attempt this key was just reported fenced for, which the coordinator never recorded:
+    /// nothing of it ran on that host. Sent only then, so other claims serialize as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unrecorded: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

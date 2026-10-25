@@ -218,14 +218,20 @@ every call.
 | `/v1/executor/complete` | attempt, lease, outcome, evidence, uploaded `log`/`cleanup_log`/`artifacts` → `recorded` or `fenced` | work, 600 s deadline |
 
 A claim key (1–128 visible ASCII bytes, else 400 `invalid_key`) returns the attempt it
-already claimed, so a lost response never claims twice. A `refused` entry `"*"`
+already claimed, so a lost response never claims twice. A coordinator that never
+recorded the attempt a key was `fenced` for sends the key again with
+`"unrecorded":ATTEMPT_ID`: a lapsed attempt that never started is then drained and, within
+the self-heal bound (see [operations](operations.md#executors)), its action queued again or
+canceled if nobody requests it; anything else is left as it is. Such a claim never claims
+new work. A `refused` entry `"*"`
 declines every profile. A completion first uploads each blob it names; if one is
 absent the route answers 422 `missing_blob` with `error.detail.missing` listing the
 digests to upload again. An identical completion is answered again as a replay; a
 different one for a completed attempt is 409 `completion_conflict`. A report for an
 attempt this executor no longer holds under that lease is 409 `attempt_fenced` and
 changes nothing, except that the lease holder of an expired attempt may report its
-drain. Other errors: 403 `forbidden` (no `execute` role, or `verified` outside the
+drain, and that holder's undrained report is recorded as `refused` on the attempt before
+the 409. Other errors: 403 `forbidden` (no `execute` role, or `verified` outside the
 profile grant), 403 `executor_unregistered`, 422 `invalid_evidence`.
 
 ## MCP

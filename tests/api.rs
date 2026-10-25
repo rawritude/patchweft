@@ -1807,6 +1807,141 @@ async fn claims_never_cross_project_scope() {
     assert_eq!(body["result"]["leases"][0]["status"], "fenced");
 }
 
+#[tokio::test]
+async fn a_candidate_names_the_undrained_attempt_its_interrupted_job_waits_on() {
+    let lab = Lab::new();
+    register_mindy(&lab);
+    let mut store = Store::open(&lab.root).unwrap();
+    let candidate = engine::submit(&mut store, &lab.a, &lab.profile, "agent", vec![]).unwrap();
+    let query = Query::Candidate {
+        candidate: candidate.id.clone(),
+    };
+    let dep = |lab: &Lab| lab.api.query(ALICE, &query).unwrap()["jobs"]["dep"].clone();
+    let verdict = |lab: &Lab| lab.api.query(ALICE, &query).unwrap()["state"].clone();
+    // mindy's claim is recorded, but the response never reaches it.
+    let (attempt, _, action) = claim_as_mindy(&lab, "lost").await;
+    assert_eq!(action, candidate.required["dep"]);
+    assert!(dep(&lab).get("awaiting_drain").is_none());
+    let expired = patchweft::authority::expire(&mut store, patchweft::now() + 1e6, 0.0).unwrap();
+    assert_eq!(expired, std::slice::from_ref(&attempt));
+    let lease_expires = attempt_row(&lab, &attempt).2["lease_expires"].clone();
+    assert!(lease_expires.is_f64());
+    // Nothing was recorded of the attempt, so mindy can still report its drain.
+    assert_eq!(
+        dep(&lab),
+        json!({"action":action,"state":"interrupted",
+               "awaiting_drain":{"attempt":attempt,"executor":"mindy","lease_expires":lease_expires,
+                                 "may_self_heal":true}})
+    );
+    // Not a verdict yet: the candidate is pending, as while the job is queued or running.
+    assert_eq!(verdict(&lab), "pending");
+    // The replayed key says mindy never recorded the attempt: drained, and the job queued again.
+    let (status, body) = executor_post(
+        &lab,
+        "claim",
+        MINDY,
+        json!({"claim_key":"lost","verified":[lab.profile],"unrecorded":attempt}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["fenced"], json!(attempt));
+    assert_eq!(body["result"]["claim"], Value::Null);
+    assert_eq!(dep(&lab), json!({"action":action,"state":"queued"}));
+    // A late undrained report is refused but recorded: that coordinator never reports again.
+    let (refused, lease, _) = claim_as_mindy(&lab, "refused").await;
+    patchweft::authority::expire(&mut store, patchweft::now() + 1e6, 0.0).unwrap();
+    assert_eq!(dep(&lab)["awaiting_drain"]["may_self_heal"], true);
+    let (status, error) = executor_post(
+        &lab,
+        "complete",
+        MINDY,
+        json!({"attempt":refused,"lease":lease,"outcome":"lost","exit_code":125,
+               "evidence":{},"drained":false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{error}");
+    assert_eq!(error["error"]["code"], "attempt_fenced");
+    assert_eq!(attempt_row(&lab, &refused).2["refused"]["outcome"], "lost");
+    let job = dep(&lab);
+    assert_eq!(job["awaiting_drain"]["attempt"], json!(refused));
+    assert_eq!(job["awaiting_drain"]["may_self_heal"], false);
+    assert_eq!(verdict(&lab), "failed");
+    patchweft::authority::confirm_drained(&mut store, &refused).unwrap();
+    engine::retry(&mut store, &candidate.id, &[]).unwrap();
+    // Nothing reported within two of mindy's leases after the lapse: the verdict is failed.
+    let (silent, _, _) = claim_as_mindy(&lab, "silent").await;
+    patchweft::authority::expire(&mut store, patchweft::now() + 1e6, 0.0).unwrap();
+    assert_eq!(verdict(&lab), "pending");
+    store
+        .db
+        .execute(
+            "UPDATE attempts SET body=json_set(body,'$.heal_until',?) WHERE id=?",
+            rusqlite::params![patchweft::now() - 1.0, silent],
+        )
+        .unwrap();
+    assert_eq!(dep(&lab)["awaiting_drain"]["may_self_heal"], false);
+    assert_eq!(verdict(&lab), "failed");
+    // The deadline was fixed at expiry: raising mindy's lease now does not reopen the verdict,
+    // and a report that comes later only drains the attempt.
+    configure(
+        &lab,
+        "mindy",
+        patchweft::authority::ConfigureRequest {
+            lease_seconds: Some(3600),
+            ..Default::default()
+        },
+    );
+    assert_eq!(verdict(&lab), "failed");
+    let (status, body) = executor_post(
+        &lab,
+        "claim",
+        MINDY,
+        json!({"claim_key":"silent","verified":[lab.profile],"unrecorded":silent}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(attempt_row(&lab, &silent).1);
+    assert_eq!(dep(&lab), json!({"action":action,"state":"interrupted"}));
+    assert_eq!(verdict(&lab), "failed");
+    engine::retry(&mut store, &candidate.id, &[]).unwrap();
+    // A report recorded undrained ends the attempt: only an operator's confirmation clears it,
+    // whether the job was interrupted, failed or canceled, since `retry` refuses each.
+    for (key, report, state) in [
+        (
+            "lost-undrained",
+            json!({"outcome":"lost","exit_code":125,"evidence":{}}),
+            "interrupted",
+        ),
+        (
+            "failed-undrained",
+            json!({"outcome":"completed","exit_code":1,"evidence":{"exit_code":1}}),
+            "failed",
+        ),
+        (
+            "canceled-undrained",
+            json!({"outcome":"completed","reason":"no-requesters","exit_code":143,
+                   "evidence":{"exit_code":143}}),
+            "canceled",
+        ),
+    ] {
+        let (attempt, lease, _) = claim_as_mindy(&lab, key).await;
+        let mut body = report;
+        body["attempt"] = json!(attempt);
+        body["lease"] = json!(lease);
+        body["drained"] = json!(false);
+        let (status, response) = executor_post(&lab, "complete", MINDY, body).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let job = dep(&lab);
+        assert_eq!(job["state"], state);
+        assert_eq!(job["awaiting_drain"]["attempt"], json!(attempt), "{state}");
+        assert_eq!(job["awaiting_drain"]["may_self_heal"], false, "{state}");
+        // Confirmed drained: nothing is awaited.
+        patchweft::authority::confirm_drained(&mut store, &attempt).unwrap();
+        assert_eq!(dep(&lab), json!({"action":action,"state":state}));
+        engine::retry(&mut store, &candidate.id, &[]).unwrap();
+    }
+}
+
 #[test]
 fn grant_execute_requires_read_and_reserves_local() {
     let lab = Lab::new();
@@ -2049,6 +2184,9 @@ async fn fenced_complete_discards_staged_uploads() {
     let (state, drained, body) = attempt_row(&lab, &attempt);
     assert_eq!((state.as_str(), drained), ("interrupted", true));
     assert_eq!(body["result"], Value::Null);
+    // The undrained report before it was recorded as refused, which settled the verdict for an
+    // operator: this drain releases the capacity and queues nothing.
+    assert_eq!(body["refused"]["outcome"], "lost");
     assert_eq!(
         engine::action_state(&store.db, &action).unwrap(),
         "interrupted"

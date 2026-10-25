@@ -113,7 +113,43 @@ Only `serve` expires leases, and not within one lease of its own start. An
 expired attempt is interrupted and stays undrained: its capacity is held until its
 coordinator reports the drain or an operator confirms it. A coordinator whose
 attempt was fenced stops the job, runs cleanup and may still report the drain
-under its lease; it never records the result.
+under its lease; it never records the result. A claim whose response was lost is
+not lost with it: the coordinator keeps the claim's key in `pending-claim` and
+sends it again first. If the lease lapsed meanwhile and the coordinator's ledger
+never held the attempt, nothing of it ran on that host and the coordinator says
+so; the store then drains the attempt, provided it never started. A lapsed lease
+gives no verdict, so either report queues the action again, unless the late drain
+report carries one: a completed command's exit, other than a stop the store counts as
+an interruption, or a result that could not be delivered is never recorded and
+leaves the action interrupted for an operator. A drained report under a held lease
+is judged the same way: an attempt that never started, a lost supervisor, or a
+command stopped by an interruption (`supervisor-stop`, `partition`, `fenced`,
+`revoked`) queues the action again, so a short partition heals like a long one. A
+command that had already failed on its own before such a stop keeps its exit code
+and is a failure, including one that exited before a SIGTERM reached its supervisor
+(an executor deploy); the evidence records the stop as `stopped_after_exit`. Requeues
+share one budget: three since the action's last `retry`, after which the action
+stays interrupted for an operator. An action nobody requests any more is canceled
+instead, whatever the report.
+
+The store waits for those reports for a bounded time: two of the executor's leases
+after expiry interrupted the attempt (10 minutes for a 300-second lease). The deadline
+is fixed when the lease expires, from the lease the executor had then, and recorded as
+the attempt's `heal_until`: changing the lease later never reopens or shortens it. Until then,
+while no report of the attempt is recorded and a drain could still move its action
+(requeue budget left, or nobody wants the work), the job may still heal itself: the candidate is `pending`, as while a job is queued or
+running, so `wait` keeps waiting. A report that arrives in time settles the job as
+above. Once the bound passes, once the coordinator's late report is refused for being
+undrained (it never reports again), or at once when the budget is already spent and the work is
+still wanted (any report could only leave the job interrupted), the candidate is
+`failed` for an operator, and stays so: a
+drain reported later only releases the capacity, and `retry` runs the job again.
+Only time bounds the wait, since a coordinator learns it was fenced before it has
+stopped its job and cleaned up. Until a drain is reported or confirmed, the job's
+entry in `status CANDIDATE` and in the `candidate` query carries `awaiting_drain`,
+whether the job is interrupted, failed or canceled: the attempt, the executor
+holding it, its `lease_expires`, and `may_self_heal`, the store's own bounded
+judgement that the job may still heal itself.
 
 A remote executor's work directory holds `lock`, `pending-claim`, `ledger/`,
 `attempts/`, `repos/` (bare mirrors), `cas/` (read-only artifacts by SHA-256),
@@ -136,9 +172,16 @@ stopping attempt. Accepted work outlives API or MCP disconnection.
 
 `recover` reconciles the local executor while no `worker` runs: it publishes
 finished results and reports dead supervisors. A supervisor that died before its
-command started is drained automatically. Uncertain process or external-resource
-cleanup keeps reservations held. Only after inspecting and draining those resources
-on the attempt's host should an authorized operator use
+command started is drained automatically. An attempt whose lease lapsed is drained
+without an operator when its coordinator reports the drain or reports that it never
+recorded the claim (see [executors](#executors)). Uncertain process or
+external-resource cleanup keeps reservations held, and so does a lapsed lease
+nothing reports: the coordinator or its work directory is gone, its binary predates
+these reports, or the job had started and its cleanup is uncertain. The job's
+`awaiting_drain` names the attempt and its executor; `may_self_heal: false` means
+only an operator can settle it (see [executors](#executors)). Only after
+inspecting and draining those resources on the attempt's host should an
+authorized operator use
 `recover --confirm-drained ATTEMPT_ID`. That command records the operator's
 assertion about that host's processes and external resources; it cannot establish
 the assertion. It keeps a failed, canceled or passed attempt's state and result
