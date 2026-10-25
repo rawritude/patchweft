@@ -121,10 +121,15 @@ so; the store then drains the attempt, provided it never started. A lapsed lease
 gives no verdict, so either report queues the action again, unless the late drain
 report carries one: a completed command's exit, other than a stop the store counts as
 an interruption, or a result that could not be delivered is never recorded and
-leaves the action interrupted for an operator. Requeues share one budget with
-attempts that never started: three since the action's last `retry`, after which the
-action stays interrupted for an operator. An action nobody requests any more is
-canceled instead, whatever the report. Until a drain is reported or confirmed, the
+leaves the action interrupted for an operator. A drained report under a held lease
+is judged the same way: an attempt that never started, a lost supervisor, or a
+command stopped by an interruption (`supervisor-stop`, `partition`, `fenced`,
+`revoked`) queues the action again, so a short partition heals like a long one. A
+command that had already failed on its own before such a stop keeps its exit code
+and is a failure; the evidence records the stop as `stopped_after_exit`. Requeues
+share one budget: three since the action's last `retry`, after which the action
+stays interrupted for an operator. An action nobody requests any more is canceled
+instead, whatever the report. Until a drain is reported or confirmed, the
 job's entry in `status CANDIDATE` and in the `candidate` query carries
 `awaiting_drain`, whether the job is interrupted, failed or canceled: the attempt,
 the executor holding it, its `lease_expires`, and `may_self_heal`, true while nothing

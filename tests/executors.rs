@@ -1083,7 +1083,8 @@ fn unreachable_api_self_stops_job_before_lease_expiry() {
         json!([job(
             "trapped",
             "trap 'touch \"$PATCHWEFT_STATE/termed\"; exit 143' TERM; \
-             touch \"$PATCHWEFT_STATE/trapped-started\"; while true; do sleep 0.05; done",
+             touch \"$PATCHWEFT_STATE/trapped-started\"; \
+             while ! test -f \"$PATCHWEFT_STATE/release\"; do sleep 0.05; done",
             json!({})
         )]),
         &["trapped"],
@@ -1091,6 +1092,8 @@ fn unreachable_api_self_stops_job_before_lease_expiry() {
     let candidate = lab.submit("agent");
     let remote = lab.spawn_remote(&lab.log("mindy"));
     wait_until("the job", || started(&lab.work, "trapped"));
+    let action = candidate["required"]["trapped"].as_str().unwrap();
+    let first = lab.attempt_of(action)["id"].as_str().unwrap().to_owned();
     let address = lab.address.clone();
     lab.stop_server();
     let stopped = Instant::now();
@@ -1100,22 +1103,25 @@ fn unreachable_api_self_stops_job_before_lease_expiry() {
     let elapsed = stopped.elapsed();
     assert!(elapsed > Duration::from_secs(2), "{elapsed:?}");
     assert!(elapsed < Duration::from_secs(6), "{elapsed:?}");
+    fs::remove_file(lab.work.join("trapped-started")).unwrap();
     lab.serve(&address);
+    // Reported under the held lease, the interruption is no verdict: the job runs again, as it
+    // would after a longer partition that let the lease lapse (gate P2-2).
+    wait_until("the job again", || started(&lab.work, "trapped"));
+    let attempt = lab.body("attempts", &first);
+    assert_eq!(attempt["result"]["reason"], "partition");
+    assert_eq!(lab.row("attempts", &first), ("interrupted".into(), true));
+    let completed = lab.events_of("attempt.completed");
+    assert_eq!(completed[0]["subject"], first.as_str());
+    assert_eq!(completed[0]["detail"]["requeued"], true);
+    assert!(lab.call(&["repairs"]).as_array().unwrap().is_empty());
+    fs::write(lab.work.join("release"), "").unwrap();
     assert_eq!(
         parsed(remote.wait_with_output().unwrap()),
-        json!({"executor":"mindy","launched":1})
+        json!({"executor":"mindy","launched":2})
     );
-    let action = candidate["required"]["trapped"].as_str().unwrap();
-    let attempt = lab.attempt_of(action);
-    assert_eq!(attempt["result"]["reason"], "partition");
-    assert_eq!(
-        lab.row("attempts", attempt["id"].as_str().unwrap()),
-        ("interrupted".into(), true)
-    );
-    assert!(lab.call(&["repairs"]).as_array().unwrap().is_empty());
     assert_eq!(lab.count("attempt.lease_expired"), 0);
-    lab.call(&["retry", candidate["id"].as_str().unwrap()]);
-    assert_eq!(lab.row("actions", action).0, "queued");
+    assert_eq!(lab.state_of(&candidate), "passed");
 }
 
 #[test]

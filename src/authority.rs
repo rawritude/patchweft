@@ -1137,22 +1137,9 @@ fn record_completion(
         // ran, the supervisor was lost, the job was interrupted) the action is queued again. Work
         // nobody wants is canceled either way.
         if state == "interrupted" && !drained && request.drained {
-            let verdictless = match request.outcome {
-                Outcome::Completed => {
-                    request.exit_code != 0
-                        && request
-                            .reason
-                            .as_deref()
-                            .is_some_and(|reason| INTERRUPTIONS.contains(&reason))
-                }
-                // A result that could not be delivered may be a pass or a failure; a held lease's
-                // undeliverable report is never requeued either.
-                Outcome::Undeliverable => false,
-                Outcome::NotStarted | Outcome::Lost => true,
-            };
             let detail = json!({"executor":executor,"outcome":request.outcome,
                                 "exit_code":request.exit_code});
-            drain_lapsed(&transaction, &attempt, verdictless, detail)?;
+            drain_lapsed(&transaction, &attempt, verdictless(request), detail)?;
             transaction.commit()?;
             return Ok(CompleteResponse {
                 attempt: attempt.id,
@@ -1366,6 +1353,24 @@ fn drain_lapsed(
 /// Stops after which the action may simply be retried: nothing about the revision failed.
 const INTERRUPTIONS: [&str; 4] = ["supervisor-stop", "partition", "fenced", "revoked"];
 
+/// Whether a report says nothing about the revision, so its drained action may be queued again:
+/// nothing ran, the supervisor was lost, or an interruption stopped the command (one that failed
+/// on its own first keeps its exit, gate P3-2). A result that could not be delivered may hide a
+/// pass or a failure. The one judge for reports under a held lease and late ones (gate P2-2).
+fn verdictless(request: &CompleteRequest) -> bool {
+    match request.outcome {
+        Outcome::Completed => {
+            request.exit_code != 0
+                && request
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| INTERRUPTIONS.contains(&reason))
+        }
+        Outcome::Undeliverable => false,
+        Outcome::NotStarted | Outcome::Lost => true,
+    }
+}
+
 /// The one writer of a result: every finished attempt, local or remote, ends here.
 /// `request.evidence` is recorded as given; `hash` identifies the completion for replays.
 pub fn record_result(
@@ -1391,17 +1396,23 @@ pub fn record_result(
     let requeue = unsettled == "queued";
     let (state, action_state, kind, detail) = match request.outcome {
         Outcome::Completed => {
-            let state = if request.exit_code == 0 {
-                "passed"
+            let (state, action_state) = if request.exit_code == 0 {
+                ("passed", "passed")
             } else if reason == Some("no-requesters") {
-                "canceled"
-            } else if reason.is_some_and(|reason| INTERRUPTIONS.contains(&reason)) {
-                "interrupted"
+                ("canceled", "canceled")
+            } else if verdictless(request) {
+                // An interruption ends like a lost supervisor, whether or not the lease lapsed.
+                if unsettled == "canceled" {
+                    ("canceled", "canceled")
+                } else {
+                    ("interrupted", unsettled)
+                }
             } else {
-                "failed"
+                ("failed", "failed")
             };
-            let detail = json!({"state":state,"evidence":evidence});
-            (state, state, "attempt.completed", detail)
+            let detail = json!({"state":state,"evidence":evidence,
+                                "requeued":action_state == "queued"});
+            (state, action_state, "attempt.completed", detail)
         }
         Outcome::NotStarted => {
             let (state, action_state) = match reason {
@@ -4235,6 +4246,85 @@ mod tests {
     }
 
     #[test]
+    fn an_interruption_requeues_alike_in_lease_and_after_its_lease_lapsed() {
+        // The same drained partition report, landing while the lease is held (a short blip) or
+        // after it lapsed (a long one), means the same: no verdict, so the action is queued again
+        // within the budget, or canceled if nobody wants it.
+        let (_root, mut store) = lab();
+        register(&store.db, "mindy", 16, 16384);
+        let cases = ["fresh", "spent", "unwanted"];
+        let mut claims = BTreeMap::new();
+        for (n, (case, when)) in cases
+            .iter()
+            .flat_map(|case| [(*case, "held"), (*case, "lapsed")])
+            .enumerate()
+        {
+            let name = format!("{when}-{case}");
+            queued(&store.db, &name, n as f64);
+            let claim = grant(&mut store, &format!("k{n}"));
+            assert_eq!(claim.action.id, name);
+            register_supervisor(&mut store, &claim);
+            if case == "spent" {
+                store
+                    .db
+                    .execute("INSERT INTO requeues VALUES (?,3)", [&name])
+                    .unwrap();
+            }
+            if case == "unwanted" {
+                stopping(&store.db, &name, &claim.attempt.id, Some("no-requesters")).unwrap();
+            }
+            claims.insert((case, when), claim);
+        }
+        let report = |claim: &Claim| {
+            let evidence = json!({"exit_code":124,"reason":"partition","artifacts":{}});
+            finish(claim, Outcome::Completed, Some("partition"), 124, evidence)
+        };
+        for case in cases {
+            let request = report(&claims[&(case, "held")]);
+            let response = complete(
+                &mut store,
+                "mindy",
+                &Scope::all(),
+                &request,
+                Outputs::InPlace,
+            )
+            .unwrap();
+            assert_eq!(response.status, "recorded", "{case}");
+            // Recorded like a lost supervisor's: canceled when nobody wants it.
+            let expected = if case == "unwanted" {
+                "canceled"
+            } else {
+                "interrupted"
+            };
+            assert_eq!(response.state.as_deref(), Some(expected), "{case}");
+        }
+        assert_eq!(expire(&mut store, now() + 3600.0, 0.0).unwrap().len(), 3);
+        for case in cases {
+            let request = report(&claims[&(case, "lapsed")]);
+            let response = complete(
+                &mut store,
+                "mindy",
+                &Scope::all(),
+                &request,
+                Outputs::InPlace,
+            )
+            .unwrap();
+            assert!(response.drain_recorded, "{case}");
+        }
+        for (case, expected) in [
+            ("fresh", ("queued", 1)),
+            ("spent", ("interrupted", 3)),
+            ("unwanted", ("canceled", 0)),
+        ] {
+            for when in ["held", "lapsed"] {
+                let name = format!("{when}-{case}");
+                let outcome = (state(&store.db, &name), requeues(&store.db, &name));
+                assert_eq!((outcome.0.as_str(), outcome.1), expected, "{name}");
+            }
+        }
+    }
+
+    #[test]
     fn a_lapsed_attempt_nobody_requests_any_more_is_canceled_not_requeued() {
         // A cancel after the lease lapsed leaves the interrupted action as it is and records no
         // stop; the drain that follows must not queue work nobody wants.
@@ -4725,8 +4815,15 @@ mod tests {
                 (attempt_state.into(), drained),
                 "{id}"
             );
-            // A drained attempt that never started requeues its action (review P2-1).
-            let requeued = outcome == NotStarted && reason != Some("no-requesters") && drained;
+            // A drained attempt that never started requeues its action (review P2-1), and so does
+            // one an interruption stopped (gate P2-2).
+            let interruption = outcome == Completed
+                && matches!(
+                    reason,
+                    Some("supervisor-stop" | "partition" | "fenced" | "revoked")
+                );
+            let requeued = drained
+                && (interruption || outcome == NotStarted && reason != Some("no-requesters"));
             let action_state = if requeued { "queued" } else { attempt_state };
             assert_eq!(state(&store.db, &id), action_state, "{id}");
             if requeued {
@@ -4761,7 +4858,7 @@ mod tests {
             let (kind, detail) = match outcome {
                 Completed => (
                     "attempt.completed",
-                    json!({"state":attempt_state,"evidence":recorded}),
+                    json!({"state":attempt_state,"evidence":recorded,"requeued":requeued}),
                 ),
                 NotStarted => (
                     "attempt.launch_failed",
