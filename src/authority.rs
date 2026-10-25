@@ -1288,20 +1288,22 @@ fn verified_evidence(
 /// for an operator (gate P3-2).
 const REQUEUE_BUDGET: i64 = 3;
 
+/// Whether the action may be queued again: a failure that repeats on every host ends interrupted
+/// for an operator instead of looping. The budget counts requeues since the action's last retry
+/// only (gate P3-D); `retry` resets it.
+fn budget_left(db: &Connection, action: &str) -> Result<bool> {
+    let requeued: i64 = db
+        .query_row("SELECT count FROM requeues WHERE action=?", [action], |r| {
+            r.get(0)
+        })
+        .optional()?
+        .unwrap_or(0);
+    Ok(requeued < REQUEUE_BUDGET)
+}
+
 /// The action state after an attempt that gave no verdict: canceled once drained if nobody wants
 /// the work (P3-C), queued again if drained within the budget, else interrupted for an operator.
 fn unsettled(db: &Connection, attempt: &Attempt, drained: bool) -> Result<&'static str> {
-    // Requeueing needs drained resources and a budget left: a failure that repeats on every host
-    // ends interrupted for an operator instead of looping. The budget counts requeues since the
-    // action's last retry only (gate P3-D); `retry` resets it.
-    let requeued: i64 = db
-        .query_row(
-            "SELECT count FROM requeues WHERE action=?",
-            [&attempt.action],
-            |r| r.get(0),
-        )
-        .optional()?
-        .unwrap_or(0);
     // A recorded no-requesters stop, or no requester left: a cancel of an action that is no
     // longer running records no stop, and queued work nobody requests is never claimed.
     let requested: i64 = db.query_row(
@@ -1312,7 +1314,7 @@ fn unsettled(db: &Connection, attempt: &Attempt, drained: bool) -> Result<&'stat
     let unwanted = attempt.stop.as_deref() == Some("no-requesters") || requested == 0;
     Ok(if drained && unwanted {
         "canceled"
-    } else if drained && requeued < REQUEUE_BUDGET {
+    } else if drained && budget_left(db, &attempt.action)? {
         "queued"
     } else {
         "interrupted"
@@ -1350,10 +1352,10 @@ fn settle_action(db: &Connection, action: &str, attempt: &str, state: &str) -> R
 const SELF_HEAL_LEASES: f64 = 2.0;
 
 /// Whether attempt `id`'s own executor may still settle it, so the verdict on its job waits:
-/// expiry interrupted it undrained, no report of it was recorded or refused, and the deadline
-/// fixed at expiry has not passed. The candidate's verdict and `awaiting_drain` read this, and a
-/// drain reported later requeues nothing, so a verdict once failed stays failed until an operator
-/// acts.
+/// expiry interrupted it undrained, no report of it was recorded or refused, its action has
+/// requeue budget left, and the deadline fixed at expiry has not passed. The candidate's verdict
+/// and `awaiting_drain` read this, and a drain reported later requeues nothing, so a verdict once
+/// failed stays failed until an operator acts.
 pub fn may_self_heal(db: &Connection, id: &str, now: f64) -> Result<bool> {
     let (state, drained, body): (String, bool, String) = db.query_row(
         "SELECT state,drained,body FROM attempts WHERE id=?",
@@ -1361,10 +1363,12 @@ pub fn may_self_heal(db: &Connection, id: &str, now: f64) -> Result<bool> {
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
     let attempt: Attempt = serde_json::from_str(&body)?;
+    // With the requeue budget spent, any report could only leave the action interrupted.
     if state != "interrupted"
         || drained
         || attempt.completion.is_some()
         || attempt.refused.is_some()
+        || !budget_left(db, &attempt.action)?
     {
         return Ok(false);
     }
@@ -4308,6 +4312,31 @@ mod tests {
             assert!(!heals(&store, &id, at), "{edit}");
             set(undo);
             assert!(heals(&store, &id, at), "{undo}");
+        }
+    }
+
+    #[test]
+    fn a_lapse_whose_requeue_budget_is_spent_cannot_heal() {
+        // Any report could only leave the action interrupted, so its verdict need not wait.
+        let (_root, mut store) = lab();
+        register(&store.db, "mindy", 4, 4096);
+        queued(&store.db, "first", 1.0);
+        let id = lapsed_claim(&mut store, "k1").attempt.id;
+        assert!(may_self_heal(&store.db, &id, now()).unwrap());
+        for (count, heals) in [(2, true), (3, false)] {
+            store
+                .db
+                .execute(
+                    "INSERT INTO requeues VALUES ('first',?)
+                     ON CONFLICT(action) DO UPDATE SET count=excluded.count",
+                    [count],
+                )
+                .unwrap();
+            assert_eq!(
+                may_self_heal(&store.db, &id, now()).unwrap(),
+                heals,
+                "{count}"
+            );
         }
     }
 
