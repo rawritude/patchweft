@@ -714,9 +714,10 @@ fn late_completion_is_fenced_and_drain_report_releases() {
     let reports = lab.events_of("attempt.drain_reported");
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0]["subject"], attempt.as_str());
+    // Stopped as fenced, an interruption rather than a verdict.
     assert_eq!(
         reports[0]["detail"],
-        json!({"executor":"mindy","requeued":true})
+        json!({"executor":"mindy","outcome":"completed","exit_code":124,"requeued":true})
     );
     assert!(
         lab.events_of("attempt.completed")
@@ -784,7 +785,7 @@ fn a_lost_claim_response_is_drained_and_run_again_without_an_operator() {
     assert_eq!(
         status["jobs"]["lost"]["awaiting_drain"],
         json!({"attempt":attempt,"executor":"mindy",
-               "lease_expires":lab.body("attempts", &attempt)["lease_expires"]})
+               "lease_expires":lab.body("attempts", &attempt)["lease_expires"],"self_heals":true})
     );
     assert!(status["jobs"]["kept"].get("awaiting_drain").is_none());
     let log = lab.log("mindy");

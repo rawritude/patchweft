@@ -221,8 +221,8 @@ A claim key (1–128 visible ASCII bytes, else 400 `invalid_key`) returns the at
 already claimed, so a lost response never claims twice. A coordinator that never
 recorded the attempt a key was `fenced` for sends the key again with
 `"unrecorded":ATTEMPT_ID`: a lapsed attempt that never started is then drained and its
-action queued again, and anything else is left as it is. Such a claim never claims new
-work. A `refused` entry `"*"`
+action queued again, or canceled if nobody requests it, and anything else is left as it
+is. Such a claim never claims new work. A `refused` entry `"*"`
 declines every profile. A completion first uploads each blob it names; if one is
 absent the route answers 422 `missing_blob` with `error.detail.missing` listing the
 digests to upload again. An identical completion is answered again as a replay; a

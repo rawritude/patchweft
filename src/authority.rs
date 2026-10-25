@@ -746,7 +746,8 @@ fn replay(
             && attempt.supervisor_pid.is_none()
             && attempt.completion.is_none()
         {
-            drain_lapsed(db, &attempt, executor, Some("claim-unrecorded"))?;
+            let detail = json!({"executor":executor,"reason":"claim-unrecorded"});
+            drain_lapsed(db, &attempt, true, detail)?;
         }
     }
     let fenced = claim.is_none().then_some(id);
@@ -1131,9 +1132,23 @@ fn record_completion(
         });
     }
     let Some((action, _)) = holding(&transaction, scope, &attempt, &state)? else {
-        // A2: the holder of an expired lease may still report that its attempt drained.
+        // A2: the holder of an expired lease may still report that its attempt drained. A late
+        // verdict is never recorded, so it leaves the action for an operator; without one (nothing
+        // ran, the supervisor was lost, the job was interrupted) the action is queued again.
         if state == "interrupted" && !drained && request.drained {
-            drain_lapsed(&transaction, &attempt, executor, None)?;
+            let verdictless = match request.outcome {
+                Outcome::Completed => {
+                    request.exit_code != 0
+                        && request
+                            .reason
+                            .as_deref()
+                            .is_some_and(|reason| INTERRUPTIONS.contains(&reason))
+                }
+                Outcome::NotStarted | Outcome::Lost | Outcome::Undeliverable => true,
+            };
+            let detail = json!({"executor":executor,"outcome":request.outcome,
+                                "exit_code":request.exit_code});
+            drain_lapsed(&transaction, &attempt, verdictless, detail)?;
             transaction.commit()?;
             return Ok(CompleteResponse {
                 attempt: attempt.id,
@@ -1261,9 +1276,8 @@ fn verified_evidence(
 /// for an operator (gate P3-2).
 const REQUEUE_BUDGET: i64 = 3;
 
-/// The action state after an attempt that gave no verdict: canceled once drained if a recorded
-/// no-requesters stop says nobody wants the work (P3-C), queued again if drained within the
-/// budget, else interrupted for an operator.
+/// The action state after an attempt that gave no verdict: canceled once drained if nobody wants
+/// the work (P3-C), queued again if drained within the budget, else interrupted for an operator.
 fn unsettled(db: &Connection, attempt: &Attempt, drained: bool) -> Result<&'static str> {
     // Requeueing needs drained resources and a budget left: a failure that repeats on every host
     // ends interrupted for an operator instead of looping. The budget counts requeues since the
@@ -1276,7 +1290,14 @@ fn unsettled(db: &Connection, attempt: &Attempt, drained: bool) -> Result<&'stat
         )
         .optional()?
         .unwrap_or(0);
-    let unwanted = attempt.stop.as_deref() == Some("no-requesters");
+    // A recorded no-requesters stop, or no requester left: a cancel of an action that is no
+    // longer running records no stop, and queued work nobody requests is never claimed.
+    let requested: i64 = db.query_row(
+        "SELECT COUNT(*) FROM interests WHERE action=? AND active=1",
+        [&attempt.action],
+        |r| r.get(0),
+    )?;
+    let unwanted = attempt.stop.as_deref() == Some("no-requesters") || requested == 0;
     Ok(if drained && unwanted {
         "canceled"
     } else if drained && requeued < REQUEUE_BUDGET {
@@ -1307,13 +1328,14 @@ fn settle_action(db: &Connection, action: &str, attempt: &str, state: &str) -> R
     Ok(())
 }
 
-/// Drains an attempt whose lease lapsed (A2, or a claim its executor never recorded). The lapse
-/// gave no verdict, so an action still waiting on it goes where a lost supervisor's would.
+/// Drains an attempt whose lease lapsed (A2, or a claim its executor never recorded) and records
+/// `detail` with whether it was requeued. Without a verdict, an action still waiting on it goes
+/// where a lost supervisor's would; otherwise it stays interrupted.
 fn drain_lapsed(
     db: &Connection,
     attempt: &Attempt,
-    executor: &str,
-    reason: Option<&str>,
+    verdictless: bool,
+    mut detail: Value,
 ) -> Result<()> {
     db.execute("UPDATE attempts SET drained=1 WHERE id=?", [&attempt.id])?;
     let waiting: i64 = db.query_row(
@@ -1321,17 +1343,14 @@ fn drain_lapsed(
         params![attempt.action, attempt.id],
         |r| r.get(0),
     )?;
-    let action_state = if waiting > 0 {
+    let action_state = if verdictless && waiting > 0 {
         let state = unsettled(db, attempt, true)?;
         settle_action(db, &attempt.action, &attempt.id, state)?;
         Some(state)
     } else {
         None
     };
-    let mut detail = json!({"executor":executor,"requeued":action_state == Some("queued")});
-    if let Some(reason) = reason {
-        detail["reason"] = json!(reason);
-    }
+    detail["requeued"] = json!(action_state == Some("queued"));
     event(db, "attempt.drain_reported", &attempt.id, &detail)?;
     Ok(())
 }
@@ -4016,9 +4035,9 @@ mod tests {
         assert!(!staged.exists());
         assert!(!store.root.join("attempts").join(&id).exists());
         assert_eq!(row(&store.db, &id), ("interrupted".into(), true));
-        // The lapse gave no verdict: the action is queued again, spending one requeue.
-        assert_eq!(state(&store.db, "first"), "queued");
-        assert_eq!(requeues(&store.db, "first"), 1);
+        // A verdict too late to record leaves the action for an operator.
+        assert_eq!(state(&store.db, "first"), "interrupted");
+        assert_eq!(requeues(&store.db, "first"), 0);
         let attempt = store.attempt(&id).unwrap();
         assert_eq!(
             (attempt.result, attempt.exit_code, attempt.completion),
@@ -4027,7 +4046,10 @@ mod tests {
         assert!(events(&store.db, "attempt.completed").is_empty());
         assert_eq!(
             events(&store.db, "attempt.drain_reported"),
-            [(id.clone(), json!({"executor":"mindy","requeued":true}))]
+            [(
+                id.clone(),
+                json!({"executor":"mindy","outcome":"completed","exit_code":0,"requeued":false})
+            )]
         );
         assert_eq!(held(&store.db, "mindy").unwrap(), idle());
         let result = complete(
@@ -4039,9 +4061,6 @@ mod tests {
         );
         assert!(matches!(result, Err(AuthorityError::Fenced)));
         assert_eq!(events(&store.db, "attempt.drain_reported").len(), 1);
-        let again = grant(&mut store, "k2");
-        assert_eq!(again.action.id, "first");
-        assert_ne!(again.attempt.id, id);
     }
 
     fn requeues(db: &Connection, action: &str) -> i64 {
@@ -4061,65 +4080,170 @@ mod tests {
         claim
     }
 
+    /// The holder's late, drained report of a lapsed attempt (A2), and the detail it records.
+    fn late_report(
+        store: &mut Store,
+        claim: &Claim,
+        outcome: Outcome,
+        reason: Option<&str>,
+        exit_code: i32,
+    ) -> Value {
+        let evidence = json!({"exit_code":exit_code,"reason":reason,"artifacts":{}});
+        let request = finish(claim, outcome, reason, exit_code, evidence);
+        let response = complete(store, "mindy", &Scope::all(), &request, Outputs::InPlace).unwrap();
+        assert_eq!(
+            (response.status.as_str(), response.drain_recorded),
+            ("fenced", true)
+        );
+        assert_eq!(
+            row(&store.db, &claim.attempt.id),
+            ("interrupted".into(), true)
+        );
+        assert!(store.attempt(&claim.attempt.id).unwrap().result.is_none());
+        let reported = events(&store.db, "attempt.drain_reported");
+        let (subject, detail) = reported.last().unwrap().clone();
+        assert_eq!(subject, claim.attempt.id);
+        detail
+    }
+
     #[test]
-    fn a_drain_report_requeues_only_a_waiting_action_within_its_budget() {
+    fn a_late_report_requeues_only_without_a_verdict_and_within_the_budget() {
         let (_root, mut store) = lab();
-        register(&store.db, "mindy", 4, 4096);
-        let report = |store: &mut Store, claim: &Claim| {
-            let response = complete(
-                store,
-                "mindy",
-                &Scope::all(),
-                &passing(claim),
-                Outputs::InPlace,
-            )
-            .unwrap();
-            assert!(response.drain_recorded);
-            assert_eq!(
-                row(&store.db, &claim.attempt.id),
-                ("interrupted".into(), true)
-            );
-            let reported = events(&store.db, "attempt.drain_reported");
-            reported.last().unwrap().1.clone()
-        };
-        // Spent by earlier requeues: the action waits for an operator, its capacity released.
-        queued(&store.db, "spent", 1.0);
+        register(&store.db, "mindy", 16, 16384);
+        let names = [
+            "failed",
+            "passed",
+            "passed-while-stopped",
+            "timed-out",
+            "not-started",
+            "lost",
+            "interrupted",
+            "undeliverable",
+            "spent",
+            "unwanted",
+            "moved",
+        ];
+        let mut claims = BTreeMap::new();
+        for (name, n) in names.iter().zip(1..) {
+            queued(&store.db, name, f64::from(n));
+            claims.insert(*name, grant(&mut store, &format!("k{n}")));
+        }
         store
             .db
             .execute("INSERT INTO requeues VALUES ('spent',3)", [])
             .unwrap();
-        let claim = lapsed_claim(&mut store, "k1");
-        assert_eq!(
-            report(&mut store, &claim),
-            json!({"executor":"mindy","requeued":false})
-        );
-        assert_eq!(state(&store.db, "spent"), "interrupted");
-        assert_eq!(requeues(&store.db, "spent"), 3);
-        // Nobody wants it any more: canceled, never queued (P3-C).
-        queued(&store.db, "unwanted", 2.0);
-        let claim = grant(&mut store, "k2");
         stopping(
             &store.db,
             "unwanted",
-            &claim.attempt.id,
+            &claims["unwanted"].attempt.id,
             Some("no-requesters"),
         )
         .unwrap();
-        expire(&mut store, now() + 3600.0, 0.0).unwrap();
+        assert_eq!(expire(&mut store, now() + 3600.0, 0.0).unwrap().len(), 11);
+        // A verdict too late to record is not acted on: the action waits for an operator, and a
+        // failure that might pass on a rerun keeps its human checkpoint. A command that exited 0
+        // as it was stopped passed, and a timeout is a failure, as `record_result` judges them.
+        for (name, reason, exit_code) in [
+            ("failed", None, 1),
+            ("passed", None, 0),
+            ("passed-while-stopped", Some("fenced"), 0),
+            ("timed-out", Some("timeout"), 124),
+        ] {
+            let detail = late_report(
+                &mut store,
+                &claims[name],
+                Outcome::Completed,
+                reason,
+                exit_code,
+            );
+            assert_eq!(
+                detail,
+                json!({"executor":"mindy","outcome":"completed","exit_code":exit_code,
+                       "requeued":false}),
+                "{name}"
+            );
+            assert_eq!(state(&store.db, name), "interrupted", "{name}");
+            assert_eq!(requeues(&store.db, name), 0, "{name}");
+            assert_eq!(repairs(&store.db, name), 0, "{name}");
+        }
+        // Without a verdict the action is queued again, like a lost supervisor's.
+        for (name, outcome, reason, exit_code) in [
+            (
+                "not-started",
+                Outcome::NotStarted,
+                Some("launch-failed"),
+                125,
+            ),
+            ("lost", Outcome::Lost, None, 125),
+            ("interrupted", Outcome::Completed, Some("fenced"), 143),
+            ("undeliverable", Outcome::Undeliverable, None, 125),
+        ] {
+            let detail = late_report(&mut store, &claims[name], outcome, reason, exit_code);
+            assert_eq!(
+                detail,
+                json!({"executor":"mindy","outcome":outcome,"exit_code":exit_code,
+                       "requeued":true}),
+                "{name}"
+            );
+            assert_eq!(state(&store.db, name), "queued", "{name}");
+            assert_eq!(requeues(&store.db, name), 1, "{name}");
+        }
+        // Spent by earlier requeues: the action waits for an operator, its capacity released.
+        let detail = late_report(&mut store, &claims["spent"], Outcome::Lost, None, 125);
+        assert_eq!(detail["requeued"], false);
+        assert_eq!(state(&store.db, "spent"), "interrupted");
+        assert_eq!(requeues(&store.db, "spent"), 3);
+        // Nobody wants it any more: canceled, never queued (P3-C).
         assert_eq!(state(&store.db, "unwanted"), "interrupted");
-        assert_eq!(report(&mut store, &claim)["requeued"], false);
+        let detail = late_report(&mut store, &claims["unwanted"], Outcome::Lost, None, 125);
+        assert_eq!(detail["requeued"], false);
         assert_eq!(state(&store.db, "unwanted"), "canceled");
         assert_eq!(requeues(&store.db, "unwanted"), 0);
         // An action no longer waiting on the attempt is left as it is.
-        queued(&store.db, "moved", 3.0);
-        let claim = lapsed_claim(&mut store, "k3");
         store
             .db
             .execute("UPDATE actions SET state='failed' WHERE id='moved'", [])
             .unwrap();
-        assert_eq!(report(&mut store, &claim)["requeued"], false);
+        let detail = late_report(&mut store, &claims["moved"], Outcome::Lost, None, 125);
+        assert_eq!(detail["requeued"], false);
         assert_eq!(state(&store.db, "moved"), "failed");
         assert_eq!(requeues(&store.db, "moved"), 0);
+    }
+
+    #[test]
+    fn a_lapsed_attempt_nobody_requests_any_more_is_canceled_not_requeued() {
+        // A cancel after the lease lapsed leaves the interrupted action as it is and records no
+        // stop; the drain that follows must not queue work nobody wants.
+        let (_root, mut store) = lab();
+        register(&store.db, "mindy", 4, 4096);
+        queued(&store.db, "unrecorded", 1.0);
+        queued(&store.db, "reported", 2.0);
+        let first = grant(&mut store, "k1");
+        let second = grant(&mut store, "k2");
+        expire(&mut store, now() + 3600.0, 0.0).unwrap();
+        for name in ["unrecorded", "reported"] {
+            crate::engine::cancel(&mut store, name, "lane").unwrap();
+            assert_eq!(state(&store.db, name), "interrupted");
+        }
+        let id = first.attempt.id.clone();
+        claim_for(&mut store, "mindy", &Scope::all(), &unrecorded("k1", &id)).unwrap();
+        assert_eq!(row(&store.db, &id), ("interrupted".into(), true));
+        assert_eq!(state(&store.db, "unrecorded"), "canceled");
+        assert_eq!(requeues(&store.db, "unrecorded"), 0);
+        assert_eq!(
+            events(&store.db, "attempt.drain_reported")[0].1,
+            json!({"executor":"mindy","reason":"claim-unrecorded","requeued":false})
+        );
+        let detail = late_report(&mut store, &second, Outcome::Lost, None, 125);
+        assert_eq!(detail["requeued"], false);
+        assert_eq!(state(&store.db, "reported"), "canceled");
+        assert_eq!(requeues(&store.db, "reported"), 0);
+        // A requester again: a later lapse of the same work is queued as before.
+        queued(&store.db, "wanted", 3.0);
+        let third = lapsed_claim(&mut store, "k3");
+        let id = third.attempt.id.clone();
+        claim_for(&mut store, "mindy", &Scope::all(), &unrecorded("k3", &id)).unwrap();
+        assert_eq!(state(&store.db, "wanted"), "queued");
     }
 
     fn unrecorded(key: &str, attempt: &str) -> ClaimRequest {

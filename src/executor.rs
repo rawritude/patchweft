@@ -804,6 +804,16 @@ impl<T: Transport> Coordinator<T> {
             }
             if let Some(claim) = response.claim {
                 let attempt = claim.attempt.id.clone();
+                // The same claim again after a crash before its key was settled: reconcile already
+                // took it up, and a second entry would launch it twice.
+                let taken = {
+                    let state = self.lock();
+                    state.ledger.contains_key(&attempt) || state.taken_up.contains(&attempt)
+                };
+                if taken {
+                    settled()?;
+                    return Ok(Claimed::Retry);
+                }
                 write_atomically(&self.ledger(&attempt), &serde_json::to_vec(&claim)?)?;
                 settled()?;
                 let mut state = self.lock();
@@ -3338,6 +3348,63 @@ mod tests {
             claim_keys(&coordinator)[4..],
             [sent("older", None), sent("older", Some("b9"))]
         );
+    }
+
+    #[test]
+    fn a_replayed_claim_already_taken_up_is_launched_once() {
+        // A crash after the ledger entry was written but before the key was settled: reconcile
+        // takes the attempt up, then the key's replay returns the same, still-held claim.
+        let temp = tempfile::tempdir().unwrap();
+        let fake = fake(temp.path());
+        let pending = fake.control.join("pending-claim");
+        fake.claims.lock().unwrap().push_back(ClaimResponse {
+            claim: Some(claim("a1")),
+            fenced: None,
+            unverified: vec![],
+        });
+        let coordinator = coordinator(fake);
+        fs::write(
+            coordinator.ledger("a1"),
+            serde_json::to_vec(&claim("a1")).unwrap(),
+        )
+        .unwrap();
+        fs::write(&pending, r#"{"key":"replayed"}"#).unwrap();
+        let mut launches = coordinator.reconcile(false).unwrap();
+        assert_eq!(launches, ["a1"]);
+        coordinator.lock().ledger.get_mut("a1").unwrap().registered = true;
+        let claimed = coordinator.claim().unwrap();
+        if let Claimed::Attempt(attempt) = &claimed {
+            launches.push(attempt.clone());
+        }
+        assert_eq!(launches, ["a1"], "{claimed:?}");
+        assert!(!pending.exists());
+        assert_eq!(claim_keys(&coordinator), [sent("replayed", None)]);
+        // The entry reconcile made is kept, not replaced.
+        assert!(coordinator.lock().ledger["a1"].registered);
+        assert_eq!(coordinator.lock().ledger.len(), 1);
+        // Either record alone is enough: an entry held now, or one taken up at start.
+        let mut entry = Entry::new(claim("a2"), Phase::Launched);
+        entry.registered = true;
+        coordinator.lock().ledger.insert("a2".into(), entry);
+        coordinator.lock().taken_up.insert("a3".into());
+        for attempt in ["a2", "a3"] {
+            fs::write(&pending, r#"{"key":"replayed"}"#).unwrap();
+            coordinator
+                .transport
+                .claims
+                .lock()
+                .unwrap()
+                .push_back(ClaimResponse {
+                    claim: Some(claim(attempt)),
+                    fenced: None,
+                    unverified: vec![],
+                });
+            assert_eq!(coordinator.claim().unwrap(), Claimed::Retry, "{attempt}");
+            assert!(!pending.exists());
+        }
+        assert!(coordinator.lock().ledger["a2"].registered);
+        assert!(!coordinator.lock().ledger.contains_key("a3"));
+        assert!(!coordinator.ledger("a3").exists());
     }
 
     #[test]

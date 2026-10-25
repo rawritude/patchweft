@@ -1036,7 +1036,7 @@ fn candidate_status_db(
         if let Some(reused) = candidate.reused.get(name) {
             job["reused"] = json!(reused);
         }
-        if state == "interrupted"
+        if ["interrupted", "failed", "canceled"].contains(&state.as_str())
             && let Some(awaiting) = awaiting_drain(db, action)?
         {
             job["awaiting_drain"] = awaiting;
@@ -1068,8 +1068,9 @@ fn candidate_status_db(
     Ok(value)
 }
 
-/// The undrained attempt an interrupted action still points at: until its executor reports the
-/// drain or an operator confirms it, its capacity stays held and `retry` refuses the job.
+/// The undrained attempt a finished action still points at: until its executor reports the drain
+/// or an operator confirms it, its capacity stays held and `retry` refuses the job. Only a lapse
+/// with nothing recorded (`self_heals`) can still be settled by its executor's own report.
 fn awaiting_drain(db: &Connection, action: &str) -> Result<Option<Value>> {
     let body: Option<String> = db
         .query_row(
@@ -1085,7 +1086,7 @@ fn awaiting_drain(db: &Connection, action: &str) -> Result<Option<Value>> {
     let attempt: Attempt = serde_json::from_str(&body)?;
     Ok(Some(json!({"attempt":attempt.id,
         "executor":attempt.executor.as_deref().unwrap_or(authority::LOCAL),
-        "lease_expires":attempt.lease_expires})))
+        "lease_expires":attempt.lease_expires,"self_heals":attempt.completion.is_none()})))
 }
 
 pub fn eligible(db: &Connection, action: &Action) -> Result<bool> {
