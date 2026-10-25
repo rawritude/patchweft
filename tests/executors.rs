@@ -2,7 +2,7 @@
 //! directory, and the local worker, all against one store on this host.
 use patchweft::{
     client::{Refused, Remote},
-    model::{CompleteRequest, CompleteResponse, Outcome},
+    model::{ClaimRequest, ClaimResponse, CompleteRequest, CompleteResponse, Outcome},
 };
 use serde_json::{Value, json};
 use std::{
@@ -706,16 +706,18 @@ fn late_completion_is_fenced_and_drain_report_releases() {
     );
     assert_eq!(lab.row("attempts", &attempt), ("interrupted".into(), false));
     // The coordinator wakes up, stops its job, cleans up and reports the drain under its lease.
+    fs::remove_file(lab.work.join("hold-started")).unwrap();
     signal(remote.id() as i32, libc::SIGCONT);
-    assert_eq!(
-        parsed(remote.wait_with_output().unwrap()),
-        json!({"executor":"mindy","launched":1})
-    );
+    // The lapse gave no verdict, so the action is queued again and mindy runs it once more.
+    wait_until("the job again", || started(&lab.work, "hold"));
     assert_eq!(lab.row("attempts", &attempt), ("interrupted".into(), true));
-    assert_eq!(lab.row("actions", &action).0, "interrupted");
     let reports = lab.events_of("attempt.drain_reported");
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0]["subject"], attempt.as_str());
+    assert_eq!(
+        reports[0]["detail"],
+        json!({"executor":"mindy","requeued":true})
+    );
     assert!(
         lab.events_of("attempt.completed")
             .iter()
@@ -723,7 +725,107 @@ fn late_completion_is_fenced_and_drain_report_releases() {
     );
     assert!(!lab.work.join("release").exists());
     // A fenced attempt's directory stays on the executor for inspection.
-    assert!(lab.work.join("retained").join(&attempt).is_dir());
+    wait_until("the retained attempt", || {
+        lab.work.join("retained").join(&attempt).is_dir()
+    });
+    fs::write(lab.work.join("release"), "").unwrap();
+    assert_eq!(
+        parsed(remote.wait_with_output().unwrap()),
+        json!({"executor":"mindy","launched":2})
+    );
+    assert_eq!(lab.state_of(&candidate), "passed");
+    assert_ne!(lab.attempt_of(&action)["id"], attempt.as_str());
+}
+
+#[test]
+fn a_lost_claim_response_is_drained_and_run_again_without_an_operator() {
+    // The authority records a claim whose response never reaches mindy. Its replayed key gets
+    // through only after the lease lapsed: fenced, and mindy's ledger never held the attempt.
+    let lab = Lab::new(
+        json!([
+            job("kept", "true", json!({})),
+            job("lost", "true", json!({}))
+        ]),
+        &["kept"],
+    );
+    let candidate = lab.submit("agent");
+    let kept = candidate["required"]["kept"].as_str().unwrap();
+    let lost = candidate["required"]["lost"].as_str().unwrap();
+    assert_eq!(lab.drain_remote(), json!({"executor":"mindy","launched":1}));
+    assert_eq!(lab.row("actions", kept).0, "passed");
+    lab.call(&[
+        "executor-set",
+        "mindy",
+        "--allow-job",
+        "kept",
+        "--allow-job",
+        "lost",
+    ]);
+    let client = Remote::new(&lab.endpoint(), &lab.credential, None).unwrap();
+    let request = ClaimRequest {
+        claim_key: "lost-response".into(),
+        verified: lab.profiles.clone(),
+        ..ClaimRequest::default()
+    };
+    let response: ClaimResponse = client.executor("claim", &request, None).unwrap();
+    let claim = response.claim.unwrap();
+    assert_eq!(claim.action.id, lost);
+    let attempt = claim.attempt.id;
+    fs::write(
+        lab.work.join("pending-claim"),
+        json!({"key":"lost-response"}).to_string(),
+    )
+    .unwrap();
+    wait_until("lease expiry", || lab.count("attempt.lease_expired") == 1);
+    assert_eq!(lab.row("attempts", &attempt), ("interrupted".into(), false));
+    // Until something confirms the drain, the candidate says who holds the job and since when.
+    let status = lab.call(&["status", candidate["id"].as_str().unwrap()]);
+    assert_eq!(status["state"], "failed");
+    assert_eq!(
+        status["jobs"]["lost"]["awaiting_drain"],
+        json!({"attempt":attempt,"executor":"mindy",
+               "lease_expires":lab.body("attempts", &attempt)["lease_expires"]})
+    );
+    assert!(status["jobs"]["kept"].get("awaiting_drain").is_none());
+    let log = lab.log("mindy");
+    assert_eq!(
+        parsed(lab.spawn_remote(&log).wait_with_output().unwrap()),
+        json!({"executor":"mindy","launched":1})
+    );
+    assert_eq!(logged(&log, "claim_fenced")[0]["attempt"], attempt.as_str());
+    assert_eq!(
+        logged(&log, "claim_unrecorded")[0]["attempt"],
+        attempt.as_str()
+    );
+    assert_eq!(lab.row("attempts", &attempt), ("interrupted".into(), true));
+    let reports = lab.events_of("attempt.drain_reported");
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0]["subject"], attempt.as_str());
+    assert_eq!(
+        reports[0]["detail"],
+        json!({"executor":"mindy","reason":"claim-unrecorded","requeued":true})
+    );
+    // Run again under the shared requeue budget; the candidate's pass was kept, not rerun.
+    let requeues: i64 = lab
+        .database()
+        .query_row("SELECT count FROM requeues WHERE action=?", [lost], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(requeues, 1);
+    assert_ne!(lab.attempt_of(lost)["id"], attempt.as_str());
+    let status = lab.call(&["status", candidate["id"].as_str().unwrap()]);
+    assert_eq!(status["state"], "passed");
+    assert!(status["jobs"]["lost"].get("awaiting_drain").is_none());
+    let claimed = lab.events_of("attempt.claimed");
+    assert_eq!(
+        claimed
+            .iter()
+            .filter(|e| e["detail"]["action"] == kept)
+            .count(),
+        1
+    );
+    assert_eq!(lab.count("attempt.interrupted"), 0);
 }
 
 #[test]

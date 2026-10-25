@@ -433,6 +433,10 @@ pub struct ClaimRequest {
     pub engine: Option<String>,
     #[serde(default)]
     pub loopback: Option<String>,
+    /// The attempt this key was just reported fenced for, which the coordinator never recorded:
+    /// nothing of it ran on that host. Sent only then, so other claims serialize as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unrecorded: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

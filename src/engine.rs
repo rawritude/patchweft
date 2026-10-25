@@ -1031,9 +1031,15 @@ fn candidate_status_db(
     visited.remove(id);
     let mut jobs = BTreeMap::new();
     for (name, action) in &candidate.required {
-        let mut job = json!({"action":action,"state":action_state(db, action)?});
+        let state = action_state(db, action)?;
+        let mut job = json!({"action":action,"state":state});
         if let Some(reused) = candidate.reused.get(name) {
             job["reused"] = json!(reused);
+        }
+        if state == "interrupted"
+            && let Some(awaiting) = awaiting_drain(db, action)?
+        {
+            job["awaiting_drain"] = awaiting;
         }
         jobs.insert(name, job);
     }
@@ -1060,6 +1066,26 @@ fn candidate_status_db(
     }
     memo.insert(id.into(), value.clone());
     Ok(value)
+}
+
+/// The undrained attempt an interrupted action still points at: until its executor reports the
+/// drain or an operator confirms it, its capacity stays held and `retry` refuses the job.
+fn awaiting_drain(db: &Connection, action: &str) -> Result<Option<Value>> {
+    let body: Option<String> = db
+        .query_row(
+            "SELECT t.body FROM actions a JOIN attempts t ON t.id=a.attempt
+             WHERE a.id=? AND t.drained=0",
+            [action],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(body) = body else {
+        return Ok(None);
+    };
+    let attempt: Attempt = serde_json::from_str(&body)?;
+    Ok(Some(json!({"attempt":attempt.id,
+        "executor":attempt.executor.as_deref().unwrap_or(authority::LOCAL),
+        "lease_expires":attempt.lease_expires})))
 }
 
 pub fn eligible(db: &Connection, action: &Action) -> Result<bool> {

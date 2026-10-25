@@ -452,6 +452,8 @@ enum Claimed {
 
 struct State {
     ledger: BTreeMap<String, Entry>,
+    /// Every attempt the ledger held when this coordinator took it up.
+    taken_up: BTreeSet<String>,
     verified: BTreeSet<String>,
     refused: BTreeMap<String, (String, Instant)>,
     lease_seconds: u64,
@@ -530,6 +532,7 @@ impl<T: Transport> Coordinator<T> {
             guards: Guards::default(),
             state: Mutex::new(State {
                 ledger: BTreeMap::new(),
+                taken_up: BTreeSet::new(),
                 verified: BTreeSet::new(),
                 refused: BTreeMap::new(),
                 lease_seconds,
@@ -678,6 +681,7 @@ impl<T: Transport> Coordinator<T> {
             let claim: Claim = serde_json::from_slice(&fs::read(&path)?)
                 .with_context(|| format!("unreadable ledger entry {}", path.display()))?;
             let attempt = claim.attempt.id.clone();
+            self.lock().taken_up.insert(attempt.clone());
             let control = self.control(&attempt);
             let supervisor: Option<SupervisorIdentity> =
                 match fs::read(control.join("supervisor.json")) {
@@ -771,8 +775,30 @@ impl<T: Transport> Coordinator<T> {
                 Err(error) => return self.unclaimed(error),
             };
             if let Some(attempt) = response.fenced {
-                // The key's attempt ended before this coordinator recorded it; nothing of it ran.
                 log(json!({"event":"claim_fenced","executor":self.executor,"attempt":attempt}));
+                // Unless the ledger held it, the key's attempt ended before this coordinator
+                // recorded it, so nothing of it ran here. Saying so once lets the authority drain
+                // it and queue its action again; its lapsed lease would otherwise hold this host's
+                // capacity until an operator confirms the drain. A held one is the ledger's to report.
+                if !self.recorded(&attempt) {
+                    let report = ClaimRequest {
+                        unrecorded: Some(attempt.clone()),
+                        ..request
+                    };
+                    match self.transport.claim(&report) {
+                        Ok(_) => log(json!({"event":"claim_unrecorded","executor":self.executor,
+                                            "attempt":attempt})),
+                        // An authority that predates the field refuses it: only the drain is lost.
+                        Err(TransportError::Permanent(error)) => {
+                            log(
+                                json!({"event":"claim_unrecorded_refused","executor":self.executor,
+                                       "attempt":attempt,"error":format!("{error:#}")}),
+                            );
+                        }
+                        // The key stays pending: the next exchange is fenced and says so again.
+                        Err(error) => return self.unclaimed(error),
+                    }
+                }
                 settled()?;
                 return Ok(Claimed::Retry);
             }
@@ -809,6 +835,16 @@ impl<T: Transport> Coordinator<T> {
         }
     }
 
+    /// Whether this coordinator held the attempt in its ledger: now, or when it took the ledger up
+    /// at start, since a crash before a claim's key was settled leaves that key pending while its
+    /// attempt runs and is reported. A ledger it cannot read counts as holding it.
+    fn recorded(&self, attempt: &str) -> bool {
+        let state = self.lock();
+        state.ledger.contains_key(attempt)
+            || state.taken_up.contains(attempt)
+            || self.ledger(attempt).try_exists().unwrap_or(true)
+    }
+
     /// A claim request with this coordinator's verdicts and what it observes of its host.
     fn ask(&self, key: &str, free: Option<u64>) -> ClaimRequest {
         let memory_limit_mb = memory_limit();
@@ -830,6 +866,7 @@ impl<T: Transport> Coordinator<T> {
             host: self.host.clone(),
             engine: Some(self.engine.clone()),
             loopback: Some(self.guards.loopback_mode()),
+            unrecorded: None,
         }
     }
 
@@ -2696,6 +2733,8 @@ mod tests {
         renewal: &'static str,
         /// "recorded" or "fenced".
         completion: &'static str,
+        /// How a claim saying `unrecorded` fails: "transient", "permanent" or not at all.
+        unrecorded_error: Mutex<Option<&'static str>>,
         calls: Mutex<Vec<Call>>,
     }
 
@@ -2727,6 +2766,15 @@ mod tests {
         }
         fn claim(&self, request: &ClaimRequest) -> Result<ClaimResponse, TransportError> {
             self.record(Call::Claim(request.clone()));
+            if request.unrecorded.is_some() {
+                match *self.unrecorded_error.lock().unwrap() {
+                    Some("transient") => {
+                        return Err(TransportError::Transient(anyhow!("connection refused")));
+                    }
+                    Some(_) => return Err(TransportError::Permanent(anyhow!("HTTP 400"))),
+                    None => {}
+                }
+            }
             Ok(self
                 .claims
                 .lock()
@@ -2852,6 +2900,7 @@ mod tests {
             claims: Mutex::new(VecDeque::new()),
             renewal: "ok",
             completion: "recorded",
+            unrecorded_error: Mutex::new(None),
             calls: Mutex::new(vec![]),
         }
     }
@@ -3194,6 +3243,143 @@ mod tests {
         assert_ne!(keys[2], "replayed");
         let next: Value = serde_json::from_slice(&fs::read(&pending).unwrap()).unwrap();
         assert_eq!(next["key"], keys[2]);
+    }
+
+    fn fenced(attempt: &str) -> ClaimResponse {
+        ClaimResponse {
+            claim: None,
+            fenced: Some(attempt.into()),
+            unverified: vec![],
+        }
+    }
+
+    /// The key and `unrecorded` of every claim request sent.
+    fn claim_keys(coordinator: &Coordinator<Fake>) -> Vec<(String, Option<String>)> {
+        claims_sent(coordinator)
+            .into_iter()
+            .map(|request| (request.claim_key, request.unrecorded))
+            .collect()
+    }
+
+    fn sent(key: &str, unrecorded: Option<&str>) -> (String, Option<String>) {
+        (key.into(), unrecorded.map(String::from))
+    }
+
+    #[test]
+    fn a_fenced_key_the_ledger_never_held_is_reported_unrecorded() {
+        // The authority recorded the claim, its response was lost, and its lease lapsed before the
+        // replayed key got through.
+        let temp = tempfile::tempdir().unwrap();
+        let fake = fake(temp.path());
+        let pending = fake.control.join("pending-claim");
+        fake.claims
+            .lock()
+            .unwrap()
+            .extend([fenced("a9"), fenced("a9")]);
+        let coordinator = coordinator(fake);
+        fs::write(&pending, r#"{"key":"lost"}"#).unwrap();
+        assert_eq!(coordinator.claim().unwrap(), Claimed::Retry);
+        assert_eq!(
+            claim_keys(&coordinator),
+            [sent("lost", None), sent("lost", Some("a9"))]
+        );
+        // Otherwise the same exchange; only this report carries the field.
+        let requests = claims_sent(&coordinator);
+        let mut report = serde_json::to_value(&requests[1]).unwrap();
+        assert_eq!(report["unrecorded"], "a9");
+        report.as_object_mut().unwrap().remove("unrecorded");
+        assert_eq!(report, serde_json::to_value(&requests[0]).unwrap());
+        assert!(!pending.exists());
+        // The next exchange claims under a new key and says nothing more.
+        assert_eq!(coordinator.claim().unwrap(), Claimed::Idle);
+        let requests = claims_sent(&coordinator);
+        assert_eq!(requests.len(), 3);
+        assert_ne!(requests[2].claim_key, "lost");
+        let next = serde_json::to_value(&requests[2]).unwrap();
+        assert!(next.get("unrecorded").is_none(), "{next}");
+    }
+
+    #[test]
+    fn an_unrecorded_report_is_sent_again_until_it_is_delivered_or_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = fake(temp.path());
+        let pending = fake.control.join("pending-claim");
+        *fake.unrecorded_error.lock().unwrap() = Some("transient");
+        fake.claims.lock().unwrap().extend([
+            fenced("a9"),
+            fenced("a9"),
+            fenced("a9"),
+            fenced("b9"),
+            fenced("b9"),
+        ]);
+        let coordinator = coordinator(fake);
+        fs::write(&pending, r#"{"key":"lost"}"#).unwrap();
+        // Unreachable: the key stays pending, and the next exchange is fenced and reports again.
+        assert_eq!(coordinator.claim().unwrap(), Claimed::Retry);
+        assert!(pending.exists());
+        *coordinator.transport.unrecorded_error.lock().unwrap() = None;
+        assert_eq!(coordinator.claim().unwrap(), Claimed::Retry);
+        assert!(!pending.exists());
+        assert_eq!(
+            claim_keys(&coordinator),
+            [
+                sent("lost", None),
+                sent("lost", Some("a9")),
+                sent("lost", None),
+                sent("lost", Some("a9")),
+            ]
+        );
+        // An authority that predates the field refuses it: the key is settled as before.
+        *coordinator.transport.unrecorded_error.lock().unwrap() = Some("permanent");
+        fs::write(&pending, r#"{"key":"older"}"#).unwrap();
+        assert_eq!(coordinator.claim().unwrap(), Claimed::Retry);
+        assert!(!pending.exists());
+        assert_eq!(
+            claim_keys(&coordinator)[4..],
+            [sent("older", None), sent("older", Some("b9"))]
+        );
+    }
+
+    #[test]
+    fn a_fenced_key_whose_attempt_the_ledger_held_reports_nothing_new() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = fake(temp.path());
+        let pending = fake.control.join("pending-claim");
+        let coordinator = coordinator(fake);
+        let replay = |attempt: &str| {
+            let before = claims_sent(&coordinator).len();
+            fs::write(&pending, r#"{"key":"pending"}"#).unwrap();
+            coordinator
+                .transport
+                .claims
+                .lock()
+                .unwrap()
+                .push_back(fenced(attempt));
+            assert_eq!(coordinator.claim().unwrap(), Claimed::Retry);
+            assert!(!pending.exists());
+            claim_keys(&coordinator)[before..].to_vec()
+        };
+        // A crash after the ledger entry was written but before the key was settled: taken up at
+        // start, the attempt ran and its report was published before the replay got through.
+        launched(&coordinator, "a1", Some(&dead()));
+        assert!(coordinator.reconcile(false).unwrap().is_empty());
+        coordinator.publish_queued().unwrap();
+        assert!(!coordinator.ledger("a1").exists());
+        assert!(coordinator.lock().ledger.is_empty());
+        assert_eq!(replay("a1"), [sent("pending", None)]);
+        // The ledger's file alone, or its entry alone.
+        launched(&coordinator, "a2", None);
+        assert_eq!(replay("a2"), [sent("pending", None)]);
+        coordinator
+            .lock()
+            .ledger
+            .insert("a3".into(), Entry::new(claim("a3"), Phase::Launched));
+        assert_eq!(replay("a3"), [sent("pending", None)]);
+        // An attempt none of them holds is reported.
+        assert_eq!(
+            replay("a4"),
+            [sent("pending", None), sent("pending", Some("a4"))]
+        );
     }
 
     #[test]

@@ -500,9 +500,18 @@ pub fn claim_for(
     let transaction = store.transaction()?;
     let mut record = load(&transaction, executor)?.ok_or(AuthorityError::Unregistered)?;
     observe(&transaction, &mut record, request, verified.clone())?;
-    if let Some(response) = replay(&transaction, executor, key)? {
+    if let Some(response) = replay(&transaction, executor, key, request.unrecorded.as_deref())? {
         transaction.commit()?;
         return Ok(response);
+    }
+    // The coordinator settles the key whatever this answers, so a claim made now would be lost.
+    if request.unrecorded.is_some() {
+        transaction.commit()?;
+        return Ok(ClaimResponse {
+            claim: None,
+            fenced: None,
+            unverified: Vec::new(),
+        });
     }
     let capacity = capacity(&transaction, &record)?;
     let refused = request.refused.keys().cloned().collect();
@@ -696,8 +705,14 @@ fn observe(
 }
 
 /// A key already used by this executor: a still-held attempt is the same claim again, any other
-/// is reported fenced. Only expiry judges lease time, so no clock is compared here.
-fn replay(db: &Connection, executor: &str, key: &str) -> Result<Option<ClaimResponse>> {
+/// is reported fenced. Only expiry judges lease time, so no clock is compared here. A coordinator
+/// that never recorded the fenced attempt says so as `unrecorded`, which may drain it.
+fn replay(
+    db: &Connection,
+    executor: &str,
+    key: &str,
+    unrecorded: Option<&str>,
+) -> Result<Option<ClaimResponse>> {
     let row: Option<(String, String, bool, String)> = db
         .query_row(
             &format!(
@@ -718,6 +733,22 @@ fn replay(db: &Connection, executor: &str, key: &str) -> Result<Option<ClaimResp
     } else {
         None
     };
+    if claim.is_none() && unrecorded == Some(id.as_str()) {
+        let attempt: Attempt = serde_json::from_str(&body)?;
+        // The lookup bound the attempt to this executor and key. Only a lapsed lease the store
+        // never saw start or report is drained: past either, processes or resources may remain
+        // that only the executor's own drain report can vouch for. Anything else is ignored, not
+        // refused: the coordinator settles the key either way, a drain recorded since is a benign
+        // race, and an error would end its claim loop.
+        if state == "interrupted"
+            && !drained
+            && attempt.started.is_none()
+            && attempt.supervisor_pid.is_none()
+            && attempt.completion.is_none()
+        {
+            drain_lapsed(db, &attempt, executor, Some("claim-unrecorded"))?;
+        }
+    }
     let fenced = claim.is_none().then_some(id);
     Ok(Some(ClaimResponse {
         claim,
@@ -1102,13 +1133,7 @@ fn record_completion(
     let Some((action, _)) = holding(&transaction, scope, &attempt, &state)? else {
         // A2: the holder of an expired lease may still report that its attempt drained.
         if state == "interrupted" && !drained && request.drained {
-            transaction.execute("UPDATE attempts SET drained=1 WHERE id=?", [&attempt.id])?;
-            event(
-                &transaction,
-                "attempt.drain_reported",
-                &attempt.id,
-                &json!({"executor":executor}),
-            )?;
+            drain_lapsed(&transaction, &attempt, executor, None)?;
             transaction.commit()?;
             return Ok(CompleteResponse {
                 attempt: attempt.id,
@@ -1232,8 +1257,84 @@ fn verified_evidence(
     Ok(evidence)
 }
 
-/// Not-started attempts an action may requeue before it waits for an operator (gate P3-2).
+/// Attempts without a verdict (not started, lost or lapsed) an action may requeue before it waits
+/// for an operator (gate P3-2).
 const REQUEUE_BUDGET: i64 = 3;
+
+/// The action state after an attempt that gave no verdict: canceled once drained if a recorded
+/// no-requesters stop says nobody wants the work (P3-C), queued again if drained within the
+/// budget, else interrupted for an operator.
+fn unsettled(db: &Connection, attempt: &Attempt, drained: bool) -> Result<&'static str> {
+    // Requeueing needs drained resources and a budget left: a failure that repeats on every host
+    // ends interrupted for an operator instead of looping. The budget counts requeues since the
+    // action's last retry only (gate P3-D); `retry` resets it.
+    let requeued: i64 = db
+        .query_row(
+            "SELECT count FROM requeues WHERE action=?",
+            [&attempt.action],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    let unwanted = attempt.stop.as_deref() == Some("no-requesters");
+    Ok(if drained && unwanted {
+        "canceled"
+    } else if drained && requeued < REQUEUE_BUDGET {
+        "queued"
+    } else {
+        "interrupted"
+    })
+}
+
+/// Moves the action of its current attempt to `state`; `queued` frees it for another claim and
+/// spends one requeue.
+fn settle_action(db: &Connection, action: &str, attempt: &str, state: &str) -> Result<()> {
+    if state == "queued" {
+        db.execute(
+            "UPDATE actions SET state='queued',attempt=NULL WHERE id=? AND attempt=?",
+            params![action, attempt],
+        )?;
+        db.execute(
+            "INSERT INTO requeues VALUES (?,1) ON CONFLICT(action) DO UPDATE SET count=count+1",
+            [action],
+        )?;
+    } else {
+        db.execute(
+            "UPDATE actions SET state=? WHERE id=? AND attempt=?",
+            params![state, action, attempt],
+        )?;
+    }
+    Ok(())
+}
+
+/// Drains an attempt whose lease lapsed (A2, or a claim its executor never recorded). The lapse
+/// gave no verdict, so an action still waiting on it goes where a lost supervisor's would.
+fn drain_lapsed(
+    db: &Connection,
+    attempt: &Attempt,
+    executor: &str,
+    reason: Option<&str>,
+) -> Result<()> {
+    db.execute("UPDATE attempts SET drained=1 WHERE id=?", [&attempt.id])?;
+    let waiting: i64 = db.query_row(
+        "SELECT COUNT(*) FROM actions WHERE id=? AND attempt=? AND state='interrupted'",
+        params![attempt.action, attempt.id],
+        |r| r.get(0),
+    )?;
+    let action_state = if waiting > 0 {
+        let state = unsettled(db, attempt, true)?;
+        settle_action(db, &attempt.action, &attempt.id, state)?;
+        Some(state)
+    } else {
+        None
+    };
+    let mut detail = json!({"executor":executor,"requeued":action_state == Some("queued")});
+    if let Some(reason) = reason {
+        detail["reason"] = json!(reason);
+    }
+    event(db, "attempt.drain_reported", &attempt.id, &detail)?;
+    Ok(())
+}
 
 /// Stops after which the action may simply be retried: nothing about the revision failed.
 const INTERRUPTIONS: [&str; 4] = ["supervisor-stop", "partition", "fenced", "revoked"];
@@ -1259,20 +1360,8 @@ pub fn record_result(
     let evidence = &request.evidence;
     let reason = request.reason.as_deref();
     let executor = attempt.executor.as_deref().unwrap_or(LOCAL);
-    // Requeueing needs drained resources and a budget left: a failure that repeats on every host
-    // ends interrupted for an operator instead of looping. The budget counts not-started requeues
-    // since the action's last retry only (gate P3-D); `retry` resets it.
-    let requeued: i64 = db
-        .query_row(
-            "SELECT count FROM requeues WHERE action=?",
-            [&action.id],
-            |r| r.get(0),
-        )
-        .optional()?
-        .unwrap_or(0);
-    // A recorded no-requesters stop means nobody wants the work: canceled, never requeued (P3-C).
-    let unwanted = attempt.stop.as_deref() == Some("no-requesters");
-    let requeue = request.drained && !unwanted && requeued < REQUEUE_BUDGET;
+    let unsettled = unsettled(db, &attempt, request.drained)?;
+    let requeue = unsettled == "queued";
     let (state, action_state, kind, detail) = match request.outcome {
         Outcome::Completed => {
             let state = if request.exit_code == 0 {
@@ -1304,13 +1393,12 @@ pub fn record_result(
         // A lost supervisor reported drained never started its command (gate P3-2); an attempt
         // whose result is not recorded (out of scope, P3-C) reports this outcome with its reason.
         Outcome::Lost => {
-            let (state, action_state) = if unwanted && request.drained {
-                ("canceled", "canceled")
-            } else if requeue {
-                ("interrupted", "queued")
+            let state = if unsettled == "canceled" {
+                "canceled"
             } else {
-                ("interrupted", "interrupted")
+                "interrupted"
             };
+            let action_state = unsettled;
             let detail = json!({"drained":request.drained,"operator_confirmed":false,
                                 "reason":reason.unwrap_or("supervisor-lost"),"executor":executor,
                                 "requeued":action_state == "queued"});
@@ -1338,21 +1426,7 @@ pub fn record_result(
             attempt.id
         ],
     )?;
-    if action_state == "queued" {
-        db.execute(
-            "UPDATE actions SET state='queued',attempt=NULL WHERE id=? AND attempt=?",
-            params![action.id, attempt.id],
-        )?;
-        db.execute(
-            "INSERT INTO requeues VALUES (?,1) ON CONFLICT(action) DO UPDATE SET count=count+1",
-            [&action.id],
-        )?;
-    } else {
-        db.execute(
-            "UPDATE actions SET state=? WHERE id=? AND attempt=?",
-            params![action_state, action.id, attempt.id],
-        )?;
-    }
+    settle_action(db, &action.id, &attempt.id, action_state)?;
     if state == "failed" {
         db.execute(
             "INSERT INTO repairs VALUES (?,?,?,'execution','open',?,NULL,?)",
@@ -3942,7 +4016,9 @@ mod tests {
         assert!(!staged.exists());
         assert!(!store.root.join("attempts").join(&id).exists());
         assert_eq!(row(&store.db, &id), ("interrupted".into(), true));
-        assert_eq!(state(&store.db, "first"), "interrupted");
+        // The lapse gave no verdict: the action is queued again, spending one requeue.
+        assert_eq!(state(&store.db, "first"), "queued");
+        assert_eq!(requeues(&store.db, "first"), 1);
         let attempt = store.attempt(&id).unwrap();
         assert_eq!(
             (attempt.result, attempt.exit_code, attempt.completion),
@@ -3951,7 +4027,7 @@ mod tests {
         assert!(events(&store.db, "attempt.completed").is_empty());
         assert_eq!(
             events(&store.db, "attempt.drain_reported"),
-            [(id.clone(), json!({"executor":"mindy"}))]
+            [(id.clone(), json!({"executor":"mindy","requeued":true}))]
         );
         assert_eq!(held(&store.db, "mindy").unwrap(), idle());
         let result = complete(
@@ -3962,6 +4038,282 @@ mod tests {
             Outputs::InPlace,
         );
         assert!(matches!(result, Err(AuthorityError::Fenced)));
+        assert_eq!(events(&store.db, "attempt.drain_reported").len(), 1);
+        let again = grant(&mut store, "k2");
+        assert_eq!(again.action.id, "first");
+        assert_ne!(again.attempt.id, id);
+    }
+
+    fn requeues(db: &Connection, action: &str) -> i64 {
+        db.query_row(
+            "SELECT COALESCE((SELECT count FROM requeues WHERE action=?),0)",
+            [action],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// mindy claims the head of its queue under `key`, and every held lease then lapses.
+    fn lapsed_claim(store: &mut Store, key: &str) -> Claim {
+        let claim = grant(store, key);
+        let expired = expire(store, now() + 3600.0, 0.0).unwrap();
+        assert!(expired.contains(&claim.attempt.id));
+        claim
+    }
+
+    #[test]
+    fn a_drain_report_requeues_only_a_waiting_action_within_its_budget() {
+        let (_root, mut store) = lab();
+        register(&store.db, "mindy", 4, 4096);
+        let report = |store: &mut Store, claim: &Claim| {
+            let response = complete(
+                store,
+                "mindy",
+                &Scope::all(),
+                &passing(claim),
+                Outputs::InPlace,
+            )
+            .unwrap();
+            assert!(response.drain_recorded);
+            assert_eq!(
+                row(&store.db, &claim.attempt.id),
+                ("interrupted".into(), true)
+            );
+            let reported = events(&store.db, "attempt.drain_reported");
+            reported.last().unwrap().1.clone()
+        };
+        // Spent by earlier requeues: the action waits for an operator, its capacity released.
+        queued(&store.db, "spent", 1.0);
+        store
+            .db
+            .execute("INSERT INTO requeues VALUES ('spent',3)", [])
+            .unwrap();
+        let claim = lapsed_claim(&mut store, "k1");
+        assert_eq!(
+            report(&mut store, &claim),
+            json!({"executor":"mindy","requeued":false})
+        );
+        assert_eq!(state(&store.db, "spent"), "interrupted");
+        assert_eq!(requeues(&store.db, "spent"), 3);
+        // Nobody wants it any more: canceled, never queued (P3-C).
+        queued(&store.db, "unwanted", 2.0);
+        let claim = grant(&mut store, "k2");
+        stopping(
+            &store.db,
+            "unwanted",
+            &claim.attempt.id,
+            Some("no-requesters"),
+        )
+        .unwrap();
+        expire(&mut store, now() + 3600.0, 0.0).unwrap();
+        assert_eq!(state(&store.db, "unwanted"), "interrupted");
+        assert_eq!(report(&mut store, &claim)["requeued"], false);
+        assert_eq!(state(&store.db, "unwanted"), "canceled");
+        assert_eq!(requeues(&store.db, "unwanted"), 0);
+        // An action no longer waiting on the attempt is left as it is.
+        queued(&store.db, "moved", 3.0);
+        let claim = lapsed_claim(&mut store, "k3");
+        store
+            .db
+            .execute("UPDATE actions SET state='failed' WHERE id='moved'", [])
+            .unwrap();
+        assert_eq!(report(&mut store, &claim)["requeued"], false);
+        assert_eq!(state(&store.db, "moved"), "failed");
+        assert_eq!(requeues(&store.db, "moved"), 0);
+    }
+
+    fn unrecorded(key: &str, attempt: &str) -> ClaimRequest {
+        ClaimRequest {
+            unrecorded: Some(attempt.into()),
+            ..ask(key, &["f-1"])
+        }
+    }
+
+    #[test]
+    fn an_unrecorded_lapsed_claim_is_drained_and_requeued_within_the_budget() {
+        // A claim the authority recorded but whose response never reached the executor: its lease
+        // lapses, the replayed key is fenced, and the executor says it never recorded the attempt.
+        let (_root, mut store) = lab();
+        register(&store.db, "mindy", 4, 4096);
+        queued(&store.db, "first", 1.0);
+        let mut last = String::new();
+        for round in 1..=4 {
+            let key = format!("k{round}");
+            let claim = lapsed_claim(&mut store, &key);
+            assert_eq!(claim.action.id, "first");
+            let id = claim.attempt.id.clone();
+            // The replay alone is fenced and changes nothing.
+            let fenced =
+                claim_for(&mut store, "mindy", &Scope::all(), &ask(&key, &["f-1"])).unwrap();
+            assert_eq!(fenced.fenced.as_deref(), Some(id.as_str()));
+            assert_eq!(row(&store.db, &id), ("interrupted".into(), false));
+            assert_eq!(held(&store.db, "mindy").unwrap(), one());
+            let response =
+                claim_for(&mut store, "mindy", &Scope::all(), &unrecorded(&key, &id)).unwrap();
+            assert!(response.claim.is_none());
+            assert_eq!(response.fenced.as_deref(), Some(id.as_str()));
+            assert_eq!(row(&store.db, &id), ("interrupted".into(), true));
+            assert_eq!(held(&store.db, "mindy").unwrap(), idle());
+            // Three requeues, then the action waits for an operator's retry.
+            let requeued = round <= 3;
+            let expected = if requeued { "queued" } else { "interrupted" };
+            assert_eq!(state(&store.db, "first"), expected, "round {round}");
+            assert_eq!(
+                events(&store.db, "attempt.drain_reported").last().unwrap(),
+                &(
+                    id.clone(),
+                    json!({"executor":"mindy","reason":"claim-unrecorded","requeued":requeued})
+                )
+            );
+            last = id;
+        }
+        assert_eq!(requeues(&store.db, "first"), 3);
+        // Said again, it changes nothing more.
+        let again =
+            claim_for(&mut store, "mindy", &Scope::all(), &unrecorded("k4", &last)).unwrap();
+        assert_eq!(again.fenced.as_deref(), Some(last.as_str()));
+        assert_eq!(events(&store.db, "attempt.drain_reported").len(), 4);
+        assert_eq!(state(&store.db, "first"), "interrupted");
+        // Nobody wants it any more: canceled, never queued (P3-C).
+        queued(&store.db, "unwanted", 2.0);
+        let claim = grant(&mut store, "k5");
+        let id = claim.attempt.id.clone();
+        stopping(&store.db, "unwanted", &id, Some("no-requesters")).unwrap();
+        expire(&mut store, now() + 3600.0, 0.0).unwrap();
+        claim_for(&mut store, "mindy", &Scope::all(), &unrecorded("k5", &id)).unwrap();
+        assert_eq!(row(&store.db, &id), ("interrupted".into(), true));
+        assert_eq!(state(&store.db, "unwanted"), "canceled");
+        assert_eq!(
+            events(&store.db, "attempt.drain_reported")
+                .last()
+                .unwrap()
+                .1,
+            json!({"executor":"mindy","reason":"claim-unrecorded","requeued":false})
+        );
+    }
+
+    #[test]
+    fn unrecorded_drains_only_the_keys_own_lapsed_attempt_that_never_started() {
+        let (_root, mut store) = lab();
+        register(&store.db, "mindy", 8, 8192);
+        register(&store.db, "other", 8, 8192);
+        let names = [
+            "mine",
+            "keyed",
+            "started",
+            "began",
+            "pid",
+            "reported",
+            "confirmed",
+            "ended",
+        ];
+        let mut claims = BTreeMap::new();
+        for (name, n) in names.iter().zip(1..) {
+            queued(&store.db, name, f64::from(n));
+            claims.insert(*name, grant(&mut store, &format!("k{n}")));
+        }
+        let id = |name: &str| claims[name].attempt.id.clone();
+        register_supervisor(&mut store, &claims["started"]);
+        // Bodies no current writer leaves: a start without a supervisor, a supervisor without a
+        // start, and an end other than an interruption without a report.
+        for (name, edit) in [
+            (
+                "began",
+                "UPDATE attempts SET body=json_set(body,'$.started',1.0) WHERE id=?",
+            ),
+            (
+                "pid",
+                "UPDATE attempts SET body=json_set(body,'$.supervisor_pid',4242) WHERE id=?",
+            ),
+        ] {
+            store.db.execute(edit, [id(name)]).unwrap();
+        }
+        // Reported lost and undrained: interrupted, but under a recorded report.
+        let lost = CompleteRequest {
+            drained: false,
+            ..finish(&claims["reported"], Outcome::Lost, None, 125, json!({}))
+        };
+        complete(&mut store, "mindy", &Scope::all(), &lost, Outputs::InPlace).unwrap();
+        assert_eq!(
+            row(&store.db, &id("reported")),
+            ("interrupted".into(), false)
+        );
+        expire(&mut store, now() + 3600.0, 0.0).unwrap();
+        confirm_drained(&mut store, &id("confirmed")).unwrap();
+        store
+            .db
+            .execute(
+                "UPDATE attempts SET state='canceled' WHERE id=?",
+                [id("ended")],
+            )
+            .unwrap();
+        // Still held: its key is the same claim again.
+        queued(&store.db, "held", 9.0);
+        let held_claim = grant(&mut store, "k9");
+        // Queued work a fresh key would claim.
+        queued(&store.db, "spare", 10.0);
+        let snapshot = |store: &Store| {
+            let actions: Vec<String> = names
+                .iter()
+                .chain(&["held", "spare"])
+                .map(|name| state(&store.db, name))
+                .collect();
+            let mut stmt = store
+                .db
+                .prepare("SELECT id,state,drained FROM attempts ORDER BY rowid")
+                .unwrap();
+            let attempts: Vec<(String, String, bool)> = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            (actions, attempts)
+        };
+        let before = snapshot(&store);
+        let mut send = |executor: &str, key: &str, attempt: &str| {
+            let response = claim_for(
+                &mut store,
+                executor,
+                &Scope::all(),
+                &unrecorded(key, attempt),
+            )
+            .unwrap();
+            (
+                response.claim.map(|claim| claim.attempt.id),
+                response.fenced,
+            )
+        };
+        // Another executor's key of the same name is not mindy's.
+        assert_eq!(send("other", "k1", &id("mine")), (None, None));
+        // The key's own attempt is another one.
+        assert_eq!(send("mindy", "k2", &id("mine")), (None, Some(id("keyed"))));
+        // A key without an attempt claims nothing, though work is queued.
+        assert_eq!(send("mindy", "k-new", &id("mine")), (None, None));
+        // Started, a supervisor recorded, reported, drained already, or not interrupted.
+        for (name, n) in names.iter().zip(1..).skip(2) {
+            let key = format!("k{n}");
+            assert_eq!(
+                send("mindy", &key, &id(name)),
+                (None, Some(id(name))),
+                "{name}"
+            );
+        }
+        // Still held, so not fenced at all.
+        let held_id = held_claim.attempt.id.clone();
+        assert_eq!(send("mindy", "k9", &held_id), (Some(held_id.clone()), None));
+        assert_eq!(snapshot(&store), before);
+        assert!(events(&store.db, "attempt.drain_reported").is_empty());
+        // The executor's own key and its unstarted lapsed attempt.
+        let response = claim_for(
+            &mut store,
+            "mindy",
+            &Scope::all(),
+            &unrecorded("k1", &id("mine")),
+        )
+        .unwrap();
+        assert_eq!(response.fenced, Some(id("mine")));
+        assert_eq!(row(&store.db, &id("mine")), ("interrupted".into(), true));
+        assert_eq!(state(&store.db, "mine"), "queued");
         assert_eq!(events(&store.db, "attempt.drain_reported").len(), 1);
     }
 
