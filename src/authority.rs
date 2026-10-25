@@ -627,6 +627,7 @@ pub fn claim_for(
         claim_key: Some(key.clone()),
         completion: None,
         stop: None,
+        refused: None,
     };
     transaction.execute(
         "INSERT INTO attempts VALUES (?,?,'claimed',0,?)",
@@ -1149,6 +1150,24 @@ fn record_completion(
                 replayed: false,
                 drain_recorded: true,
             });
+        }
+        // An undrained one is refused, but recorded: its coordinator retires the attempt on this
+        // answer and never reports it again, so nothing it could still settle is left.
+        if state == "interrupted" && !drained && attempt.refused.is_none() {
+            let refused = json!({"outcome":request.outcome,"exit_code":request.exit_code,
+                                 "reason":request.reason,"at":now()});
+            transaction.execute(
+                "UPDATE attempts SET body=json_set(body,'$.refused',json(?)) WHERE id=?",
+                params![refused.to_string(), attempt.id],
+            )?;
+            event(
+                &transaction,
+                "attempt.report_refused",
+                &attempt.id,
+                &json!({"executor":executor,"outcome":request.outcome,
+                        "exit_code":request.exit_code}),
+            )?;
+            transaction.commit()?;
         }
         return Err(AuthorityError::Fenced);
     };
@@ -4125,6 +4144,100 @@ mod tests {
         let (subject, detail) = reported.last().unwrap().clone();
         assert_eq!(subject, claim.attempt.id);
         detail
+    }
+
+    #[test]
+    fn a_refused_undrained_late_report_is_recorded() {
+        // The command started, its supervisor was OOM-killed, and the coordinator reports it lost
+        // and undrained after the lease lapsed. The report is refused as before, but recorded:
+        // that coordinator retires the attempt and never reports it again.
+        let (_root, mut store) = lab();
+        register(&store.db, "mindy", 4, 4096);
+        queued(&store.db, "first", 1.0);
+        let claim = grant(&mut store, "k1");
+        let id = claim.attempt.id.clone();
+        register_supervisor(&mut store, &claim);
+        expire(&mut store, now() + 3600.0, 0.0).unwrap();
+        let lost = CompleteRequest {
+            drained: false,
+            ..finish(
+                &claim,
+                Outcome::Lost,
+                None,
+                125,
+                json!({"error":"supervisor exited"}),
+            )
+        };
+        let stolen = CompleteRequest {
+            lease: "stolen".into(),
+            ..lost.clone()
+        };
+        let refuse = |store: &mut Store, executor: &str, request: &CompleteRequest| {
+            let result = complete(store, executor, &Scope::all(), request, Outputs::InPlace);
+            assert!(matches!(result, Err(AuthorityError::Fenced)), "{executor}");
+            assert_eq!(row(&store.db, &id), ("interrupted".into(), false));
+        };
+        // Only the lease holder's report is recorded.
+        refuse(&mut store, "mindy", &stolen);
+        refuse(&mut store, "other", &lost);
+        assert!(store.attempt(&id).unwrap().refused.is_none());
+        refuse(&mut store, "mindy", &lost);
+        let attempt = store.attempt(&id).unwrap();
+        assert_eq!(attempt.completion, None);
+        let refused = attempt.refused.unwrap();
+        assert_eq!(
+            (
+                &refused["outcome"],
+                &refused["exit_code"],
+                &refused["reason"]
+            ),
+            (&json!("lost"), &json!(125), &Value::Null)
+        );
+        assert!(refused["at"].is_f64());
+        assert_eq!(
+            events(&store.db, "attempt.report_refused"),
+            [(
+                id.clone(),
+                json!({"executor":"mindy","outcome":"lost","exit_code":125})
+            )]
+        );
+        // Refused again, it is recorded once.
+        refuse(&mut store, "mindy", &lost);
+        assert_eq!(events(&store.db, "attempt.report_refused").len(), 1);
+        assert_eq!(store.attempt(&id).unwrap().refused, Some(refused));
+        assert_eq!(state(&store.db, "first"), "interrupted");
+        // Nothing is recorded of a report refused for another cause: an attempt already drained,
+        // or one still held whose action no longer waits on it.
+        for (name, key) in [("drained", "k2"), ("moved", "k3")] {
+            queued(&store.db, name, 2.0);
+            let claim = grant(&mut store, key);
+            if name == "drained" {
+                expire(&mut store, now() + 3600.0, 0.0).unwrap();
+                confirm_drained(&mut store, &claim.attempt.id).unwrap();
+            } else {
+                store
+                    .db
+                    .execute("UPDATE actions SET state='failed' WHERE id='moved'", [])
+                    .unwrap();
+            }
+            let request = CompleteRequest {
+                drained: false,
+                ..finish(&claim, Outcome::Lost, None, 125, json!({}))
+            };
+            let result = complete(
+                &mut store,
+                "mindy",
+                &Scope::all(),
+                &request,
+                Outputs::InPlace,
+            );
+            assert!(matches!(result, Err(AuthorityError::Fenced)), "{name}");
+            assert!(
+                store.attempt(&claim.attempt.id).unwrap().refused.is_none(),
+                "{name}"
+            );
+        }
+        assert_eq!(events(&store.db, "attempt.report_refused").len(), 1);
     }
 
     #[test]

@@ -1844,6 +1844,26 @@ async fn a_candidate_names_the_undrained_attempt_its_interrupted_job_waits_on() 
     assert_eq!(body["result"]["fenced"], json!(attempt));
     assert_eq!(body["result"]["claim"], Value::Null);
     assert_eq!(dep(&lab), json!({"action":action,"state":"queued"}));
+    // A late undrained report is refused but recorded: that coordinator never reports again.
+    let (refused, lease, _) = claim_as_mindy(&lab, "refused").await;
+    patchweft::authority::expire(&mut store, patchweft::now() + 1e6, 0.0).unwrap();
+    assert_eq!(dep(&lab)["awaiting_drain"]["may_self_heal"], true);
+    let (status, error) = executor_post(
+        &lab,
+        "complete",
+        MINDY,
+        json!({"attempt":refused,"lease":lease,"outcome":"lost","exit_code":125,
+               "evidence":{},"drained":false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{error}");
+    assert_eq!(error["error"]["code"], "attempt_fenced");
+    assert_eq!(attempt_row(&lab, &refused).2["refused"]["outcome"], "lost");
+    let job = dep(&lab);
+    assert_eq!(job["awaiting_drain"]["attempt"], json!(refused));
+    assert_eq!(job["awaiting_drain"]["may_self_heal"], false);
+    patchweft::authority::confirm_drained(&mut store, &refused).unwrap();
+    engine::retry(&mut store, &candidate.id, &[]).unwrap();
     // A report recorded undrained ends the attempt: only an operator's confirmation clears it,
     // whether the job was interrupted, failed or canceled, since `retry` refuses each.
     for (key, report, state) in [

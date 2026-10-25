@@ -1087,7 +1087,7 @@ fn awaiting_drain(db: &Connection, action: &str) -> Result<Option<Value>> {
     let attempt: Attempt = serde_json::from_str(&body)?;
     Ok(Some(json!({"attempt":attempt.id,
         "executor":attempt.executor.as_deref().unwrap_or(authority::LOCAL),
-        "lease_expires":attempt.lease_expires,"may_self_heal":attempt.completion.is_none()})))
+        "lease_expires":attempt.lease_expires,"may_self_heal":attempt.completion.is_none() && attempt.refused.is_none()})))
 }
 
 pub fn eligible(db: &Connection, action: &Action) -> Result<bool> {

@@ -284,6 +284,10 @@ pub struct Attempt {
     pub completion: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop: Option<String>,
+    /// The holder's late, undrained report, refused after its lease lapsed: that executor will
+    /// not report the attempt again. Outcome, exit code, reason and time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
