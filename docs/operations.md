@@ -136,13 +136,13 @@ The store waits for those reports for a bounded time: two of the executor's leas
 after expiry interrupted the attempt (10 minutes for a 300-second lease). The deadline
 is fixed when the lease expires, from the lease the executor had then, and recorded as
 the attempt's `heal_until`: changing the lease later never reopens or shortens it. Until then,
-while no report of the attempt is recorded and its action has requeue budget left, the
-job may still heal itself: the candidate is `pending`, as while a job is queued or
+while no report of the attempt is recorded and a drain could still move its action
+(requeue budget left, or nobody wants the work), the job may still heal itself: the candidate is `pending`, as while a job is queued or
 running, so `wait` keeps waiting. A report that arrives in time settles the job as
 above. Once the bound passes, once the coordinator's late report is refused for being
-undrained (it never reports again), or at once when the budget is already spent (any
-report could only leave the job interrupted), the candidate is `failed` for an
-operator, and stays so: a
+undrained (it never reports again), or at once when the budget is already spent and the work is
+still wanted (any report could only leave the job interrupted), the candidate is
+`failed` for an operator, and stays so: a
 drain reported later only releases the capacity, and `retry` runs the job again.
 Only time bounds the wait, since a coordinator learns it was fenced before it has
 stopped its job and cleaned up. Until a drain is reported or confirmed, the job's

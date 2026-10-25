@@ -1352,8 +1352,9 @@ fn settle_action(db: &Connection, action: &str, attempt: &str, state: &str) -> R
 const SELF_HEAL_LEASES: f64 = 2.0;
 
 /// Whether attempt `id`'s own executor may still settle it, so the verdict on its job waits:
-/// expiry interrupted it undrained, no report of it was recorded or refused, its action has
-/// requeue budget left, and the deadline fixed at expiry has not passed. The candidate's verdict
+/// expiry interrupted it undrained, no report of it was recorded or refused, a drain could still
+/// move its action (`unsettled` would cancel or queue it), and the deadline fixed at expiry has not
+/// passed. The candidate's verdict
 /// and `awaiting_drain` read this, and a drain reported later requeues nothing, so a verdict once
 /// failed stays failed until an operator acts.
 pub fn may_self_heal(db: &Connection, id: &str, now: f64) -> Result<bool> {
@@ -1363,12 +1364,13 @@ pub fn may_self_heal(db: &Connection, id: &str, now: f64) -> Result<bool> {
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
     let attempt: Attempt = serde_json::from_str(&body)?;
-    // With the requeue budget spent, any report could only leave the action interrupted.
+    // `unsettled` owns what a drain does: work nobody wants is canceled whatever the budget, and
+    // only wanted work with the budget spent could end nowhere but interrupted.
     if state != "interrupted"
         || drained
         || attempt.completion.is_some()
         || attempt.refused.is_some()
-        || !budget_left(db, &attempt.action)?
+        || unsettled(db, &attempt, true)? == "interrupted"
     {
         return Ok(false);
     }
@@ -4556,10 +4558,10 @@ mod tests {
     fn an_interruption_requeues_alike_in_lease_and_after_its_lease_lapsed() {
         // The same drained partition report, landing while the lease is held (a short blip) or
         // after it lapsed (a long one), means the same: no verdict, so the action is queued again
-        // within the budget, or canceled if nobody wants it.
+        // within the budget, or canceled if nobody wants it, whatever the budget ("both").
         let (_root, mut store) = lab();
         register(&store.db, "mindy", 16, 16384);
-        let cases = ["fresh", "spent", "unwanted"];
+        let cases = ["fresh", "spent", "unwanted", "both"];
         let mut claims = BTreeMap::new();
         for (n, (case, when)) in cases
             .iter()
@@ -4571,13 +4573,13 @@ mod tests {
             let claim = grant(&mut store, &format!("k{n}"));
             assert_eq!(claim.action.id, name);
             register_supervisor(&mut store, &claim);
-            if case == "spent" {
+            if case == "spent" || case == "both" {
                 store
                     .db
                     .execute("INSERT INTO requeues VALUES (?,3)", [&name])
                     .unwrap();
             }
-            if case == "unwanted" {
+            if case == "unwanted" || case == "both" {
                 stopping(&store.db, &name, &claim.attempt.id, Some("no-requesters")).unwrap();
             }
             claims.insert((case, when), claim);
@@ -4598,14 +4600,14 @@ mod tests {
             .unwrap();
             assert_eq!(response.status, "recorded", "{case}");
             // Recorded like a lost supervisor's: canceled when nobody wants it.
-            let expected = if case == "unwanted" {
+            let expected = if case == "unwanted" || case == "both" {
                 "canceled"
             } else {
                 "interrupted"
             };
             assert_eq!(response.state.as_deref(), Some(expected), "{case}");
         }
-        assert_eq!(expire(&mut store, now() + 3600.0, 0.0).unwrap().len(), 3);
+        assert_eq!(expire(&mut store, now() + 3600.0, 0.0).unwrap().len(), 4);
         for case in cases {
             let request = report(&claims[&(case, "lapsed")]);
             let response = complete(
@@ -4622,6 +4624,7 @@ mod tests {
             ("fresh", ("queued", 1)),
             ("spent", ("interrupted", 3)),
             ("unwanted", ("canceled", 0)),
+            ("both", ("canceled", 3)),
         ] {
             for when in ["held", "lapsed"] {
                 let name = format!("{when}-{case}");
