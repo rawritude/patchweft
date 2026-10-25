@@ -627,6 +627,7 @@ pub fn claim_for(
         claim_key: Some(key.clone()),
         completion: None,
         stop: None,
+        lapsed: None,
         refused: None,
     };
     transaction.execute(
@@ -1338,23 +1339,61 @@ fn settle_action(db: &Connection, action: &str, attempt: &str, state: &str) -> R
     Ok(())
 }
 
+/// How long, in its executor's leases after expiry interrupted it, an attempt may still be settled
+/// by that executor's own report. A coordinator that cannot renew stops its jobs before its lease
+/// runs out and renews at least every third of a lease, so once it reconnects it learns it was
+/// fenced, finishes cleanup and reports well within one more lease; two allow for a reconnect up
+/// to a lease after the lapse. Time alone bounds it: a coordinator is told it was fenced before it
+/// has stopped and cleaned up, so contact without a report does not mean none will come (gate
+/// P2-1).
+const SELF_HEAL_LEASES: f64 = 2.0;
+
+/// Whether an attempt's own executor may still settle it, so the verdict on its job waits:
+/// expiry interrupted it undrained, no report of it was recorded or refused, and the bound has
+/// not passed. The candidate's verdict and `awaiting_drain` read this, and a drain reported later
+/// requeues nothing, so a verdict once failed stays failed until an operator acts.
+pub fn may_self_heal(
+    db: &Connection,
+    state: &str,
+    drained: bool,
+    attempt: &Attempt,
+    now: f64,
+) -> Result<bool> {
+    if state != "interrupted"
+        || drained
+        || attempt.completion.is_some()
+        || attempt.refused.is_some()
+    {
+        return Ok(false);
+    }
+    // An attempt expired before `lapsed` was recorded counts from its lease's end.
+    let Some(lapsed) = attempt.lapsed.or(attempt.lease_expires) else {
+        return Ok(false);
+    };
+    let executor = attempt.executor.as_deref().unwrap_or(LOCAL);
+    let lease_seconds = load(db, executor)?.map_or(DEFAULT_LEASE_SECONDS, |r| r.lease_seconds);
+    Ok(now < lapsed + SELF_HEAL_LEASES * lease_seconds as f64)
+}
+
 /// Drains an attempt whose lease lapsed (A2, or a claim its executor never recorded) and records
-/// `detail` with whether it was requeued. An action still waiting on it that nobody wants is
-/// canceled; otherwise, without a verdict, it goes where a lost supervisor's would, and with one
-/// it stays interrupted.
+/// `detail` with whether it was requeued. Within the self-heal bound, an action still waiting on
+/// it that nobody wants is canceled; otherwise, without a verdict, it goes where a lost
+/// supervisor's would, and with one it stays interrupted. Past the bound only the capacity is
+/// released: the verdict was already the operator's.
 fn drain_lapsed(
     db: &Connection,
     attempt: &Attempt,
     verdictless: bool,
     mut detail: Value,
 ) -> Result<()> {
+    let healing = may_self_heal(db, "interrupted", false, attempt, now())?;
     db.execute("UPDATE attempts SET drained=1 WHERE id=?", [&attempt.id])?;
     let waiting: i64 = db.query_row(
         "SELECT COUNT(*) FROM actions WHERE id=? AND attempt=? AND state='interrupted'",
         params![attempt.action, attempt.id],
         |r| r.get(0),
     )?;
-    let action_state = if waiting > 0 {
+    let action_state = if healing && waiting > 0 {
         let state = unsettled(db, attempt, true)?;
         // Nobody wanting the work decides before any verdict does.
         (state == "canceled" || verdictless).then_some(state)
@@ -1509,6 +1548,8 @@ struct Lapsed {
     executor: String,
     lease_expires: f64,
     effective: f64,
+    /// When the lapse was found: expiry records it as the attempt's `lapsed`.
+    found: f64,
 }
 
 /// Interrupts attempts whose executor stopped renewing. Only the API process expires leases.
@@ -1550,6 +1591,7 @@ fn lapsed(db: &Connection, now: f64, api_start: f64) -> Result<Vec<Lapsed>> {
                 executor,
                 lease_expires,
                 effective,
+                found: now,
             });
         }
     }
@@ -1561,9 +1603,9 @@ fn lapsed(db: &Connection, now: f64, api_start: f64) -> Result<Vec<Lapsed>> {
 fn expire_lease(store: &mut Store, lapsed: &Lapsed) -> Result<bool> {
     let transaction = store.transaction()?;
     let expired = transaction.execute(
-        "UPDATE attempts SET state='interrupted',drained=0 WHERE id=?
-         AND state IN ('claimed','running') AND json_extract(body,'$.lease_expires')=?",
-        params![lapsed.attempt, lapsed.lease_expires],
+        "UPDATE attempts SET state='interrupted',drained=0,body=json_set(body,'$.lapsed',?3)
+         WHERE id=?1 AND state IN ('claimed','running') AND json_extract(body,'$.lease_expires')=?2",
+        params![lapsed.attempt, lapsed.lease_expires, lapsed.found],
     )? == 1;
     if expired {
         transaction.execute(
@@ -4144,6 +4186,84 @@ mod tests {
         let (subject, detail) = reported.last().unwrap().clone();
         assert_eq!(subject, claim.attempt.id);
         detail
+    }
+
+    #[test]
+    fn a_lapse_settles_itself_only_within_its_bound() {
+        let (_root, mut store) = lab();
+        let mut mindy = register(&store.db, "mindy", 8, 8192);
+        mindy.lease_seconds = 10;
+        save(&store.db, &mindy).unwrap();
+        for (name, n) in [("healing", 1.0), ("unrecorded", 2.0), ("reported", 3.0)] {
+            queued(&store.db, name, n);
+        }
+        let claims: Vec<Claim> = ["k1", "k2", "k3"]
+            .iter()
+            .map(|key| grant(&mut store, key))
+            .collect();
+        register_supervisor(&mut store, &claims[2]);
+        let expired_at = claims[0].attempt.lease_expires + 1.0;
+        assert_eq!(expire(&mut store, expired_at, 0.0).unwrap().len(), 3);
+        let heals = |store: &Store, id: &str, at: f64| {
+            let (state, drained): (String, bool) = row(&store.db, id);
+            may_self_heal(&store.db, &state, drained, &store.attempt(id).unwrap(), at).unwrap()
+        };
+        // Expiry records when it interrupted the attempt; the bound is two of mindy's leases.
+        let id = claims[0].attempt.id.clone();
+        let lapsed = store.attempt(&id).unwrap().lapsed.unwrap();
+        assert!((lapsed - expired_at).abs() < 1e-3, "{lapsed}");
+        assert!(heals(&store, &id, expired_at + 19.9));
+        assert!(!heals(&store, &id, expired_at + 20.1));
+        // An attempt expired before `lapsed` existed counts from its lease's end.
+        store
+            .db
+            .execute(
+                "UPDATE attempts SET body=json_remove(body,'$.lapsed') WHERE id=?",
+                [&id],
+            )
+            .unwrap();
+        let ended = claims[0].attempt.lease_expires;
+        assert!(heals(&store, &id, ended + 19.9));
+        assert!(!heals(&store, &id, ended + 20.1));
+        // Past the bound, a report still releases the capacity but settles nothing: the verdict
+        // is already the operator's.
+        for claim in &claims[1..] {
+            store
+                .db
+                .execute(
+                    "UPDATE attempts SET body=json_set(body,'$.lapsed',?) WHERE id=?",
+                    params![now() - 21.0, claim.attempt.id],
+                )
+                .unwrap();
+            assert!(!heals(&store, &claim.attempt.id, now()));
+        }
+        let id = claims[1].attempt.id.clone();
+        claim_for(&mut store, "mindy", &Scope::all(), &unrecorded("k2", &id)).unwrap();
+        assert_eq!(row(&store.db, &id), ("interrupted".into(), true));
+        assert_eq!(state(&store.db, "unrecorded"), "interrupted");
+        let detail = late_report(&mut store, &claims[2], Outcome::Lost, None, 125);
+        assert_eq!(detail["requeued"], false);
+        assert_eq!(state(&store.db, "reported"), "interrupted");
+        assert_eq!(held(&store.db, "mindy").unwrap(), one());
+        // Nothing to wait for once drained, reported, refused or not interrupted.
+        let id = claims[0].attempt.id.clone();
+        let attempt = store.attempt(&id).unwrap();
+        let at = ended + 1.0;
+        assert!(may_self_heal(&store.db, "interrupted", false, &attempt, at).unwrap());
+        assert!(!may_self_heal(&store.db, "interrupted", true, &attempt, at).unwrap());
+        assert!(!may_self_heal(&store.db, "failed", false, &attempt, at).unwrap());
+        for edit in [
+            Attempt {
+                completion: Some("hash".into()),
+                ..attempt.clone()
+            },
+            Attempt {
+                refused: Some(json!({"outcome":"lost"})),
+                ..attempt.clone()
+            },
+        ] {
+            assert!(!may_self_heal(&store.db, "interrupted", false, &edit, at).unwrap());
+        }
     }
 
     #[test]

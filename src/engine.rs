@@ -1049,10 +1049,12 @@ fn candidate_status_db(
         "blocked"
     } else if jobs.values().all(|v| v["state"] == "passed") {
         "passed"
-    } else if jobs
-        .values()
-        .any(|v| v["state"] == "failed" || v["state"] == "interrupted")
-    {
+    } else if jobs.values().any(|v| {
+        // A lapse its executor may still settle is no verdict yet: pending, as while the job is
+        // queued or running, until the report comes or the authority's bound passes (gate P2-1).
+        (v["state"] == "failed" || v["state"] == "interrupted")
+            && v["awaiting_drain"]["may_self_heal"] != true
+    }) {
         "failed"
     } else if jobs.values().all(|v| v["state"] == "canceled") {
         "canceled"
@@ -1069,25 +1071,25 @@ fn candidate_status_db(
 }
 
 /// The undrained attempt a finished action still points at: until its executor reports the drain
-/// or an operator confirms it, its capacity stays held and `retry` refuses the job. Only a lapse
-/// with nothing recorded (`may_self_heal`) can still be settled by its executor's own report, and
-/// nothing promises that report will come: a refused report is not recorded.
+/// or an operator confirms it, its capacity stays held and `retry` refuses the job.
+/// `may_self_heal` is the authority's bounded judgement that its executor may still settle it.
 fn awaiting_drain(db: &Connection, action: &str) -> Result<Option<Value>> {
-    let body: Option<String> = db
+    let row: Option<(String, String)> = db
         .query_row(
-            "SELECT t.body FROM actions a JOIN attempts t ON t.id=a.attempt
+            "SELECT t.state,t.body FROM actions a JOIN attempts t ON t.id=a.attempt
              WHERE a.id=? AND t.drained=0",
             [action],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    let Some(body) = body else {
+    let Some((state, body)) = row else {
         return Ok(None);
     };
     let attempt: Attempt = serde_json::from_str(&body)?;
+    let may_self_heal = authority::may_self_heal(db, &state, false, &attempt, now())?;
     Ok(Some(json!({"attempt":attempt.id,
         "executor":attempt.executor.as_deref().unwrap_or(authority::LOCAL),
-        "lease_expires":attempt.lease_expires,"may_self_heal":attempt.completion.is_none() && attempt.refused.is_none()})))
+        "lease_expires":attempt.lease_expires,"may_self_heal":may_self_heal})))
 }
 
 pub fn eligible(db: &Connection, action: &Action) -> Result<bool> {

@@ -738,20 +738,12 @@ fn late_completion_is_fenced_and_drain_report_releases() {
     assert_ne!(lab.attempt_of(&action)["id"], attempt.as_str());
 }
 
-#[test]
-fn a_lost_claim_response_is_drained_and_run_again_without_an_operator() {
-    // The authority records a claim whose response never reaches mindy. Its replayed key gets
-    // through only after the lease lapsed: fenced, and mindy's ledger never held the attempt.
-    let lab = Lab::new(
-        json!([
-            job("kept", "true", json!({})),
-            job("lost", "true", json!({}))
-        ]),
-        &["kept"],
-    );
+/// mindy runs `kept`, then the authority records a claim of `lost` whose response never reaches
+/// mindy: the key waits in mindy's `pending-claim` until the lease lapses. Returns the candidate
+/// and the lost attempt.
+fn lost_claim(lab: &Lab) -> (Value, String) {
     let candidate = lab.submit("agent");
     let kept = candidate["required"]["kept"].as_str().unwrap();
-    let lost = candidate["required"]["lost"].as_str().unwrap();
     assert_eq!(lab.drain_remote(), json!({"executor":"mindy","launched":1}));
     assert_eq!(lab.row("actions", kept).0, "passed");
     lab.call(&[
@@ -770,29 +762,68 @@ fn a_lost_claim_response_is_drained_and_run_again_without_an_operator() {
     };
     let response: ClaimResponse = client.executor("claim", &request, None).unwrap();
     let claim = response.claim.unwrap();
-    assert_eq!(claim.action.id, lost);
-    let attempt = claim.attempt.id;
+    assert_eq!(
+        claim.action.id,
+        candidate["required"]["lost"].as_str().unwrap()
+    );
     fs::write(
         lab.work.join("pending-claim"),
         json!({"key":"lost-response"}).to_string(),
     )
     .unwrap();
     wait_until("lease expiry", || lab.count("attempt.lease_expired") == 1);
+    let attempt = claim.attempt.id;
     assert_eq!(lab.row("attempts", &attempt), ("interrupted".into(), false));
-    // Until something confirms the drain, the candidate says who holds the job and since when.
-    let status = lab.call(&["status", candidate["id"].as_str().unwrap()]);
-    assert_eq!(status["state"], "failed");
+    (candidate, attempt)
+}
+
+fn kept_and_lost() -> Lab {
+    Lab::new(
+        json!([
+            job("kept", "true", json!({})),
+            job("lost", "true", json!({}))
+        ]),
+        &["kept"],
+    )
+}
+
+#[test]
+fn a_lost_claim_response_is_drained_and_run_again_without_an_operator() {
+    // The authority records a claim whose response never reaches mindy. Its replayed key gets
+    // through only after the lease lapsed: fenced, and mindy's ledger never held the attempt.
+    let lab = kept_and_lost();
+    let (candidate, attempt) = lost_claim(&lab);
+    let id = candidate["id"].as_str().unwrap();
+    let kept = candidate["required"]["kept"].as_str().unwrap();
+    let lost = candidate["required"]["lost"].as_str().unwrap();
+    // Until something settles it, the candidate is pending, not failed, and says who holds the
+    // job and since when.
+    let status = lab.call(&["status", id]);
+    assert_eq!(status["state"], "pending");
     assert_eq!(
         status["jobs"]["lost"]["awaiting_drain"],
         json!({"attempt":attempt,"executor":"mindy",
                "lease_expires":lab.body("attempts", &attempt)["lease_expires"],"may_self_heal":true})
     );
     assert!(status["jobs"]["kept"].get("awaiting_drain").is_none());
+    // `wait` stays with it through the recovery.
+    let mut wait = lab
+        .command(&["wait", id, "--timeout-seconds", "120"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(1500));
+    assert!(
+        wait.try_wait().unwrap().is_none(),
+        "wait ended mid-recovery"
+    );
     let log = lab.log("mindy");
     assert_eq!(
         parsed(lab.spawn_remote(&log).wait_with_output().unwrap()),
         json!({"executor":"mindy","launched":1})
     );
+    assert_eq!(parsed(wait.wait_with_output().unwrap())["state"], "passed");
     assert_eq!(logged(&log, "claim_fenced")[0]["attempt"], attempt.as_str());
     assert_eq!(
         logged(&log, "claim_unrecorded")[0]["attempt"],
@@ -815,7 +846,7 @@ fn a_lost_claim_response_is_drained_and_run_again_without_an_operator() {
         .unwrap();
     assert_eq!(requeues, 1);
     assert_ne!(lab.attempt_of(lost)["id"], attempt.as_str());
-    let status = lab.call(&["status", candidate["id"].as_str().unwrap()]);
+    let status = lab.call(&["status", id]);
     assert_eq!(status["state"], "passed");
     assert!(status["jobs"]["lost"].get("awaiting_drain").is_none());
     let claimed = lab.events_of("attempt.claimed");
@@ -827,6 +858,45 @@ fn a_lost_claim_response_is_drained_and_run_again_without_an_operator() {
         1
     );
     assert_eq!(lab.count("attempt.interrupted"), 0);
+}
+
+#[test]
+fn a_lapse_nothing_settles_fails_its_candidate_once_its_bound_passes() {
+    // Three-second leases: a lapse may heal itself for two of them, then the verdict is failed
+    // and stays failed, whatever reports later.
+    let lab = kept_and_lost();
+    lab.call(&["executor-set", "mindy", "--lease-seconds", "3"]);
+    let (candidate, attempt) = lost_claim(&lab);
+    let id = candidate["id"].as_str().unwrap();
+    let lapsed = Instant::now();
+    let output = lab
+        .command(&["wait", id, "--timeout-seconds", "60"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    let ended: Value = serde_json::from_str(error["error"].as_str().unwrap()).unwrap();
+    assert_eq!(ended["state"], "failed");
+    let elapsed = lapsed.elapsed();
+    assert!(elapsed > Duration::from_secs(4), "{elapsed:?}");
+    let status = lab.call(&["status", id]);
+    assert_eq!(
+        status["jobs"]["lost"]["awaiting_drain"]["may_self_heal"],
+        false
+    );
+    // mindy comes back and says it never recorded the attempt: drained, but not run again.
+    assert_eq!(lab.drain_remote(), json!({"executor":"mindy","launched":0}));
+    assert_eq!(lab.row("attempts", &attempt), ("interrupted".into(), true));
+    let reports = lab.events_of("attempt.drain_reported");
+    assert_eq!(
+        reports[0]["detail"],
+        json!({"executor":"mindy","reason":"claim-unrecorded","requeued":false})
+    );
+    assert_eq!(lab.state_of(&candidate), "failed");
+    // An operator's retry needs no drain confirmation.
+    lab.call(&["retry", id]);
+    assert_eq!(lab.drain_remote(), json!({"executor":"mindy","launched":1}));
+    assert_eq!(lab.state_of(&candidate), "passed");
 }
 
 #[test]

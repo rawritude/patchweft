@@ -284,6 +284,10 @@ pub struct Attempt {
     pub completion: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop: Option<String>,
+    /// When expiry interrupted the attempt: its executor's own report may settle it for a bounded
+    /// time after.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lapsed: Option<f64>,
     /// The holder's late, undrained report, refused after its lease lapsed: that executor will
     /// not report the attempt again. Outcome, exit code, reason and time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
