@@ -294,9 +294,15 @@ Cleanup runs afterward, so the job timeout is not a hard bound on the complete
 attempt lifecycle.
 
 Jobs receive `PATCHWEFT_STATE`, `PATCHWEFT_ATTEMPT`, `PATCHWEFT_REVISION`,
-`PATCHWEFT_SLOTS` (unless `export_slots` is false), `PATCHWEFT_REPORT` and, for
+`PATCHWEFT_SLOTS` (unless `export_slots` is false), `PATCHWEFT_REPORT`,
+`PATCHWEFT_VACUOUS` and, for
 declared jobs with a passed key, `PATCHWEFT_INPUTS` and, for declared jobs with
 `base_paths` and a base, `PATCHWEFT_BASE` (passed key or not).
+`PATCHWEFT_VACUOUS` is an absolute path in the attempt directory, outside the
+checkout, that does not exist at launch: a job that passes without doing its work
+(its surface untouched) may create it, and the pass then records `"vacuous": true`
+in its evidence and is not counted toward the job's expected duration, while its
+state, reuse, events and status are those of any other pass.
 `PATCHWEFT_STATE` is the store's directory on the API host and the executor's
 `--work` directory elsewhere; `$PATCHWEFT_STATE/attempts/$PATCHWEFT_ATTEMPT` is the
 attempt directory on both.
