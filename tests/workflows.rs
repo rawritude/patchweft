@@ -1600,7 +1600,7 @@ fn a_pass_that_creates_patchweft_vacuous_is_marked_vacuous() {
         let samples: i64 = lab
             .database()
             .query_row(
-                "SELECT COUNT(*) FROM job_durations WHERE job=?",
+                "SELECT COUNT(*) FROM job_estimates WHERE job=?",
                 [job],
                 |r| r.get(0),
             )
