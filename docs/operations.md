@@ -24,10 +24,13 @@ rank is its expected occupancy plus the highest rank among the queued jobs waiti
 a train's prepare passes, its long shards are admitted before short ones queued earlier.
 Expected occupancy is the median of the job's last 7 passes in its profile, from claim to result
 on the store's clock; a pass whose job created `PATCHWEFT_VACUOUS` (it skipped its work) is not
-counted. While its own profile has none, it is that of the most recently updated profile with
-the same definition name (lineage) in the same project, so a re-registered profile inherits its
-predecessor's; other projects and other names (a nightly beside a validation profile) never
-count. Each project, lineage and job keeps the samples of its 3 most recently updated profiles.
+counted. Passes recorded before a version that knows the marker count as before, so after that
+upgrade a surface job's estimate keeps its older skip passes until its first pass that does its
+work: the first train in which it applies pays for them once. While its own profile has none,
+it is that of the most recently updated profile with the same definition name (lineage) in the
+same project, so a re-registered profile inherits its predecessor's; other projects and other
+names (a nightly beside a validation profile) never count. Each project, lineage and job keeps
+the samples of its 3 most recently updated profiles.
 A job with no history there either expects the median of what its profile's other queued jobs
 are expected to take, so a new shard does not wait behind every known short job. The first
 preparation after an upgrade seeds the samples from the passes already recorded.

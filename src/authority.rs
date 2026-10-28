@@ -4184,8 +4184,8 @@ mod tests {
 
     #[test]
     fn a_job_without_history_is_expected_to_take_as_long_as_its_profiles_known_jobs() {
-        // A new shard used to rank 0, below every known job, so a known 8 s job created after it
-        // was claimed first.
+        // A new shard must not rank below every known job: a known 8 s job created after it is
+        // not claimed before it.
         let (_root, store) = hold_lab();
         train_job(&store.db, "new-shard", "vitest-new", 1.0, &[]);
         train_job(&store.db, "lint", "lint", 2.0, &[]);
