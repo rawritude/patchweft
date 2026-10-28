@@ -8,7 +8,7 @@ use crate::{
     unique,
 };
 use anyhow::{Context, Result, ensure};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
@@ -101,6 +101,7 @@ pub fn prepare(db: &Connection) -> Result<()> {
         "INSERT OR IGNORE INTO executors VALUES (?,?)",
         params![LOCAL, serde_json::to_string(&default_record(LOCAL))?],
     )?;
+    prepare_durations(db)?;
     Ok(())
 }
 
@@ -189,6 +190,8 @@ pub fn fits(held: Reservation, wanted: Reservation, capacity: Reservation) -> bo
         && held.memory_mb + wanted.memory_mb <= capacity.memory_mb
 }
 
+/// Admissible work for one of its owners; `select` orders these by priority, fair share,
+/// critical-path rank and age.
 pub struct Choice {
     pub owner: String,
     /// The owner's scheduling priority.
@@ -212,8 +215,8 @@ pub struct Selection {
 }
 
 /// The head of one executor's queue: work it may run and could ever fit, ordered by owner
-/// priority then fair share. An unverified head admits nothing until it is verified, so
-/// verification lag never reorders admission.
+/// priority, then fair share, then critical-path rank, then age. An unverified head admits
+/// nothing until it is verified, so verification lag never reorders admission.
 pub fn select(
     db: &Connection,
     record: &ExecutorRecord,
@@ -229,13 +232,14 @@ pub fn select(
             .map(|v| Ok(serde_json::from_str(&v?)?))
             .collect::<Result<_>>()?
     };
+    let ranks = ranks(&queued, &Durations::load(db)?);
     let priorities = owner_priorities(db)?;
     let mut profiles = BTreeMap::new();
     let mut unverified = Vec::new();
     let mut choices = Vec::new();
     let mut hold: BTreeMap<i64, Reservation> = BTreeMap::new();
     let mut waited_on = BTreeMap::new();
-    for action in queued {
+    for (action, rank) in queued.into_iter().zip(ranks) {
         if !scope.allows_profile(&action.profile)
             || refused.contains(&action.profile)
             || refused.contains(REFUSE_ALL)
@@ -337,20 +341,25 @@ pub fn select(
                 reservation,
                 timeout_seconds,
             };
-            choices.push((priority, served, trusted, choice));
+            choices.push((priority, served, rank, trusted, choice));
         }
     }
     // Higher operator priority first (a landing-ready train), then fair share between owners.
+    // Within one owner, the job ahead of the longest chain left: once a train's prepare passes,
+    // a slot that frees goes to its long cross shard, not to short shards queued before it
+    // (#4204, train 59). With no history every rank is 0 and the oldest goes first. A long head
+    // that does not fit yet drains its executor for longer (`claim_for`).
     choices.sort_by(|a, b| {
         b.0.cmp(&a.0)
             .then(a.1.total_cmp(&b.1))
-            .then(a.3.action.created.total_cmp(&b.3.action.created))
-            .then(a.3.owner.cmp(&b.3.owner))
+            .then(b.2.total_cmp(&a.2))
+            .then(a.4.action.created.total_cmp(&b.4.action.created))
+            .then(a.4.owner.cmp(&b.4.owner))
     });
     let choice = choices
         .into_iter()
         .next()
-        .filter(|(_, _, trusted, _)| *trusted)
+        .filter(|(_, _, _, trusted, _)| *trusted)
         .map(|(.., choice)| choice);
     let freed = waited_on
         .into_values()
@@ -432,6 +441,234 @@ fn owner_priorities(db: &Connection) -> Result<BTreeMap<String, i64>> {
     let mut stmt = db.prepare("SELECT owner, priority FROM owner_priorities")?;
     let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Occupancy samples kept per profile and job: a median of a few shrugs off one slow host and
+/// still follows a job that got slower.
+const DURATION_SAMPLES: usize = 7;
+/// A pass's occupancy also covers its claim's transfers before the command's timer and its
+/// uploads after: one that outlasts its timeout by more than this is a clock step, not a run.
+const DURATION_GRACE_SECONDS: f64 = 300.0;
+
+/// Expected occupancy per profile and job, which `select` ranks critical paths by. Seeded once,
+/// when the table is created, from the passes already recorded, so the first train after an
+/// upgrade is not ranked cold; under one write lock, so concurrent first opens seed it once.
+fn prepare_durations(db: &Connection) -> Result<()> {
+    if table_exists(db, "job_durations")? {
+        return Ok(());
+    }
+    let transaction = db
+        .is_autocommit()
+        .then(|| Transaction::new_unchecked(db, TransactionBehavior::Immediate))
+        .transpose()?;
+    if !table_exists(db, "job_durations")? {
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS job_durations (profile TEXT NOT NULL, job TEXT NOT NULL,
+             samples TEXT NOT NULL, PRIMARY KEY(profile, job))",
+        )?;
+        // Fields extracted, not bodies parsed: a pass's evidence can be megabytes.
+        let mut stmt = db.prepare(
+            "SELECT json_extract(a.body,'$.profile'), json_extract(a.body,'$.job'),
+             json_extract(t.body,'$.created'), json_extract(t.body,'$.ended'),
+             COALESCE(json_extract(t.body,'$.timeout_seconds'),
+                      json_extract(a.body,'$.identity.timeout_seconds'))
+             FROM attempts t JOIN actions a ON a.id=t.action WHERE t.state='passed'
+             ORDER BY json_extract(t.body,'$.ended'), t.rowid",
+        )?;
+        let passes = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<f64>>(2)?,
+                r.get::<_, Option<f64>>(3)?,
+                r.get::<_, Option<f64>>(4)?,
+            ))
+        })?;
+        let mut kept: BTreeMap<(String, String), Vec<f64>> = BTreeMap::new();
+        for pass in passes {
+            let (profile, job, created, ended, timeout_seconds) = pass?;
+            if let (Some(created), Some(ended), Some(timeout_seconds)) =
+                (created, ended, timeout_seconds)
+                && let Some(seconds) = occupancy(created, ended, timeout_seconds)
+            {
+                kept.entry((profile, job)).or_default().push(seconds);
+            }
+        }
+        for ((profile, job), mut samples) in kept {
+            samples.drain(..samples.len().saturating_sub(DURATION_SAMPLES));
+            db.execute(
+                "INSERT INTO job_durations VALUES (?,?,?)",
+                params![profile, job, serde_json::to_string(&samples)?],
+            )?;
+        }
+    }
+    if let Some(transaction) = transaction {
+        transaction.commit()?;
+    }
+    Ok(())
+}
+
+/// A pass's occupancy, from its claim to its result: the authority stamps both on its own clock,
+/// so no executor's clock or report enters it. None when it cannot be a measurement.
+fn occupancy(created: f64, ended: f64, timeout_seconds: f64) -> Option<f64> {
+    let seconds = ended - created;
+    (seconds.is_finite() && (0.0..=timeout_seconds + DURATION_GRACE_SECONDS).contains(&seconds))
+        .then_some(seconds)
+}
+
+/// Adds a pass's occupancy to its job's samples, keeping the newest. Samples only order work,
+/// so a row that does not parse is started over rather than failing the result.
+fn remember_duration(db: &Connection, profile: &str, job: &str, seconds: f64) -> Result<()> {
+    let samples: Option<String> = db
+        .query_row(
+            "SELECT samples FROM job_durations WHERE profile=? AND job=?",
+            [profile, job],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let mut samples: Vec<f64> = samples
+        .and_then(|samples| serde_json::from_str(&samples).ok())
+        .unwrap_or_default();
+    samples.push(seconds);
+    samples.drain(..samples.len().saturating_sub(DURATION_SAMPLES));
+    db.execute(
+        "INSERT INTO job_durations VALUES (?,?,?)
+         ON CONFLICT(profile,job) DO UPDATE SET samples=excluded.samples",
+        params![profile, job, serde_json::to_string(&samples)?],
+    )?;
+    Ok(())
+}
+
+/// Each job's expected occupancy, read once per selection: the median of its own samples, else
+/// of its name's in every profile, since a re-registered profile starts without history.
+#[derive(Default)]
+struct Durations {
+    by_key: BTreeMap<String, BTreeMap<String, f64>>,
+    by_job: BTreeMap<String, f64>,
+}
+
+impl Durations {
+    /// A store not yet prepared has no history.
+    fn load(db: &Connection) -> Result<Self> {
+        let mut durations = Self::default();
+        if !table_exists(db, "job_durations")? {
+            return Ok(durations);
+        }
+        let mut stmt = db.prepare("SELECT profile, job, samples FROM job_durations")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut by_job: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+        for row in rows {
+            let (profile, job, samples) = row?;
+            let samples: Vec<f64> = serde_json::from_str::<Vec<f64>>(&samples)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+                .collect();
+            if let Some(median) = median(samples.clone()) {
+                durations
+                    .by_key
+                    .entry(profile)
+                    .or_default()
+                    .insert(job.clone(), median);
+            }
+            by_job.entry(job).or_default().extend(samples);
+        }
+        durations.by_job = by_job
+            .into_iter()
+            .filter_map(|(job, samples)| Some((job, median(samples)?)))
+            .collect();
+        Ok(durations)
+    }
+
+    fn expected(&self, profile: &str, job: &str) -> Option<f64> {
+        self.by_key
+            .get(profile)
+            .and_then(|jobs| jobs.get(job))
+            .or_else(|| self.by_job.get(job))
+            .copied()
+    }
+}
+
+fn median(mut samples: Vec<f64>) -> Option<f64> {
+    samples.sort_by(f64::total_cmp);
+    let middle = samples.len() / 2;
+    match samples.len() {
+        0 => None,
+        n if n % 2 == 1 => Some(samples[middle]),
+        _ => Some((samples[middle - 1] + samples[middle]) / 2.0),
+    }
+}
+
+/// Each queued action's critical-path rank, in queue order: its expected occupancy plus the
+/// highest rank among the queued actions waiting on it, so the job ahead of the longest chain
+/// left sorts first. Unknown occupancy counts as none.
+fn ranks(queued: &[Action], durations: &Durations) -> Vec<f64> {
+    let actions: BTreeMap<&str, &Action> = queued
+        .iter()
+        .map(|action| (action.id.as_str(), action))
+        .collect();
+    let mut dependents: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for action in queued {
+        for dependency in &action.dependencies {
+            if actions.contains_key(dependency.as_str()) {
+                dependents
+                    .entry(dependency.as_str())
+                    .or_default()
+                    .push(&action.id);
+            }
+        }
+    }
+    let mut memo = BTreeMap::new();
+    queued
+        .iter()
+        .map(|action| {
+            rank(
+                &action.id,
+                &actions,
+                &dependents,
+                durations,
+                &mut BTreeSet::new(),
+                &mut memo,
+            )
+        })
+        .collect()
+}
+
+fn rank<'a>(
+    id: &'a str,
+    actions: &BTreeMap<&'a str, &'a Action>,
+    dependents: &BTreeMap<&'a str, Vec<&'a str>>,
+    durations: &Durations,
+    visiting: &mut BTreeSet<&'a str>,
+    memo: &mut BTreeMap<&'a str, f64>,
+) -> f64 {
+    if let Some(rank) = memo.get(id) {
+        return *rank;
+    }
+    // Profiles form no cycle, but a back-edge adds nothing rather than recursing forever.
+    if !visiting.insert(id) {
+        return 0.0;
+    }
+    let mut longest: f64 = 0.0;
+    for dependent in dependents.get(id).into_iter().flatten() {
+        longest = longest.max(rank(
+            dependent, actions, dependents, durations, visiting, memo,
+        ));
+    }
+    visiting.remove(id);
+    let action = actions[id];
+    let rank = durations
+        .expected(&action.profile, &action.job)
+        .unwrap_or(0.0)
+        + longest;
+    memo.insert(id, rank);
+    rank
 }
 
 const MAX_PROFILE_IDS: usize = 32;
@@ -1540,6 +1777,17 @@ pub fn record_result(
         ],
     )?;
     settle_action(db, &action.id, &attempt.id, action_state)?;
+    // Only a pass measures how long the job takes; one claimed before timeouts were recorded on
+    // attempts is bounded by its action's.
+    let timeout_seconds = attempt
+        .timeout_seconds
+        .or(action.identity.as_ref().map(|i| i.timeout_seconds));
+    if state == "passed"
+        && let (Some(ended), Some(timeout_seconds)) = (attempt.ended, timeout_seconds)
+        && let Some(seconds) = occupancy(attempt.created, ended, timeout_seconds as f64)
+    {
+        remember_duration(db, &action.profile, &action.job, seconds)?;
+    }
     if state == "failed" {
         db.execute(
             "INSERT INTO repairs VALUES (?,?,?,'execution','open',?,NULL,?)",
@@ -3147,6 +3395,529 @@ mod tests {
         assert_eq!(mindy_claims(&mut store, "k3").as_deref(), Some("lane"));
         assert_eq!(load(&store.db, "mindy").unwrap().unwrap().holding, None);
         assert_eq!(events(&store.db, "executor.hold_released").len(), 1);
+    }
+
+    /// Recorded occupancy, in seconds, of `job` in `profile`.
+    fn history(db: &Connection, profile: &str, job: &str, samples: &[f64]) {
+        db.execute(
+            "INSERT INTO job_durations VALUES (?,?,?)
+             ON CONFLICT(profile,job) DO UPDATE SET samples=excluded.samples",
+            params![profile, job, serde_json::to_string(samples).unwrap()],
+        )
+        .unwrap();
+    }
+
+    fn samples(db: &Connection, profile: &str, job: &str) -> Option<Vec<f64>> {
+        db.query_row(
+            "SELECT samples FROM job_durations WHERE profile=? AND job=?",
+            [profile, job],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .unwrap()
+        .map(|samples| serde_json::from_str(&samples).unwrap())
+    }
+
+    /// The head of mindy's queue, without claiming it.
+    fn head(store: &Store) -> Option<String> {
+        let record = load(&store.db, "mindy").unwrap().unwrap();
+        let capacity = capacity(&store.db, &record).unwrap();
+        let verified = BTreeSet::from(["f-1".to_owned()]);
+        select(
+            &store.db,
+            &record,
+            &Scope::all(),
+            &verified,
+            &BTreeSet::new(),
+            capacity,
+        )
+        .unwrap()
+        .choice
+        .map(|choice| choice.action.id)
+    }
+
+    /// The train's action `id` running `job`, waiting on `dependencies`.
+    fn train_job(db: &Connection, id: &str, job: &str, created: f64, dependencies: &[&str]) {
+        queue(
+            db,
+            Queue {
+                id,
+                job,
+                owner: "train",
+                created,
+                dependencies,
+                ..Queue::default()
+            },
+        );
+    }
+
+    #[test]
+    fn the_root_ahead_of_the_longest_chain_is_its_owners_head() {
+        // NG's graph (#4204): install gates the core shards, prepare the cross shards and census.
+        let (_root, store) = hold_lab();
+        train_job(&store.db, "install", "install", 1.0, &[]);
+        train_job(&store.db, "prepare", "prepare", 2.0, &[]);
+        for (id, job, dependency) in [
+            ("core-1", "vitest-core", "install"),
+            ("core-2", "vitest-core", "install"),
+            ("core-3", "vitest-core", "install"),
+            ("db", "vitest-db", "install"),
+            ("domain", "vitest-domain", "install"),
+            ("cross-1", "vitest-cross", "prepare"),
+            ("cross-2", "vitest-cross", "prepare"),
+            ("census", "census", "prepare"),
+        ] {
+            train_job(&store.db, id, job, 3.0, &[dependency]);
+        }
+        for (job, seconds) in [
+            ("install", 24.0),
+            ("prepare", 204.0),
+            ("vitest-core", 1080.0),
+            ("vitest-db", 300.0),
+            ("vitest-domain", 180.0),
+            ("vitest-cross", 960.0),
+            ("census", 840.0),
+        ] {
+            history(&store.db, "f-1", job, &[seconds]);
+        }
+        // 204 + 960 = 1164 s against 24 + 1080 = 1104 s, though install was created first.
+        assert_eq!(head(&store).as_deref(), Some("prepare"));
+        // The chain decides, not the root's own run: prepare's is still the longer, but
+        // 24 + 1200 = 1224 s now leads.
+        history(&store.db, "f-1", "vitest-core", &[1200.0]);
+        assert_eq!(head(&store).as_deref(), Some("install"));
+    }
+
+    #[test]
+    fn a_link_whose_dependency_passed_keeps_the_rank_of_the_chain_behind_it() {
+        // prepare waits on install: once install passes, prepare and the core shards are ready
+        // together, and the shards created before prepare do not demote it.
+        let (_root, store) = hold_lab();
+        train_job(&store.db, "install", "install", 1.0, &[]);
+        store
+            .db
+            .execute("UPDATE actions SET state='passed' WHERE id='install'", [])
+            .unwrap();
+        for id in ["core-1", "core-2", "core-3"] {
+            train_job(&store.db, id, "vitest-core", 2.0, &["install"]);
+        }
+        train_job(&store.db, "prepare", "prepare", 3.0, &["install"]);
+        train_job(&store.db, "cross", "vitest-cross", 4.0, &["prepare"]);
+        train_job(&store.db, "census", "census", 4.0, &["prepare"]);
+        for (job, seconds) in [
+            ("install", 24.0),
+            ("prepare", 204.0),
+            ("vitest-core", 1080.0),
+            ("vitest-cross", 960.0),
+            ("census", 840.0),
+        ] {
+            history(&store.db, "f-1", job, &[seconds]);
+        }
+        // 204 + max(960, 840) = 1164 s against 1080 s.
+        assert_eq!(head(&store).as_deref(), Some("prepare"));
+        // Without cross, census alone leaves 204 + 840 = 1044 s: the shards lead.
+        store
+            .db
+            .execute("UPDATE actions SET state='canceled' WHERE id='cross'", [])
+            .unwrap();
+        assert_eq!(head(&store).as_deref(), Some("core-1"));
+        // A census that takes 900 s makes 1104 s: it counts too.
+        history(&store.db, "f-1", "census", &[900.0]);
+        assert_eq!(head(&store).as_deref(), Some("prepare"));
+    }
+
+    #[test]
+    fn a_long_job_outranks_shorts_queued_before_it_once_its_dependency_passes() {
+        // Train 59 (#4204): prepare passed at +3.4 min, but the slots that freed went to short
+        // shards created before cross, which was claimed at +16.1 min. mindy fits two jobs.
+        let (_root, mut store) = hold_lab();
+        let base = Queue {
+            owner: "train",
+            reservation: Some((4, 4096)),
+            ..Queue::default()
+        };
+        queue(
+            &store.db,
+            Queue {
+                id: "prepare",
+                job: "prepare",
+                ..base
+            },
+        );
+        history(&store.db, "f-1", "prepare", &[204.0]);
+        let shorts = [
+            "vitest-db",
+            "vitest-domain",
+            "vitest-frontends",
+            "vitest-jobs",
+        ];
+        for (n, job) in shorts.into_iter().enumerate() {
+            queue(
+                &store.db,
+                Queue {
+                    id: job,
+                    job,
+                    created: 2.0 + n as f64,
+                    ..base
+                },
+            );
+            history(&store.db, "f-1", job, &[240.0]);
+        }
+        queue(
+            &store.db,
+            Queue {
+                id: "cross",
+                job: "vitest-cross",
+                created: 9.0,
+                dependencies: &["prepare"],
+                ..base
+            },
+        );
+        history(&store.db, "f-1", "vitest-cross", &[960.0]);
+        crate::worker::set_priority(&store, "train", 1).unwrap();
+        let prepare = grant(&mut store, "k1");
+        assert_eq!(prepare.action.id, "prepare");
+        assert_eq!(grant(&mut store, "k2").action.id, "vitest-db");
+        assert_eq!(mindy_claims(&mut store, "k3"), None, "mindy is full");
+        complete(
+            &mut store,
+            "mindy",
+            &Scope::all(),
+            &passing(&prepare),
+            Outputs::InPlace,
+        )
+        .unwrap();
+        // The slot prepare frees goes to cross, not to the shorts created before it.
+        assert_eq!(mindy_claims(&mut store, "k4").as_deref(), Some("cross"));
+    }
+
+    #[test]
+    fn fair_share_and_priority_still_order_owners_before_rank() {
+        // Rank orders one owner's work only: a long job never takes another owner's turn, and a
+        // prioritized owner's short job still comes first.
+        let (_root, mut store) = hold_lab();
+        let base = Queue::default();
+        for (id, owner, job, created) in [
+            ("a-long", "a", "long", 1.0),
+            ("b-short", "b", "short", 2.0),
+            ("c-short", "c", "short", 3.0),
+        ] {
+            queue(
+                &store.db,
+                Queue {
+                    id,
+                    owner,
+                    job,
+                    created,
+                    ..base
+                },
+            );
+        }
+        history(&store.db, "f-1", "long", &[3600.0]);
+        history(&store.db, "f-1", "short", &[10.0]);
+        // b was served longest ago, so its turn comes before a's.
+        store
+            .db
+            .execute_batch("INSERT INTO dispatches VALUES ('a',100.0),('b',50.0),('c',200.0)")
+            .unwrap();
+        crate::worker::set_priority(&store, "c", 1).unwrap();
+        let order: Vec<String> = ["k1", "k2", "k3"]
+            .into_iter()
+            .map(|key| mindy_claims(&mut store, key).unwrap())
+            .collect();
+        assert_eq!(order, ["c-short", "b-short", "a-long"]);
+    }
+
+    #[test]
+    fn without_history_an_owners_jobs_keep_their_created_order() {
+        // No pass recorded yet, or a store not prepared since: every rank is 0, whatever the graph.
+        for prepared in [true, false] {
+            let (_root, mut store) = hold_lab();
+            if !prepared {
+                store.db.execute_batch("DROP TABLE job_durations").unwrap();
+            }
+            train_job(&store.db, "lint", "lint", 1.0, &[]);
+            train_job(&store.db, "prepare", "prepare", 2.0, &[]);
+            train_job(&store.db, "cross", "vitest-cross", 3.0, &["prepare"]);
+            train_job(&store.db, "census", "census", 3.0, &["prepare"]);
+            train_job(&store.db, "install", "install", 4.0, &[]);
+            let order: Vec<String> = ["k1", "k2", "k3"]
+                .into_iter()
+                .map(|key| mindy_claims(&mut store, key).unwrap())
+                .collect();
+            assert_eq!(order, ["lint", "prepare", "install"], "{prepared}");
+        }
+    }
+
+    #[test]
+    fn a_dependency_cycle_ends_its_rank_at_the_back_edge() {
+        let (_root, store) = hold_lab();
+        train_job(&store.db, "a", "lint", 1.0, &["b"]);
+        train_job(&store.db, "b", "lint", 2.0, &["a"]);
+        train_job(&store.db, "ready", "build", 3.0, &[]);
+        history(&store.db, "f-1", "lint", &[10.0]);
+        let queued: Vec<Action> = ["a", "b", "ready"]
+            .into_iter()
+            .map(|id| store.action(id).unwrap())
+            .collect();
+        let durations = Durations::load(&store.db).unwrap();
+        assert_eq!(ranks(&queued, &durations), [20.0, 10.0, 0.0]);
+        assert_eq!(head(&store).as_deref(), Some("ready"));
+    }
+
+    #[test]
+    fn only_a_pass_within_its_timeout_feeds_job_durations() {
+        let (_root, mut store) = hold_lab();
+        // A failure, a launch that never started and a lost supervisor say nothing of how long
+        // the job takes.
+        for (n, (outcome, exit_code, evidence)) in [
+            (
+                Outcome::Completed,
+                2,
+                json!({"exit_code":2,"reason":null,"artifacts":{}}),
+            ),
+            (Outcome::NotStarted, 125, json!({"error":"spawn"})),
+            (Outcome::Lost, 125, json!({"error":"supervisor exited"})),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("unfinished-{n}");
+            queue(
+                &store.db,
+                Queue {
+                    id: &id,
+                    job: "build",
+                    created: n as f64,
+                    ..Queue::default()
+                },
+            );
+            let claim = grant(&mut store, &id);
+            let request = CompleteRequest {
+                drained: false,
+                ..finish(&claim, outcome, None, exit_code, evidence)
+            };
+            complete(
+                &mut store,
+                "mindy",
+                &Scope::all(),
+                &request,
+                Outputs::InPlace,
+            )
+            .unwrap();
+        }
+        assert_eq!(samples(&store.db, "f-1", "build"), None);
+        // A pass's occupancy runs from its claim to its result, both on the authority's clock:
+        // the executor's own timing is never read.
+        let pass = |store: &mut Store, id: &str, claimed_ago: f64| {
+            queue(
+                &store.db,
+                Queue {
+                    id,
+                    job: "build",
+                    created: 10.0,
+                    ..Queue::default()
+                },
+            );
+            let claim = grant(store, id);
+            store
+                .db
+                .execute(
+                    "UPDATE attempts SET body=json_set(body,'$.created',?) WHERE id=?",
+                    params![now() - claimed_ago, claim.attempt.id],
+                )
+                .unwrap();
+            let request = CompleteRequest {
+                evidence: json!({"exit_code":0,"reason":null,"artifacts":{},
+                                 "elapsed_seconds":1.0,"timer_seconds":1.0}),
+                ..passing(&claim)
+            };
+            complete(store, "mindy", &Scope::all(), &request, Outputs::InPlace).unwrap();
+        };
+        pass(&mut store, "measured", 30.0);
+        let kept = samples(&store.db, "f-1", "build").unwrap();
+        assert!(
+            kept.len() == 1 && (30.0..31.0).contains(&kept[0]),
+            "{kept:?}"
+        );
+        // A claim stamped after its result (the clock stepped back) or longer ago than the
+        // timeout (60 s) and grace allow (it stepped forward) is no measurement.
+        pass(&mut store, "behind", -5.0);
+        pass(&mut store, "ahead", 60.0 + DURATION_GRACE_SECONDS + 1.0);
+        assert_eq!(samples(&store.db, "f-1", "build").unwrap().len(), 1);
+        // Within the grace, a claim's transfers and uploads outside the command's timer count.
+        pass(&mut store, "slow", 60.0 + DURATION_GRACE_SECONDS - 5.0);
+        assert_eq!(samples(&store.db, "f-1", "build").unwrap().len(), 2);
+        for (created, ended) in [
+            (f64::NAN, 40.0),
+            (10.0, f64::NAN),
+            (f64::NEG_INFINITY, 40.0),
+            (10.0, f64::INFINITY),
+            (f64::INFINITY, f64::INFINITY),
+        ] {
+            assert_eq!(occupancy(created, ended, 60.0), None, "{created} {ended}");
+        }
+        assert_eq!(occupancy(10.0, 40.0, 60.0), Some(30.0));
+        assert_eq!(occupancy(10.0, 10.0, 60.0), Some(0.0));
+        assert_eq!(occupancy(40.0, 10.0, 60.0), None);
+    }
+
+    #[test]
+    fn job_durations_keep_the_last_seven_and_expect_their_median() {
+        let (_root, store) = lab();
+        for seconds in 1..=9 {
+            remember_duration(&store.db, "f-1", "build", f64::from(seconds)).unwrap();
+        }
+        assert_eq!(
+            samples(&store.db, "f-1", "build").unwrap(),
+            [3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]
+        );
+        assert_eq!(
+            Durations::load(&store.db).unwrap().expected("f-1", "build"),
+            Some(6.0)
+        );
+        // An even count's median is the mean of the middle two, in whatever order they came.
+        history(&store.db, "f-1", "test", &[40.0, 10.0, 30.0, 20.0]);
+        // Samples that are no durations are left out, and a row that does not parse is none.
+        store
+            .db
+            .execute_batch(
+                "INSERT INTO job_durations VALUES ('f-1','lint','[-5.0,10.0,20.0]'),
+                 ('f-1','wide','garbage')",
+            )
+            .unwrap();
+        let durations = Durations::load(&store.db).unwrap();
+        assert_eq!(durations.expected("f-1", "test"), Some(25.0));
+        assert_eq!(durations.expected("f-1", "lint"), Some(15.0));
+        assert_eq!(durations.expected("f-1", "wide"), None);
+        // A pass never fails on a row it cannot read: the samples start over.
+        remember_duration(&store.db, "f-1", "wide", 5.0).unwrap();
+        assert_eq!(samples(&store.db, "f-1", "wide").unwrap(), [5.0]);
+    }
+
+    #[test]
+    fn durations_are_kept_per_profile_and_job_and_fall_back_to_the_job_name() {
+        let (_root, mut store) = hold_lab();
+        history(&store.db, "f-1", "build", &[100.0]);
+        history(&store.db, "f-2", "build", &[300.0, 500.0]);
+        history(&store.db, "f-2", "test", &[50.0]);
+        let durations = Durations::load(&store.db).unwrap();
+        assert_eq!(durations.expected("f-1", "build"), Some(100.0));
+        assert_eq!(durations.expected("f-2", "build"), Some(400.0));
+        // A profile without history of its own, as once re-registered, takes the job name's
+        // samples in every profile.
+        assert_eq!(durations.expected("f-3", "build"), Some(300.0));
+        assert_eq!(durations.expected("f-1", "test"), Some(50.0));
+        assert_eq!(durations.expected("f-1", "lint"), None);
+        // A pass joins its own profile's samples only.
+        queue(
+            &store.db,
+            Queue {
+                id: "f2-build",
+                profile: "f-2",
+                job: "build",
+                ..Queue::default()
+            },
+        );
+        let claim = claim_for(&mut store, "mindy", &Scope::all(), &ask("k1", &["f-2"]))
+            .unwrap()
+            .claim
+            .unwrap();
+        complete(
+            &mut store,
+            "mindy",
+            &Scope::all(),
+            &passing(&claim),
+            Outputs::InPlace,
+        )
+        .unwrap();
+        assert_eq!(samples(&store.db, "f-1", "build").unwrap(), [100.0]);
+        assert_eq!(samples(&store.db, "f-2", "build").unwrap().len(), 3);
+        assert_eq!(samples(&store.db, "f-2", "test").unwrap(), [50.0]);
+    }
+
+    #[test]
+    fn prepare_seeds_job_durations_from_earlier_passes_once() {
+        // A store upgraded with passes already recorded ranks its first train from them.
+        let (_root, store) = empty();
+        let attempt =
+            |db: &Connection, id: &str, action: &str, state: &str, occupancy: f64, ended: f64| {
+                let mut body = json!({"id":id,"action":action,"worker_pid":1,"worker_start":"1",
+                "supervisor_pid":null,"supervisor_start":null,"slots":1,"memory_mb":512,
+                "created":ended - occupancy,"started":null,"ended":ended,"exit_code":0,
+                "result":null});
+                // Attempts claimed before timeouts were recorded on them fall back to the action's.
+                if id != "legacy" {
+                    body["timeout_seconds"] = json!(60);
+                }
+                db.execute(
+                    "INSERT INTO attempts VALUES (?,?,?,1,?)",
+                    params![id, action, state, body.to_string()],
+                )
+                .unwrap();
+            };
+        queue(
+            &store.db,
+            Queue {
+                id: "build",
+                job: "build",
+                ..Queue::default()
+            },
+        );
+        queue(
+            &store.db,
+            Queue {
+                id: "test-2",
+                profile: "f-2",
+                job: "test",
+                ..Queue::default()
+            },
+        );
+        // Nine passes, written out of order: the last seven by their end are kept.
+        for n in [5, 1, 9, 3, 7, 2, 8, 4, 6] {
+            attempt(
+                &store.db,
+                &format!("pass-{n}"),
+                "build",
+                "passed",
+                f64::from(n) * 10.0,
+                1000.0 + f64::from(n),
+            );
+        }
+        // Newer than every pass, and none of them a measurement.
+        attempt(&store.db, "failed", "build", "failed", 5.0, 2000.0);
+        attempt(&store.db, "behind", "build", "passed", -5.0, 2001.0);
+        attempt(&store.db, "ahead", "build", "passed", 1000.0, 2002.0);
+        attempt(&store.db, "legacy", "test-2", "passed", 15.0, 1000.0);
+        prepare(&store.db).unwrap();
+        assert_eq!(
+            samples(&store.db, "f-1", "build").unwrap(),
+            [30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0]
+        );
+        assert_eq!(samples(&store.db, "f-2", "test").unwrap(), [15.0]);
+        // Once only: later passes are the result writer's to add, so preparing again neither
+        // counts them a second time nor replaces what was kept.
+        attempt(&store.db, "pass-10", "build", "passed", 100.0, 1010.0);
+        remember_duration(&store.db, "f-1", "build", 100.0).unwrap();
+        prepare(&store.db).unwrap();
+        prepare(&store.db).unwrap();
+        assert_eq!(
+            samples(&store.db, "f-1", "build").unwrap(),
+            [40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0]
+        );
+        // The API seeds a store it opens.
+        let (_other, fresh) = empty();
+        queue(
+            &fresh.db,
+            Queue {
+                id: "build",
+                job: "build",
+                ..Queue::default()
+            },
+        );
+        attempt(&fresh.db, "pass", "build", "passed", 42.0, 1000.0);
+        crate::api::Api::open(&fresh.root).unwrap();
+        assert_eq!(samples(&fresh.db, "f-1", "build").unwrap(), [42.0]);
     }
 
     fn queued(db: &Connection, id: &str, created: f64) {

@@ -18,7 +18,15 @@ Initialize the local executor's slot and memory budget. Admission is fair betwee
 owners across all executors; `priority OWNER N`
 admits a higher-priority owner's work first (for example a landing-ready merge train)
 and `0` clears it. Priority orders admission only: it never preempts running work or
-changes action identity. A higher-priority owner's job that waits only on a running dependency
+changes action identity. Within one owner, the job ahead of the longest chain of queued work
+goes first, then the oldest: a job's rank is its expected occupancy plus the highest rank among
+the queued jobs waiting on it, so once a train's prepare passes, its long shards are admitted
+before short ones queued earlier. Expected occupancy is the median of the job's last 7 passes,
+from claim to result on the store's clock, or of its name's in any profile while its own profile
+has none; the first preparation after an upgrade seeds it from the passes already recorded.
+Without history every rank is 0 and the oldest goes first. An executor drains for its head: a
+head that does not fit yet keeps smaller jobs back until it does, and ranking makes a long job
+the head more often. A higher-priority owner's job that waits only on a running dependency
 (every dependency passed or running) holds the capacity it will need on each executor that may
 run it: a lower-priority job is admitted only if it fits beside the demand of the priorities
 above its own, counting the host's running work but not the dependencies being waited on, whose
