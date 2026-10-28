@@ -232,7 +232,7 @@ pub fn select(
             .map(|v| Ok(serde_json::from_str(&v?)?))
             .collect::<Result<_>>()?
     };
-    let ranks = ranks(&queued, &Durations::load(db)?);
+    let ranks = ranks(&queued, &Durations::load(db, &queued)?);
     let priorities = owner_priorities(db)?;
     let mut profiles = BTreeMap::new();
     let mut unverified = Vec::new();
@@ -345,10 +345,14 @@ pub fn select(
         }
     }
     // Higher operator priority first (a landing-ready train), then fair share between owners.
-    // Within one owner, the job ahead of the longest chain left: once a train's prepare passes,
-    // a slot that frees goes to its long cross shard, not to short shards queued before it
-    // (#4204, train 59). With no history every rank is 0 and the oldest goes first. A long head
-    // that does not fit yet drains its executor for longer (`claim_for`).
+    // Among work of equal fair share (one owner's, or owners not yet served), the job ahead of
+    // the longest chain left: once a train's prepare passes, a slot that frees goes to its long
+    // cross shard, not to short shards queued before it (#4204, train 59). Owners never served
+    // tie on fair share too, so rank decides between them before age. Age never comes before
+    // rank: a superseded train's leftovers, which NG's driver leaves queued under the same owner,
+    // would then go ahead of the new train's longer work. With no history every rank is 0 and the
+    // oldest goes first. A long head that does not fit yet drains its executor for longer
+    // (`claim_for`).
     choices.sort_by(|a, b| {
         b.0.cmp(&a.0)
             .then(a.1.total_cmp(&b.1))
@@ -446,66 +450,121 @@ fn owner_priorities(db: &Connection) -> Result<BTreeMap<String, i64>> {
 /// Occupancy samples kept per profile and job: a median of a few shrugs off one slow host and
 /// still follows a job that got slower.
 const DURATION_SAMPLES: usize = 7;
+/// Profiles whose rows are kept per project, lineage and job: a re-registered profile inherits
+/// its predecessors' samples, and however often that happens the table stays bounded.
+const DURATION_PROFILES: usize = 3;
 /// A pass's occupancy also covers its claim's transfers before the command's timer and its
 /// uploads after: one that outlasts its timeout by more than this is a clock step, not a run.
 const DURATION_GRACE_SECONDS: f64 = 300.0;
 
-/// Expected occupancy per profile and job, which `select` ranks critical paths by. Seeded once,
-/// when the table is created, from the passes already recorded, so the first train after an
-/// upgrade is not ranked cold; under one write lock, so concurrent first opens seed it once.
+/// Expected occupancy per profile and job, which `select` ranks critical paths by, with the
+/// project and lineage a profile without history of its own inherits from. Seeded once, when the
+/// table is created, from the passes already recorded, so the first train after an upgrade is
+/// not ranked cold; under one write lock, so concurrent first opens seed it once. Every sample is
+/// derived from the attempts, so a table of an older shape is replaced and seeded alike.
 fn prepare_durations(db: &Connection) -> Result<()> {
-    if table_exists(db, "job_durations")? {
+    if durations_prepared(db)? && !table_exists(db, "job_durations")? {
         return Ok(());
     }
     let transaction = db
         .is_autocommit()
         .then(|| Transaction::new_unchecked(db, TransactionBehavior::Immediate))
         .transpose()?;
-    if !table_exists(db, "job_durations")? {
+    // v23 kept its samples in `job_durations`, and writes it positionally. Dropped rather than
+    // reshaped under that name, it is recreated and seeded by v23 itself if v23 is rolled back
+    // to, where a reshaped one would fail every result v23 records; dropped again on upgrade.
+    db.execute_batch("DROP TABLE IF EXISTS job_durations")?;
+    if !durations_prepared(db)? {
         db.execute_batch(
-            "CREATE TABLE IF NOT EXISTS job_durations (profile TEXT NOT NULL, job TEXT NOT NULL,
-             samples TEXT NOT NULL, PRIMARY KEY(profile, job))",
+            "DROP TABLE IF EXISTS job_estimates;
+             CREATE TABLE job_estimates (profile TEXT NOT NULL, job TEXT NOT NULL,
+             project TEXT NOT NULL, lineage TEXT NOT NULL, samples TEXT NOT NULL,
+             updated REAL NOT NULL, PRIMARY KEY(profile, job));
+             CREATE INDEX job_estimates_lineage ON job_estimates(project, lineage, job, updated);",
         )?;
-        // Fields extracted, not bodies parsed: a pass's evidence can be megabytes.
+        // Fields extracted, not bodies parsed: a pass's evidence can be megabytes. A pass that
+        // did not run its work measures nothing; a missing revision or profile pools as in
+        // `Lineages::of`.
         let mut stmt = db.prepare(
             "SELECT json_extract(a.body,'$.profile'), json_extract(a.body,'$.job'),
+             COALESCE(r.project,''),
+             COALESCE(json_extract(p.body,'$.definition.name'),json_extract(a.body,'$.profile')),
              json_extract(t.body,'$.created'), json_extract(t.body,'$.ended'),
              COALESCE(json_extract(t.body,'$.timeout_seconds'),
                       json_extract(a.body,'$.identity.timeout_seconds'))
-             FROM attempts t JOIN actions a ON a.id=t.action WHERE t.state='passed'
+             FROM attempts t JOIN actions a ON a.id=t.action
+             LEFT JOIN revisions r ON r.id=json_extract(a.body,'$.revision')
+             LEFT JOIN profiles p ON p.id=json_extract(a.body,'$.profile')
+             WHERE t.state='passed' AND json_type(t.body,'$.result.vacuous') IS NOT 'true'
              ORDER BY json_extract(t.body,'$.ended'), t.rowid",
         )?;
         let passes = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
-                r.get::<_, Option<f64>>(2)?,
-                r.get::<_, Option<f64>>(3)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
                 r.get::<_, Option<f64>>(4)?,
+                r.get::<_, Option<f64>>(5)?,
+                r.get::<_, Option<f64>>(6)?,
             ))
         })?;
-        let mut kept: BTreeMap<(String, String), Vec<f64>> = BTreeMap::new();
+        let mut kept: BTreeMap<(String, String), Seeded> = BTreeMap::new();
         for pass in passes {
-            let (profile, job, created, ended, timeout_seconds) = pass?;
+            let (profile, job, project, lineage, created, ended, timeout_seconds) = pass?;
             if let (Some(created), Some(ended), Some(timeout_seconds)) =
                 (created, ended, timeout_seconds)
                 && let Some(seconds) = occupancy(created, ended, timeout_seconds)
             {
-                kept.entry((profile, job)).or_default().push(seconds);
+                let row = kept.entry((profile, job)).or_default();
+                row.samples.push(seconds);
+                // In order of their end, so the newest pass is the last one here.
+                (row.project, row.lineage, row.updated) = (project, lineage, ended);
             }
         }
-        for ((profile, job), mut samples) in kept {
+        let mut pools = BTreeSet::new();
+        for ((profile, job), mut row) in kept {
+            let samples = &mut row.samples;
             samples.drain(..samples.len().saturating_sub(DURATION_SAMPLES));
             db.execute(
-                "INSERT INTO job_durations VALUES (?,?,?)",
-                params![profile, job, serde_json::to_string(&samples)?],
+                "INSERT INTO job_estimates VALUES (?,?,?,?,?,?)",
+                params![
+                    profile,
+                    job,
+                    row.project,
+                    row.lineage,
+                    serde_json::to_string(samples)?,
+                    row.updated
+                ],
             )?;
+            pools.insert((row.project, row.lineage, job));
+        }
+        for (project, lineage, job) in pools {
+            prune_durations(db, &project, &lineage, &job)?;
         }
     }
     if let Some(transaction) = transaction {
         transaction.commit()?;
     }
     Ok(())
+}
+
+/// A row the seed writes: its passes' samples, with the project, lineage and end of the newest.
+#[derive(Default)]
+struct Seeded {
+    samples: Vec<f64>,
+    project: String,
+    lineage: String,
+    updated: f64,
+}
+
+/// Whether `job_estimates` has its current shape; a store without the table has none.
+fn durations_prepared(db: &Connection) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT COUNT(*)>0 FROM pragma_table_info('job_estimates') WHERE name='lineage'",
+        [],
+        |r| r.get(0),
+    )?)
 }
 
 /// A pass's occupancy, from its claim to its result: the authority stamps both on its own clock,
@@ -516,13 +575,19 @@ fn occupancy(created: f64, ended: f64, timeout_seconds: f64) -> Option<f64> {
         .then_some(seconds)
 }
 
-/// Adds a pass's occupancy to its job's samples, keeping the newest. Samples only order work,
-/// so a row that does not parse is started over rather than failing the result.
-fn remember_duration(db: &Connection, profile: &str, job: &str, seconds: f64) -> Result<()> {
+/// Adds a pass's occupancy to its job's samples, keeping the newest, then bounds its lineage's
+/// rows of the job. Samples only order work, so a row that does not parse is started over, and a
+/// store not prepared since records the pass without one, rather than failing the result.
+fn remember_duration(db: &Connection, action: &Action, seconds: f64) -> Result<()> {
+    if !durations_prepared(db)? {
+        return Ok(());
+    }
+    let lineages = Lineages::load(db, std::slice::from_ref(action))?;
+    let (project, lineage) = lineages.of(action);
     let samples: Option<String> = db
         .query_row(
-            "SELECT samples FROM job_durations WHERE profile=? AND job=?",
-            [profile, job],
+            "SELECT samples FROM job_estimates WHERE profile=? AND job=?",
+            [&action.profile, &action.job],
             |r| r.get(0),
         )
         .optional()?;
@@ -532,65 +597,139 @@ fn remember_duration(db: &Connection, profile: &str, job: &str, seconds: f64) ->
     samples.push(seconds);
     samples.drain(..samples.len().saturating_sub(DURATION_SAMPLES));
     db.execute(
-        "INSERT INTO job_durations VALUES (?,?,?)
-         ON CONFLICT(profile,job) DO UPDATE SET samples=excluded.samples",
-        params![profile, job, serde_json::to_string(&samples)?],
+        "INSERT INTO job_estimates VALUES (?,?,?,?,?,?)
+         ON CONFLICT(profile,job) DO UPDATE SET project=excluded.project,
+         lineage=excluded.lineage, samples=excluded.samples, updated=excluded.updated",
+        params![
+            action.profile,
+            action.job,
+            project,
+            lineage,
+            serde_json::to_string(&samples)?,
+            now()
+        ],
+    )?;
+    prune_durations(db, project, lineage, &action.job)
+}
+
+/// Keeps only the rows of the newest `DURATION_PROFILES` profiles of one project, lineage and
+/// job, so the table stays bounded by projects, lineages and jobs however often a profile is
+/// registered again. A profile with queued work can lose its row to newer profiles of its
+/// lineage: its jobs then expect what the newest of them does.
+fn prune_durations(db: &Connection, project: &str, lineage: &str, job: &str) -> Result<()> {
+    db.execute(
+        "DELETE FROM job_estimates WHERE project=?1 AND lineage=?2 AND job=?3 AND profile NOT IN
+         (SELECT profile FROM job_estimates WHERE project=?1 AND lineage=?2 AND job=?3
+          ORDER BY updated DESC, profile DESC LIMIT ?4)",
+        params![project, lineage, job, DURATION_PROFILES as i64],
     )?;
     Ok(())
 }
 
-/// Each job's expected occupancy, read once per selection: the median of its own samples, else
-/// of its name's in every profile, since a re-registered profile starts without history.
+/// Where actions' samples pool beyond their own profile: each revision's project and each
+/// profile's lineage, the definition name a re-registered profile keeps. One query each, however
+/// many actions there are.
+#[derive(Default)]
+struct Lineages {
+    projects: BTreeMap<String, String>,
+    names: BTreeMap<String, String>,
+}
+
+impl Lineages {
+    fn load(db: &Connection, actions: &[Action]) -> Result<Self> {
+        let lookup = |query: &str, ids: BTreeSet<&str>| -> Result<BTreeMap<String, String>> {
+            let mut stmt = db.prepare(query)?;
+            let rows = stmt.query_map([serde_json::to_string(&ids)?], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?;
+            Ok(rows.collect::<rusqlite::Result<_>>()?)
+        };
+        Ok(Self {
+            projects: lookup(
+                "SELECT id, project FROM revisions WHERE id IN (SELECT value FROM json_each(?))",
+                actions.iter().map(|a| a.revision.as_str()).collect(),
+            )?,
+            names: lookup(
+                "SELECT id, COALESCE(json_extract(body,'$.definition.name'),id) FROM profiles
+                 WHERE id IN (SELECT value FROM json_each(?))",
+                actions.iter().map(|a| a.profile.as_str()).collect(),
+            )?,
+        })
+    }
+
+    /// The action's project and lineage. Revisions and profiles are never deleted; a store
+    /// without them pools an action's samples under its profile alone.
+    fn of<'a>(&'a self, action: &'a Action) -> (&'a str, &'a str) {
+        (
+            self.projects
+                .get(&action.revision)
+                .map_or("", String::as_str),
+            self.names
+                .get(&action.profile)
+                .map_or(action.profile.as_str(), String::as_str),
+        )
+    }
+}
+
+/// Each queued job's expected occupancy, read once per selection: the median of its own
+/// profile's samples, else of the most recently updated row of its name in its lineage and
+/// project, since a re-registered profile starts without history. Other projects and other
+/// lineages (a nightly beside a validation profile) never stand in.
 #[derive(Default)]
 struct Durations {
-    by_key: BTreeMap<String, BTreeMap<String, f64>>,
-    by_job: BTreeMap<String, f64>,
+    lineages: Lineages,
+    by_key: BTreeMap<(String, String), f64>,
+    by_lineage: BTreeMap<(String, String, String), f64>,
 }
 
 impl Durations {
-    /// A store not yet prepared has no history.
-    fn load(db: &Connection) -> Result<Self> {
-        let mut durations = Self::default();
-        if !table_exists(db, "job_durations")? {
+    /// Reads the rows of the queued jobs' names only. A store not prepared since has no history.
+    fn load(db: &Connection, queued: &[Action]) -> Result<Self> {
+        let mut durations = Self {
+            lineages: Lineages::load(db, queued)?,
+            ..Self::default()
+        };
+        if !durations_prepared(db)? {
             return Ok(durations);
         }
-        let mut stmt = db.prepare("SELECT profile, job, samples FROM job_durations")?;
-        let rows = stmt.query_map([], |r| {
+        let jobs: BTreeSet<&str> = queued.iter().map(|action| action.job.as_str()).collect();
+        // Oldest first: the newest row of a project, lineage and job is the one kept.
+        let mut stmt = db.prepare(
+            "SELECT profile, job, project, lineage, samples FROM job_estimates
+             WHERE job IN (SELECT value FROM json_each(?)) ORDER BY updated, profile",
+        )?;
+        let rows = stmt.query_map([serde_json::to_string(&jobs)?], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
             ))
         })?;
-        let mut by_job: BTreeMap<String, Vec<f64>> = BTreeMap::new();
         for row in rows {
-            let (profile, job, samples) = row?;
+            let (profile, job, project, lineage, samples) = row?;
             let samples: Vec<f64> = serde_json::from_str::<Vec<f64>>(&samples)
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
                 .collect();
-            if let Some(median) = median(samples.clone()) {
-                durations
-                    .by_key
-                    .entry(profile)
-                    .or_default()
-                    .insert(job.clone(), median);
+            if let Some(median) = median(samples) {
+                durations.by_key.insert((profile, job.clone()), median);
+                durations.by_lineage.insert((project, lineage, job), median);
             }
-            by_job.entry(job).or_default().extend(samples);
         }
-        durations.by_job = by_job
-            .into_iter()
-            .filter_map(|(job, samples)| Some((job, median(samples)?)))
-            .collect();
         Ok(durations)
     }
 
-    fn expected(&self, profile: &str, job: &str) -> Option<f64> {
+    fn expected(&self, action: &Action) -> Option<f64> {
+        let (project, lineage) = self.lineages.of(action);
         self.by_key
-            .get(profile)
-            .and_then(|jobs| jobs.get(job))
-            .or_else(|| self.by_job.get(job))
+            .get(&(action.profile.clone(), action.job.clone()))
+            .or_else(|| {
+                self.by_lineage
+                    .get(&(project.into(), lineage.into(), action.job.clone()))
+            })
             .copied()
     }
 }
@@ -607,16 +746,36 @@ fn median(mut samples: Vec<f64>) -> Option<f64> {
 
 /// Each queued action's critical-path rank, in queue order: its expected occupancy plus the
 /// highest rank among the queued actions waiting on it, so the job ahead of the longest chain
-/// left sorts first. Unknown occupancy counts as none.
+/// left sorts first. A job without history is expected to occupy the median of what its
+/// profile's other queued actions are expected to, so a new shard does not sort below every
+/// known job; with nothing known in its profile, it counts as none.
 fn ranks(queued: &[Action], durations: &Durations) -> Vec<f64> {
-    let actions: BTreeMap<&str, &Action> = queued
+    let known: Vec<Option<f64>> = queued
         .iter()
-        .map(|action| (action.id.as_str(), action))
+        .map(|action| durations.expected(action))
+        .collect();
+    let mut siblings: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
+    for (action, seconds) in queued.iter().zip(&known) {
+        if let Some(seconds) = seconds {
+            siblings.entry(&action.profile).or_default().push(*seconds);
+        }
+    }
+    let siblings: BTreeMap<&str, f64> = siblings
+        .into_iter()
+        .filter_map(|(profile, seconds)| Some((profile, median(seconds)?)))
+        .collect();
+    let occupancy: BTreeMap<&str, f64> = queued
+        .iter()
+        .zip(known)
+        .map(|(action, seconds)| {
+            let seconds = seconds.or_else(|| siblings.get(action.profile.as_str()).copied());
+            (action.id.as_str(), seconds.unwrap_or(0.0))
+        })
         .collect();
     let mut dependents: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for action in queued {
         for dependency in &action.dependencies {
-            if actions.contains_key(dependency.as_str()) {
+            if occupancy.contains_key(dependency.as_str()) {
                 dependents
                     .entry(dependency.as_str())
                     .or_default()
@@ -630,9 +789,8 @@ fn ranks(queued: &[Action], durations: &Durations) -> Vec<f64> {
         .map(|action| {
             rank(
                 &action.id,
-                &actions,
                 &dependents,
-                durations,
+                &occupancy,
                 &mut BTreeSet::new(),
                 &mut memo,
             )
@@ -642,9 +800,8 @@ fn ranks(queued: &[Action], durations: &Durations) -> Vec<f64> {
 
 fn rank<'a>(
     id: &'a str,
-    actions: &BTreeMap<&'a str, &'a Action>,
     dependents: &BTreeMap<&'a str, Vec<&'a str>>,
-    durations: &Durations,
+    occupancy: &BTreeMap<&'a str, f64>,
     visiting: &mut BTreeSet<&'a str>,
     memo: &mut BTreeMap<&'a str, f64>,
 ) -> f64 {
@@ -657,16 +814,10 @@ fn rank<'a>(
     }
     let mut longest: f64 = 0.0;
     for dependent in dependents.get(id).into_iter().flatten() {
-        longest = longest.max(rank(
-            dependent, actions, dependents, durations, visiting, memo,
-        ));
+        longest = longest.max(rank(dependent, dependents, occupancy, visiting, memo));
     }
     visiting.remove(id);
-    let action = actions[id];
-    let rank = durations
-        .expected(&action.profile, &action.job)
-        .unwrap_or(0.0)
-        + longest;
+    let rank = occupancy[id] + longest;
     memo.insert(id, rank);
     rank
 }
@@ -1777,16 +1928,17 @@ pub fn record_result(
         ],
     )?;
     settle_action(db, &action.id, &attempt.id, action_state)?;
-    // Only a pass measures how long the job takes; one claimed before timeouts were recorded on
-    // attempts is bounded by its action's.
+    // Only a pass that ran its work measures how long the job takes; one claimed before timeouts
+    // were recorded on attempts is bounded by its action's.
     let timeout_seconds = attempt
         .timeout_seconds
         .or(action.identity.as_ref().map(|i| i.timeout_seconds));
     if state == "passed"
+        && evidence["vacuous"] != true
         && let (Some(ended), Some(timeout_seconds)) = (attempt.ended, timeout_seconds)
         && let Some(seconds) = occupancy(attempt.created, ended, timeout_seconds as f64)
     {
-        remember_duration(db, &action.profile, &action.job, seconds)?;
+        remember_duration(db, &action, seconds)?;
     }
     if state == "failed" {
         db.execute(
@@ -2299,7 +2451,26 @@ mod tests {
     }
 
     fn queue(db: &Connection, q: Queue) {
-        let action = Action {
+        let action = action(&q);
+        db.execute(
+            "INSERT INTO actions VALUES (?,?,'queued',NULL,?,?)",
+            params![
+                q.id,
+                q.id,
+                serde_json::to_string(&action).unwrap(),
+                q.created
+            ],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO interests VALUES (?,?,'',1)",
+            params![q.id, q.owner],
+        )
+        .unwrap();
+    }
+
+    fn action(q: &Queue) -> Action {
+        Action {
             id: q.id.into(),
             key: q.id.into(),
             revision: q.revision.into(),
@@ -2319,22 +2490,7 @@ mod tests {
             origin: None,
             declared_inputs: None,
             declared_base: None,
-        };
-        db.execute(
-            "INSERT INTO actions VALUES (?,?,'queued',NULL,?,?)",
-            params![
-                q.id,
-                q.id,
-                serde_json::to_string(&action).unwrap(),
-                q.created
-            ],
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO interests VALUES (?,?,'',1)",
-            params![q.id, q.owner],
-        )
-        .unwrap();
+        }
     }
 
     /// A held attempt: `executor` None writes a body from before executors existed.
@@ -3397,19 +3553,46 @@ mod tests {
         assert_eq!(events(&store.db, "executor.hold_released").len(), 1);
     }
 
-    /// Recorded occupancy, in seconds, of `job` in `profile`.
+    /// Recorded occupancy, in seconds, of `job` in `profile` (its own lineage) of project `p-a`.
     fn history(db: &Connection, profile: &str, job: &str, samples: &[f64]) {
+        recorded(db, (profile, job), ("p-a", profile), samples, now());
+    }
+
+    /// A `job_estimates` row of `(profile, job)` in `(project, lineage)`.
+    fn recorded(
+        db: &Connection,
+        (profile, job): (&str, &str),
+        (project, lineage): (&str, &str),
+        samples: &[f64],
+        updated: f64,
+    ) {
         db.execute(
-            "INSERT INTO job_durations VALUES (?,?,?)
-             ON CONFLICT(profile,job) DO UPDATE SET samples=excluded.samples",
-            params![profile, job, serde_json::to_string(samples).unwrap()],
+            "INSERT INTO job_estimates VALUES (?,?,?,?,?,?)
+             ON CONFLICT(profile,job) DO UPDATE SET samples=excluded.samples,
+             updated=excluded.updated",
+            params![
+                profile,
+                job,
+                project,
+                lineage,
+                serde_json::to_string(samples).unwrap(),
+                updated
+            ],
         )
         .unwrap();
     }
 
+    /// The occupancy a selection would expect of `q`'s job, were `q` queued.
+    fn expected(db: &Connection, q: Queue) -> Option<f64> {
+        let action = action(&q);
+        Durations::load(db, std::slice::from_ref(&action))
+            .unwrap()
+            .expected(&action)
+    }
+
     fn samples(db: &Connection, profile: &str, job: &str) -> Option<Vec<f64>> {
         db.query_row(
-            "SELECT samples FROM job_durations WHERE profile=? AND job=?",
+            "SELECT samples FROM job_estimates WHERE profile=? AND job=?",
             [profile, job],
             |r| r.get::<_, String>(0),
         )
@@ -3593,8 +3776,8 @@ mod tests {
 
     #[test]
     fn fair_share_and_priority_still_order_owners_before_rank() {
-        // Rank orders one owner's work only: a long job never takes another owner's turn, and a
-        // prioritized owner's short job still comes first.
+        // Rank orders work of equal fair share only: a long job never takes the turn of an owner
+        // served longer ago, and a prioritized owner's short job still comes first.
         let (_root, mut store) = hold_lab();
         let base = Queue::default();
         for (id, owner, job, created) in [
@@ -3634,7 +3817,7 @@ mod tests {
         for prepared in [true, false] {
             let (_root, mut store) = hold_lab();
             if !prepared {
-                store.db.execute_batch("DROP TABLE job_durations").unwrap();
+                store.db.execute_batch("DROP TABLE job_estimates").unwrap();
             }
             train_job(&store.db, "lint", "lint", 1.0, &[]);
             train_job(&store.db, "prepare", "prepare", 2.0, &[]);
@@ -3660,13 +3843,14 @@ mod tests {
             .into_iter()
             .map(|id| store.action(id).unwrap())
             .collect();
-        let durations = Durations::load(&store.db).unwrap();
-        assert_eq!(ranks(&queued, &durations), [20.0, 10.0, 0.0]);
+        let durations = Durations::load(&store.db, &queued).unwrap();
+        // ready has no history: it expects its profile's median.
+        assert_eq!(ranks(&queued, &durations), [20.0, 10.0, 10.0]);
         assert_eq!(head(&store).as_deref(), Some("ready"));
     }
 
     #[test]
-    fn only_a_pass_within_its_timeout_feeds_job_durations() {
+    fn only_a_pass_within_its_timeout_feeds_job_estimates() {
         let (_root, mut store) = hold_lab();
         // A failure, a launch that never started and a lost supervisor say nothing of how long
         // the job takes.
@@ -3763,52 +3947,61 @@ mod tests {
     }
 
     #[test]
-    fn job_durations_keep_the_last_seven_and_expect_their_median() {
+    fn job_estimates_keep_the_last_seven_and_expect_their_median() {
         let (_root, store) = lab();
+        let job = |job| Queue {
+            job,
+            ..Queue::default()
+        };
         for seconds in 1..=9 {
-            remember_duration(&store.db, "f-1", "build", f64::from(seconds)).unwrap();
+            remember_duration(&store.db, &action(&job("build")), f64::from(seconds)).unwrap();
         }
         assert_eq!(
             samples(&store.db, "f-1", "build").unwrap(),
             [3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]
         );
-        assert_eq!(
-            Durations::load(&store.db).unwrap().expected("f-1", "build"),
-            Some(6.0)
-        );
+        assert_eq!(expected(&store.db, job("build")), Some(6.0));
         // An even count's median is the mean of the middle two, in whatever order they came.
         history(&store.db, "f-1", "test", &[40.0, 10.0, 30.0, 20.0]);
         // Samples that are no durations are left out, and a row that does not parse is none.
         store
             .db
             .execute_batch(
-                "INSERT INTO job_durations VALUES ('f-1','lint','[-5.0,10.0,20.0]'),
-                 ('f-1','wide','garbage')",
+                "INSERT INTO job_estimates VALUES ('f-1','lint','p-a','f-1','[-5.0,10.0,20.0]',0),
+                 ('f-1','wide','p-a','f-1','garbage',0)",
             )
             .unwrap();
-        let durations = Durations::load(&store.db).unwrap();
-        assert_eq!(durations.expected("f-1", "test"), Some(25.0));
-        assert_eq!(durations.expected("f-1", "lint"), Some(15.0));
-        assert_eq!(durations.expected("f-1", "wide"), None);
+        assert_eq!(expected(&store.db, job("test")), Some(25.0));
+        assert_eq!(expected(&store.db, job("lint")), Some(15.0));
+        assert_eq!(expected(&store.db, job("wide")), None);
         // A pass never fails on a row it cannot read: the samples start over.
-        remember_duration(&store.db, "f-1", "wide", 5.0).unwrap();
+        remember_duration(&store.db, &action(&job("wide")), 5.0).unwrap();
         assert_eq!(samples(&store.db, "f-1", "wide").unwrap(), [5.0]);
     }
 
     #[test]
-    fn durations_are_kept_per_profile_and_job_and_fall_back_to_the_job_name() {
+    fn durations_are_kept_per_profile_and_job_and_never_taken_from_another_lineage() {
         let (_root, mut store) = hold_lab();
         history(&store.db, "f-1", "build", &[100.0]);
         history(&store.db, "f-2", "build", &[300.0, 500.0]);
         history(&store.db, "f-2", "test", &[50.0]);
-        let durations = Durations::load(&store.db).unwrap();
-        assert_eq!(durations.expected("f-1", "build"), Some(100.0));
-        assert_eq!(durations.expected("f-2", "build"), Some(400.0));
-        // A profile without history of its own, as once re-registered, takes the job name's
-        // samples in every profile.
-        assert_eq!(durations.expected("f-3", "build"), Some(300.0));
-        assert_eq!(durations.expected("f-1", "test"), Some(50.0));
-        assert_eq!(durations.expected("f-1", "lint"), None);
+        let of = |profile, job| {
+            expected(
+                &store.db,
+                Queue {
+                    profile,
+                    job,
+                    ..Queue::default()
+                },
+            )
+        };
+        assert_eq!(of("f-1", "build"), Some(100.0));
+        assert_eq!(of("f-2", "build"), Some(400.0));
+        // lab's profiles are each their own lineage: a profile without history of its own takes
+        // none from another's.
+        assert_eq!(of("f-3", "build"), None);
+        assert_eq!(of("f-1", "test"), None);
+        assert_eq!(of("f-1", "lint"), None);
         // A pass joins its own profile's samples only.
         queue(
             &store.db,
@@ -3837,7 +4030,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_seeds_job_durations_from_earlier_passes_once() {
+    fn prepare_seeds_job_estimates_from_earlier_passes_once() {
         // A store upgraded with passes already recorded ranks its first train from them.
         let (_root, store) = empty();
         let attempt =
@@ -3898,7 +4091,7 @@ mod tests {
         // Once only: later passes are the result writer's to add, so preparing again neither
         // counts them a second time nor replaces what was kept.
         attempt(&store.db, "pass-10", "build", "passed", 100.0, 1010.0);
-        remember_duration(&store.db, "f-1", "build", 100.0).unwrap();
+        remember_duration(&store.db, &store.action("build").unwrap(), 100.0).unwrap();
         prepare(&store.db).unwrap();
         prepare(&store.db).unwrap();
         assert_eq!(
@@ -3918,6 +4111,635 @@ mod tests {
         attempt(&fresh.db, "pass", "build", "passed", 42.0, 1000.0);
         crate::api::Api::open(&fresh.root).unwrap();
         assert_eq!(samples(&fresh.db, "f-1", "build").unwrap(), [42.0]);
+    }
+
+    /// `job_durations` as v23 created it.
+    const V23_DURATIONS: &str = "CREATE TABLE job_durations (profile TEXT NOT NULL,
+        job TEXT NOT NULL, samples TEXT NOT NULL, PRIMARY KEY(profile, job))";
+
+    /// A pass of `action` recorded before the table was: claimed `occupancy` seconds before it
+    /// ended at `ended`, within a 60 s timeout, with `result` as its evidence.
+    fn earlier_pass(
+        db: &Connection,
+        id: &str,
+        action: &str,
+        occupancy: f64,
+        ended: f64,
+        result: Value,
+    ) {
+        let body = json!({"id":id,"action":action,"worker_pid":1,"worker_start":"1",
+            "supervisor_pid":null,"supervisor_start":null,"slots":1,"memory_mb":512,
+            "created":ended - occupancy,"started":null,"ended":ended,"exit_code":0,
+            "result":result,"timeout_seconds":60});
+        db.execute(
+            "INSERT INTO attempts VALUES (?,?,'passed',1,?)",
+            params![id, action, body.to_string()],
+        )
+        .unwrap();
+    }
+
+    /// A registered profile `id` whose definition is named `lineage`.
+    fn lineage_profile(db: &Connection, id: &str, lineage: &str) {
+        let profile = json!({"id":id,"engine":"e","platform":"linux-x86_64","tools":{},
+            "definition":{"version":1,"name":lineage,"tools":{},"jobs":[
+                {"name":"build","command":["sh"]},{"name":"test","command":["sh"]}]}});
+        crate::store::insert(db, "profiles", id, &profile).unwrap();
+    }
+
+    type DurationRow = (String, String, String, String, String, f64);
+
+    /// Every `job_estimates` row: profile, job, project, lineage, samples and updated.
+    fn duration_rows(db: &Connection) -> Vec<DurationRow> {
+        let mut stmt = db
+            .prepare(
+                "SELECT profile, job, project, lineage, samples, updated FROM job_estimates
+                 ORDER BY profile, job",
+            )
+            .unwrap();
+        stmt.query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    /// The profiles with a row for `job`.
+    fn profiles_of(db: &Connection, job: &str) -> Vec<String> {
+        let mut stmt = db
+            .prepare("SELECT profile FROM job_estimates WHERE job=? ORDER BY profile")
+            .unwrap();
+        stmt.query_map([job], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_job_without_history_is_expected_to_take_as_long_as_its_profiles_known_jobs() {
+        // A new shard must not rank below every known job: a known 8 s job created after it is
+        // not claimed before it.
+        let (_root, store) = hold_lab();
+        train_job(&store.db, "new-shard", "vitest-new", 1.0, &[]);
+        train_job(&store.db, "lint", "lint", 2.0, &[]);
+        history(&store.db, "f-1", "lint", &[8.0]);
+        // Expected to take 8 s too, the older goes first.
+        assert_eq!(head(&store).as_deref(), Some("new-shard"));
+        // The median of what its profile's queued actions are expected to occupy, not of their
+        // ranks: prepare counts as 204 s, not as the 1164 s of its chain. A profile with no
+        // history at all (f-2) ranks every job 0, as before.
+        let (_root, store) = hold_lab();
+        train_job(&store.db, "prepare", "prepare", 1.0, &[]);
+        train_job(&store.db, "cross-1", "vitest-cross", 2.0, &["prepare"]);
+        train_job(&store.db, "cross-2", "vitest-cross", 2.0, &["prepare"]);
+        train_job(&store.db, "lint", "lint", 3.0, &[]);
+        train_job(&store.db, "new-shard", "vitest-new", 4.0, &[]);
+        queue(
+            &store.db,
+            Queue {
+                id: "nightly",
+                profile: "f-2",
+                job: "vitest-new",
+                ..Queue::default()
+            },
+        );
+        for (job, seconds) in [("prepare", 204.0), ("vitest-cross", 960.0), ("lint", 8.0)] {
+            history(&store.db, "f-1", job, &[seconds]);
+        }
+        let queued: Vec<Action> = [
+            "prepare",
+            "cross-1",
+            "cross-2",
+            "lint",
+            "new-shard",
+            "nightly",
+        ]
+        .into_iter()
+        .map(|id| store.action(id).unwrap())
+        .collect();
+        let durations = Durations::load(&store.db, &queued).unwrap();
+        // Known: 204, 960, 960 and 8 s, one per queued action.
+        assert_eq!(
+            ranks(&queued, &durations),
+            [1164.0, 960.0, 960.0, 8.0, 582.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn a_profile_without_history_takes_the_newest_of_its_lineage_in_its_project() {
+        // validate-1..4 are one profile registered again and again; beta's validate profile has
+        // the same name in another project, and the nightly is another lineage.
+        let (_root, store) = lab();
+        for (id, lineage) in [
+            ("validate-1", "validate"),
+            ("validate-2", "validate"),
+            ("validate-3", "validate"),
+            ("validate-4", "validate"),
+            ("beta-validate", "validate"),
+            ("nightly-1", "nightly"),
+            ("nightly-2", "nightly"),
+        ] {
+            lineage_profile(&store.db, id, lineage);
+        }
+        recorded(
+            &store.db,
+            ("validate-1", "build"),
+            ("p-a", "validate"),
+            &[100.0],
+            1.0,
+        );
+        recorded(
+            &store.db,
+            ("validate-2", "build"),
+            ("p-a", "validate"),
+            &[200.0],
+            2.0,
+        );
+        // Newer, but of another project or another lineage.
+        for (key, pool, seconds) in [
+            (("beta-validate", "build"), ("p-b", "validate"), 900.0),
+            (("beta-validate", "lint"), ("p-b", "validate"), 30.0),
+            (("nightly-1", "build"), ("p-a", "nightly"), 700.0),
+            (("nightly-1", "test"), ("p-a", "nightly"), 50.0),
+        ] {
+            recorded(&store.db, key, pool, &[seconds], 9.0);
+        }
+        let of = |profile, revision, job| {
+            expected(
+                &store.db,
+                Queue {
+                    profile,
+                    revision,
+                    job,
+                    ..Queue::default()
+                },
+            )
+        };
+        assert_eq!(of("validate-3", "r-a", "build"), Some(200.0));
+        assert_eq!(of("validate-3", "r-a", "lint"), None);
+        assert_eq!(of("validate-3", "r-a", "test"), None);
+        assert_eq!(of("nightly-2", "r-a", "build"), Some(700.0));
+        // On beta's revision, beta's row is its project's.
+        assert_eq!(of("validate-3", "r-b", "build"), Some(900.0));
+        // A profile's own row comes first, however old.
+        assert_eq!(of("validate-1", "r-a", "build"), Some(100.0));
+        // A pass records where it pools: the newest of its lineage in its project.
+        remember_duration(
+            &store.db,
+            &action(&Queue {
+                profile: "validate-3",
+                job: "build",
+                ..Queue::default()
+            }),
+            300.0,
+        )
+        .unwrap();
+        let row: (String, String) = store
+            .db
+            .query_row(
+                "SELECT project, lineage FROM job_estimates WHERE profile='validate-3'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("p-a".into(), "validate".into()));
+        assert_eq!(of("validate-4", "r-a", "build"), Some(300.0));
+    }
+
+    #[test]
+    fn a_lineage_keeps_the_rows_of_its_three_newest_profiles_per_job() {
+        let (_root, store) = lab();
+        for n in 1..=4 {
+            lineage_profile(&store.db, &format!("validate-{n}"), "validate");
+        }
+        lineage_profile(&store.db, "beta-validate", "validate");
+        lineage_profile(&store.db, "nightly-1", "nightly");
+        for n in 1..=3 {
+            recorded(
+                &store.db,
+                (&format!("validate-{n}"), "build"),
+                ("p-a", "validate"),
+                &[f64::from(n)],
+                f64::from(n),
+            );
+        }
+        // Older still, but of another job, lineage or project.
+        recorded(
+            &store.db,
+            ("validate-1", "test"),
+            ("p-a", "validate"),
+            &[5.0],
+            0.5,
+        );
+        recorded(
+            &store.db,
+            ("nightly-1", "build"),
+            ("p-a", "nightly"),
+            &[7.0],
+            0.5,
+        );
+        recorded(
+            &store.db,
+            ("beta-validate", "build"),
+            ("p-b", "validate"),
+            &[8.0],
+            0.5,
+        );
+        // The fourth profile's first pass drops the oldest of the three.
+        remember_duration(
+            &store.db,
+            &action(&Queue {
+                profile: "validate-4",
+                job: "build",
+                ..Queue::default()
+            }),
+            4.0,
+        )
+        .unwrap();
+        assert_eq!(
+            profiles_of(&store.db, "build"),
+            [
+                "beta-validate",
+                "nightly-1",
+                "validate-2",
+                "validate-3",
+                "validate-4"
+            ]
+        );
+        assert_eq!(profiles_of(&store.db, "test"), ["validate-1"]);
+        // The seed keeps the same bound.
+        store.db.execute_batch("DROP TABLE job_estimates").unwrap();
+        for n in 1..=4 {
+            let id = format!("build-{n}");
+            queue(
+                &store.db,
+                Queue {
+                    id: &id,
+                    profile: &format!("validate-{n}"),
+                    job: "build",
+                    ..Queue::default()
+                },
+            );
+            earlier_pass(
+                &store.db,
+                &format!("pass-{n}"),
+                &id,
+                10.0,
+                1000.0 + f64::from(n),
+                json!({}),
+            );
+        }
+        prepare(&store.db).unwrap();
+        assert_eq!(
+            profiles_of(&store.db, "build"),
+            ["validate-2", "validate-3", "validate-4"]
+        );
+    }
+
+    #[test]
+    fn a_selection_reads_the_durations_of_the_queued_jobs_only() {
+        let (_root, store) = lab();
+        for (profile, job) in [
+            ("f-1", "build"),
+            ("f-2", "build"),
+            ("f-1", "test"),
+            ("f-1", "lint"),
+            ("f-2", "wide"),
+        ] {
+            history(&store.db, profile, job, &[10.0]);
+        }
+        let queued = [
+            action(&Queue {
+                id: "build",
+                job: "build",
+                ..Queue::default()
+            }),
+            action(&Queue {
+                id: "test",
+                profile: "f-2",
+                job: "test",
+                ..Queue::default()
+            }),
+        ];
+        let durations = Durations::load(&store.db, &queued).unwrap();
+        // Of any profile, since one without its own row may take another's of its lineage.
+        let read: Vec<(&str, &str)> = durations
+            .by_key
+            .keys()
+            .map(|(profile, job)| (profile.as_str(), job.as_str()))
+            .collect();
+        assert_eq!(read, [("f-1", "build"), ("f-1", "test"), ("f-2", "build")]);
+    }
+
+    #[test]
+    fn prepare_leaves_a_job_estimates_table_of_the_current_shape_as_it_is() {
+        // Rows no attempt derives, as a pass recorded since the seed and pruned attempts leave.
+        let (_root, store) = lab();
+        queue(
+            &store.db,
+            Queue {
+                id: "build",
+                job: "build",
+                ..Queue::default()
+            },
+        );
+        earlier_pass(&store.db, "pass", "build", 30.0, 1000.0, json!({}));
+        recorded(&store.db, ("f-1", "build"), ("p-a", "f-1"), &[7.0], 5.0);
+        recorded(&store.db, ("f-9", "ghost"), ("p-z", "gone"), &[1.0], 2.0);
+        let before = duration_rows(&store.db);
+        prepare(&store.db).unwrap();
+        prepare(&store.db).unwrap();
+        assert_eq!(duration_rows(&store.db), before);
+    }
+
+    #[test]
+    fn concurrent_first_opens_seed_and_migrate_job_estimates_once() {
+        // B checks before A commits, then waits on A's write lock. Inside it B must find A's table
+        // done, or it would seed again and lose the pass A recorded since its own seed.
+        static WAITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        fn waiting(_: i32) -> bool {
+            WAITING.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            true
+        }
+        for legacy in [false, true] {
+            WAITING.store(false, std::sync::atomic::Ordering::SeqCst);
+            let (_root, store) = lab();
+            store.db.execute_batch("DROP TABLE job_estimates").unwrap();
+            if legacy {
+                store.db.execute_batch(V23_DURATIONS).unwrap();
+            }
+            queue(
+                &store.db,
+                Queue {
+                    id: "build",
+                    job: "build",
+                    ..Queue::default()
+                },
+            );
+            earlier_pass(&store.db, "pass", "build", 42.0, 1000.0, json!({}));
+            let other = Store::open(&store.root).unwrap();
+            other.db.busy_handler(Some(waiting)).unwrap();
+            store.db.execute_batch("BEGIN IMMEDIATE").unwrap();
+            let seeding = std::thread::spawn(move || {
+                prepare_durations(&other.db).map_err(|error| format!("{error:#}"))
+            });
+            let start = std::time::Instant::now();
+            while !WAITING.load(std::sync::atomic::Ordering::SeqCst) {
+                assert!(
+                    start.elapsed().as_secs() < 30,
+                    "B never waited for the lock"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            prepare_durations(&store.db).unwrap();
+            remember_duration(&store.db, &store.action("build").unwrap(), 7.0).unwrap();
+            store.db.execute_batch("COMMIT").unwrap();
+            seeding.join().unwrap().unwrap();
+            assert_eq!(
+                samples(&store.db, "f-1", "build").unwrap(),
+                [42.0, 7.0],
+                "{legacy}"
+            );
+            assert!(!table_exists(&store.db, "job_durations").unwrap());
+        }
+    }
+
+    #[test]
+    fn an_upgrade_after_a_rollback_drops_v23s_table_again_and_keeps_its_estimates() {
+        // A rolled-back v23 recreated job_durations beside the estimates this binary kept.
+        let (_root, store) = lab();
+        queue(
+            &store.db,
+            Queue {
+                id: "build",
+                job: "build",
+                ..Queue::default()
+            },
+        );
+        earlier_pass(&store.db, "pass", "build", 30.0, 1000.0, json!({}));
+        recorded(&store.db, ("f-1", "build"), ("p-a", "f-1"), &[7.0], 5.0);
+        let before = duration_rows(&store.db);
+        store
+            .db
+            .execute_batch(&format!(
+                "{V23_DURATIONS}; INSERT INTO job_durations VALUES ('f-1','build','[30.0]')"
+            ))
+            .unwrap();
+        prepare(&store.db).unwrap();
+        assert!(!table_exists(&store.db, "job_durations").unwrap());
+        assert_eq!(duration_rows(&store.db), before);
+    }
+
+    #[test]
+    fn a_pass_that_did_not_run_its_work_is_no_sample() {
+        // NG's surface jobs pass within seconds when their surface is untouched: counted, those
+        // passes would rank a 900 s job as a 10 s one.
+        let (_root, mut store) = hold_lab();
+        for (id, evidence) in [
+            (
+                "skipped",
+                json!({"exit_code":0,"reason":null,"artifacts":{},"vacuous":true}),
+            ),
+            ("ran", json!({"exit_code":0,"reason":null,"artifacts":{}})),
+        ] {
+            queue(
+                &store.db,
+                Queue {
+                    id,
+                    job: "build",
+                    ..Queue::default()
+                },
+            );
+            let claim = grant(&mut store, id);
+            let request = CompleteRequest {
+                evidence,
+                ..passing(&claim)
+            };
+            complete(
+                &mut store,
+                "mindy",
+                &Scope::all(),
+                &request,
+                Outputs::InPlace,
+            )
+            .unwrap();
+            // The pass is a pass like any other.
+            assert_eq!(state(&store.db, id), "passed");
+            assert_eq!(row(&store.db, &claim.attempt.id).0, "passed");
+            if id == "skipped" {
+                assert_eq!(samples(&store.db, "f-1", "build"), None);
+            }
+        }
+        assert_eq!(samples(&store.db, "f-1", "build").unwrap().len(), 1);
+        assert_eq!(events(&store.db, "attempt.completed").len(), 2);
+        // Nor does the seed count them.
+        store.db.execute_batch("DROP TABLE job_estimates").unwrap();
+        prepare(&store.db).unwrap();
+        assert_eq!(samples(&store.db, "f-1", "build").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_pass_on_a_store_not_prepared_since_is_recorded_without_a_sample() {
+        // No job_estimates, with or without v23's job_durations: the result writer leaves both.
+        for legacy in [false, true] {
+            let (_root, mut store) = hold_lab();
+            store.db.execute_batch("DROP TABLE job_estimates").unwrap();
+            if legacy {
+                store
+                    .db
+                    .execute_batch(&format!(
+                        "{V23_DURATIONS}; INSERT INTO job_durations VALUES ('f-1','build','[5.0]')"
+                    ))
+                    .unwrap();
+            }
+            queue(
+                &store.db,
+                Queue {
+                    id: "build",
+                    job: "build",
+                    ..Queue::default()
+                },
+            );
+            let claim = grant(&mut store, "k1");
+            complete(
+                &mut store,
+                "mindy",
+                &Scope::all(),
+                &passing(&claim),
+                Outputs::InPlace,
+            )
+            .unwrap();
+            assert_eq!(state(&store.db, "build"), "passed", "{legacy}");
+            assert!(
+                !table_exists(&store.db, "job_estimates").unwrap(),
+                "{legacy}"
+            );
+            if legacy {
+                let v23: String = store
+                    .db
+                    .query_row("SELECT samples FROM job_durations", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(v23, "[5.0]");
+            }
+        }
+    }
+
+    #[test]
+    fn a_v23_job_durations_table_is_dropped_and_job_estimates_seeded_from_the_passes() {
+        // Samples are derived data: every one is recomputable from the attempts. v23's table goes,
+        // so v23, if rolled back to, recreates and seeds its own rather than failing each result.
+        let (_root, store) = lab();
+        store
+            .db
+            .execute_batch(&format!(
+                "DROP TABLE job_estimates; {V23_DURATIONS};
+                 INSERT INTO job_durations VALUES ('f-1','build','[1.0]'),('f-2','lint','[2.0]')"
+            ))
+            .unwrap();
+        queue(
+            &store.db,
+            Queue {
+                id: "build",
+                job: "build",
+                ..Queue::default()
+            },
+        );
+        earlier_pass(&store.db, "pass", "build", 30.0, 1000.0, json!({}));
+        earlier_pass(
+            &store.db,
+            "skipped",
+            "build",
+            2.0,
+            1001.0,
+            json!({"vacuous":true}),
+        );
+        prepare(&store.db).unwrap();
+        let names = |pragma: &str| -> Vec<String> {
+            let mut stmt = store
+                .db
+                .prepare(&format!("SELECT name FROM {pragma}"))
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert!(!table_exists(&store.db, "job_durations").unwrap());
+        assert_eq!(
+            names("pragma_table_info('job_estimates')"),
+            ["profile", "job", "project", "lineage", "samples", "updated"]
+        );
+        assert_eq!(
+            names("pragma_index_info('job_estimates_lineage')"),
+            ["project", "lineage", "job", "updated"]
+        );
+        assert_eq!(
+            duration_rows(&store.db),
+            [(
+                "f-1".into(),
+                "build".into(),
+                "p-a".into(),
+                "f-1".into(),
+                "[30.0]".into(),
+                1000.0
+            )]
+        );
+    }
+
+    #[test]
+    fn a_pass_claimed_before_attempts_recorded_timeouts_is_bounded_by_its_actions() {
+        // The action's identity allows 60 s; its attempt records no timeout of its own.
+        let (_root, mut store) = hold_lab();
+        for (id, claimed_ago) in [
+            ("within", 30.0),
+            ("beyond", 60.0 + DURATION_GRACE_SECONDS + 1.0),
+        ] {
+            queue(
+                &store.db,
+                Queue {
+                    id,
+                    job: "build",
+                    ..Queue::default()
+                },
+            );
+            let claim = grant(&mut store, id);
+            store
+                .db
+                .execute(
+                    "UPDATE attempts SET body=json_remove(json_set(body,'$.created',?),
+                     '$.timeout_seconds') WHERE id=?",
+                    params![now() - claimed_ago, claim.attempt.id],
+                )
+                .unwrap();
+            complete(
+                &mut store,
+                "mindy",
+                &Scope::all(),
+                &passing(&claim),
+                Outputs::InPlace,
+            )
+            .unwrap();
+        }
+        let within = |kept: Option<Vec<f64>>| {
+            let kept = kept.unwrap();
+            assert!(
+                kept.len() == 1 && (30.0..31.0).contains(&kept[0]),
+                "{kept:?}"
+            );
+        };
+        within(samples(&store.db, "f-1", "build"));
+        // The seed bounds them alike.
+        store.db.execute_batch("DROP TABLE job_estimates").unwrap();
+        prepare(&store.db).unwrap();
+        within(samples(&store.db, "f-1", "build"));
     }
 
     fn queued(db: &Connection, id: &str, created: f64) {

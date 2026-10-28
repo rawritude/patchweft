@@ -18,12 +18,22 @@ Initialize the local executor's slot and memory budget. Admission is fair betwee
 owners across all executors; `priority OWNER N`
 admits a higher-priority owner's work first (for example a landing-ready merge train)
 and `0` clears it. Priority orders admission only: it never preempts running work or
-changes action identity. Within one owner, the job ahead of the longest chain of queued work
-goes first, then the oldest: a job's rank is its expected occupancy plus the highest rank among
-the queued jobs waiting on it, so once a train's prepare passes, its long shards are admitted
-before short ones queued earlier. Expected occupancy is the median of the job's last 7 passes,
-from claim to result on the store's clock, or of its name's in any profile while its own profile
-has none; the first preparation after an upgrade seeds it from the passes already recorded.
+changes action identity. Among work of equal fair share (one owner's, or owners not yet
+served), the job ahead of the longest chain of queued work goes first, then the oldest: a job's
+rank is its expected occupancy plus the highest rank among the queued jobs waiting on it, so once
+a train's prepare passes, its long shards are admitted before short ones queued earlier.
+Expected occupancy is the median of the job's last 7 passes in its profile, from claim to result
+on the store's clock; a pass whose job created `PATCHWEFT_VACUOUS` (it skipped its work) is not
+counted. Passes recorded before a version that knows the marker count as before, so after that
+upgrade a surface job's estimate keeps its older skip passes until its first pass that does its
+work: the first train in which it applies pays for them once. While its own profile has none,
+it is that of the most recently updated profile with the same definition name (lineage) in the
+same project, so a re-registered profile inherits its predecessor's; other projects and other
+names (a nightly beside a validation profile) never count. Each project, lineage and job keeps
+the samples of its 3 most recently updated profiles.
+A job with no history there either expects the median of what its profile's other queued jobs
+are expected to take, so a new shard does not wait behind every known short job. The first
+preparation after an upgrade seeds the samples from the passes already recorded.
 Without history every rank is 0 and the oldest goes first. An executor drains for its head: a
 head that does not fit yet keeps smaller jobs back until it does, and ranking makes a long job
 the head more often. A higher-priority owner's job that waits only on a running dependency

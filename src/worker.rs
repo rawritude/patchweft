@@ -408,6 +408,8 @@ fn execute_command(
         }
     }
     let log = setup(File::create(directory.join("output.log")))?;
+    // In the attempt directory, beside the checkout: never part of the job's tree or artifacts.
+    let vacuous = directory.join("vacuous");
     let paths: Vec<PathBuf> = profile
         .definition
         .tools
@@ -437,6 +439,7 @@ fn execute_command(
         .env("PATCHWEFT_ATTEMPT", &claim.attempt.id)
         .env("PATCHWEFT_REVISION", &action.revision)
         .env("PATCHWEFT_REPORT", &job.report.path)
+        .env("PATCHWEFT_VACUOUS", &vacuous)
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
@@ -547,6 +550,11 @@ fn execute_command(
                   "timeout_seconds":timeout_seconds}});
     if let Some(stop) = stopped_after_exit {
         evidence["stopped_after_exit"] = json!(stop);
+    }
+    // A pass that skipped its work (its surface untouched) says nothing of how long the work
+    // takes; a failure is never one.
+    if code == 0 && fs::symlink_metadata(&vacuous).is_ok() {
+        evidence["vacuous"] = json!(true);
     }
     Ok((code, evidence))
 }

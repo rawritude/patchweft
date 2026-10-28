@@ -1548,6 +1548,68 @@ fn export_slots_false_hides_variable_and_leaves_identity() {
 }
 
 #[test]
+fn a_pass_that_creates_patchweft_vacuous_is_marked_vacuous() {
+    let lab = Lab::new();
+    // Every job first checks the path is absent at launch, in its attempt directory and outside
+    // its checkout view (its working directory).
+    let fresh = "test ! -e \"$PATCHWEFT_VACUOUS\" && \
+                 test \"$PATCHWEFT_VACUOUS\" = \"$PATCHWEFT_STATE/attempts/$PATCHWEFT_ATTEMPT/vacuous\" && \
+                 case \"$PATCHWEFT_VACUOUS\" in \"$PWD\"/*) exit 3;; esac";
+    let profile = lab.profile(json!([
+        job(
+            "skipped",
+            &format!("{fresh} && touch \"$PATCHWEFT_VACUOUS\""),
+            json!({})
+        ),
+        job("worked", fresh, json!({})),
+        job(
+            "refused",
+            &format!("{fresh} && touch \"$PATCHWEFT_VACUOUS\" && exit 1"),
+            json!({})
+        ),
+    ]));
+    let candidate = lab.submit(&lab.base, &profile, "agent");
+    lab.drain();
+    for (job, state, created, vacuous) in [
+        ("skipped", "passed", true, Some(&json!(true))),
+        ("worked", "passed", false, None),
+        ("refused", "failed", true, None),
+    ] {
+        let action = candidate["required"][job].as_str().unwrap();
+        let (attempt, recorded): (String, String) = lab
+            .database()
+            .query_row(
+                "SELECT attempt, state FROM actions WHERE id=?",
+                [action],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(recorded, state, "{job}");
+        assert_eq!(
+            lab.state
+                .join("attempts")
+                .join(&attempt)
+                .join("vacuous")
+                .exists(),
+            created,
+            "{job}"
+        );
+        let evidence = &lab.body("attempts", &attempt)["result"];
+        assert_eq!(evidence.get("vacuous"), vacuous, "{job}: {evidence}");
+        // Only the pass that ran its work measures how long its job takes.
+        let samples: i64 = lab
+            .database()
+            .query_row(
+                "SELECT COUNT(*) FROM job_estimates WHERE job=?",
+                [job],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(samples, i64::from(job == "worked"), "{job}");
+    }
+}
+
+#[test]
 fn timeout_is_a_key_and_acceptance_budget_not_identity() {
     let lab = Lab::new();
     let jobs = |name: &str, script: &str, timeout: u64| {
