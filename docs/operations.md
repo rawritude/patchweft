@@ -49,29 +49,37 @@ processes and declared cleanup finish. A coordinator exit does not imply that
 its jobs have stopped.
 
 The hold has nothing to hold for before a train is submitted, and priority never preempts, so
-lane work claimed just before a train can keep its first job waiting.
-`reserve EXECUTOR --slots N --memory-mb M` keeps part of an executor's capacity for owners with
-priority above 0: work no such owner wants never occupies it, and is admitted only if it fits,
-beside the other such work held there, within the capacity less the reserve. A queued action
-counts as prioritized while any owner above 0 wants it, as it does for ordering, and its claim is
-that owner's. A running attempt counts as prioritized while the owner it was claimed for is above
-0 and still wants it: work a lane claimed stays the lanes' even once a train shares it, so a train
-that lets go of it later cannot leave lane work in the reserve. Prioritized work
-running there, inside the reserve or beyond it, never counts against what is left to priority 0;
-the whole capacity still bounds everything the executor runs, and a lower-priority head must
-fit beside both the hold and the reserve. Work of an owner at 0 or below that is larger than the
-capacity less the reserve is left to other executors, as work larger than an executor is, so it
-never keeps that executor's smaller work back. Size the reserve as the largest job a prioritized
-owner's work must start there without waiting; for NG's merge train, its `prepare`'s declared
-slots and memory_mb. Set it again when that declaration changes. It must stay below the
-executor's capacity in both slots and memory, so other work always keeps some room; an
-`executor-set` that would lower the capacity to the reserve or below is refused until the
-reserve is lowered or cleared. A cgroup limit cannot be refused: while the reported limit leaves
-the reserve no room below it, the reserve is not applied, rather than strand other work, and
-`patchweft executors` shows it with `"applied": false`. `--slots 0 --memory-mb 0` clears it.
-`patchweft executors` shows it as `reserve`, and each change is an `executor.reserve` event. A head the reserve keeps back drains the executor as one
-that does not fit yet does; it is not a hold and does not set `holding`. Trains run almost back
-to back, so prioritized work seldom leaves the reserve idle.
+lane work claimed just before a train can keep its first job waiting. A standing reserve covers
+that: `reserve EXECUTOR --slots N --memory-mb M` keeps part of an executor's capacity for owners
+with priority above 0, and `--slots 0 --memory-mb 0` clears it. `patchweft executors` shows it as
+`reserve`, and each change is an `executor.reserve` event. Trains run almost back to back, so
+prioritized work seldom leaves the reserve idle.
+
+Work no owner above 0 wants never occupies the reserve: it is admitted only if it fits, beside
+the other such work held there, within the capacity less the reserve. Prioritized work running
+there, inside the reserve or beyond it, never counts against what is left to priority 0; the
+whole capacity still bounds everything the executor runs, and a lower-priority head must fit
+beside both the hold and the reserve. A head the reserve keeps back drains the executor as one
+that does not fit yet does; it is not a hold and does not set `holding`. Work of an owner at 0
+or below that is larger than the capacity less the reserve is left to other executors, as work
+larger than an executor is, so it never keeps that executor's smaller work back.
+
+A queued action counts as prioritized while any owner above 0 wants it, as it does for ordering,
+and its claim is that owner's. A running attempt counts as prioritized while the owner it was
+claimed for is above 0 and still wants it: work a lane claimed stays the lanes' even once a train
+shares it, so a train that lets go of it later cannot leave lane work in the reserve.
+
+Size the reserve, in each dimension, as the largest job a prioritized owner's work must start
+there without waiting. For NG's merge train that is 8 slots, its `prepare`'s, and 9216 MiB, a
+whole-tree Vitest shard's, which is larger in memory than `prepare`: on a 20-slot, 26624 MiB
+local, 8192 MiB left train 95's second-wave shard waiting behind two lane shards. Set it again
+when those declarations change.
+
+The reserve must stay below the executor's capacity in both slots and memory, so other work
+always keeps some room. An `executor-set` that would lower the capacity to the reserve or below
+is refused until the reserve is lowered or cleared. A cgroup limit cannot be refused: while the
+reported limit leaves the reserve no room below it, the reserve is not applied, rather than
+strand other work, and `patchweft executors` shows it with `"applied": false`.
 
 Private working directories prevent accidental workspace sharing, but are not
 a hostile-code sandbox. Native slot and memory declarations do not impose
