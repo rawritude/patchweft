@@ -271,6 +271,10 @@ pub struct Attempt {
     /// `local` or a remote executor id. Absent on attempts claimed before executors existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor: Option<String>,
+    /// The owner it was claimed for: the reserve counts it as prioritized only while that owner is
+    /// above priority 0 and still wants it. Absent on attempts claimed before owners were recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     /// Fencing token: only its holder may renew or complete the attempt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease: Option<String>,

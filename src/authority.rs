@@ -198,10 +198,20 @@ fn unreserved(capacity: Reservation, reserve: Reservation) -> Reservation {
     }
 }
 
-/// Reservations of this executor's undrained attempts that no owner above priority 0 wants, by the
-/// rule `select` orders and holds work by: an action's priority is the highest among its active
-/// interests' owners. Prioritized work running inside the reserve or beyond it is never counted
-/// against what the reserve leaves to other work.
+/// A reserve applies only while it stays below the executor's effective capacity in both slots and
+/// memory: one a later `executor-set` or a lower cgroup limit has met would leave other work no room
+/// at all, so it is not applied (and `executors` says so) rather than strand that work.
+fn applied(reserve: Option<Reservation>, capacity: Reservation) -> Option<Reservation> {
+    reserve
+        .filter(|reserve| reserve.slots < capacity.slots && reserve.memory_mb < capacity.memory_mb)
+}
+
+/// Reservations of this executor's undrained attempts that are not prioritized. One is prioritized
+/// while the owner it was claimed for is above priority 0 and still wants it: work a lane claimed
+/// stays counted even once a train shares its action, so a train that later lets go cannot leave
+/// lane work in the reserve. Prioritized work running inside the reserve or beyond it is never
+/// counted against what the reserve leaves to other work; an attempt claimed before owners were
+/// recorded counts as not prioritized.
 fn held_unprioritized(db: &Connection, executor: &str) -> Result<Reservation> {
     if !table_exists(db, "owner_priorities")? {
         return held(db, executor);
@@ -212,7 +222,8 @@ fn held_unprioritized(db: &Connection, executor: &str) -> Result<Reservation> {
              COALESCE(SUM(json_extract(body,'$.memory_mb')),0)
              FROM attempts WHERE drained=0 AND {EXECUTOR}=? AND NOT EXISTS (
                  SELECT 1 FROM interests i JOIN owner_priorities p ON p.owner=i.owner
-                 WHERE i.action=attempts.action AND i.active=1 AND p.priority>0)"
+                 WHERE i.action=attempts.action AND i.active=1 AND p.priority>0
+                 AND i.owner=json_extract(attempts.body,'$.owner'))"
         ),
         [executor],
         |r| {
@@ -270,7 +281,7 @@ pub fn select(
     };
     let ranks = ranks(&queued, &Durations::load(db, &queued)?);
     let priorities = owner_priorities(db)?;
-    let reserve = reserve(db, &record.id)?;
+    let reserve = applied(reserve(db, &record.id)?, capacity);
     let mut profiles = BTreeMap::new();
     let mut unverified = Vec::new();
     let mut choices = Vec::new();
@@ -355,25 +366,37 @@ pub fn select(
             continue;
         }
         let trusted = verified.contains(&action.profile);
-        if !trusted && unverified.len() < MAX_UNVERIFIED && !unverified.contains(&action.profile) {
-            unverified.push(action.profile.clone());
-        }
         let mut stmt =
             db.prepare("SELECT DISTINCT owner FROM interests WHERE action=? AND active=1")?;
         let owners: Vec<String> = stmt
             .query_map([&action.id], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
-        for owner in owners {
-            let priority = priorities.get(&owner).copied().unwrap_or(0);
-            // Work of an owner at priority 0 or below that what the reserve leaves can never fit
-            // must not idle the executor behind it either; an owner above 0 may still run the same
-            // action in the reserve.
-            if priority <= 0
+        // Work of an owner at priority 0 or below that what the reserve leaves can never fit must
+        // not idle the executor behind it either; an owner above 0 may still run the same action
+        // in the reserve.
+        let beyond_reserve = |priority: i64| {
+            priority <= 0
                 && reserve.is_some_and(|reserve| {
                     let left = unreserved(capacity, reserve);
                     reservation.slots > left.slots || reservation.memory_mb > left.memory_mb
                 })
-            {
+        };
+        // Only work some owner may run here asks for its profile to be verified, as work this
+        // executor can never fit does not.
+        let runnable = owners.is_empty()
+            || owners
+                .iter()
+                .any(|owner| !beyond_reserve(priorities.get(owner).copied().unwrap_or(0)));
+        if runnable
+            && !trusted
+            && unverified.len() < MAX_UNVERIFIED
+            && !unverified.contains(&action.profile)
+        {
+            unverified.push(action.profile.clone());
+        }
+        for owner in owners {
+            let priority = priorities.get(&owner).copied().unwrap_or(0);
+            if beyond_reserve(priority) {
                 continue;
             }
             let served = db
@@ -1077,6 +1100,7 @@ pub fn claim_for(
         result: None,
         timeout_seconds: Some(choice.timeout_seconds),
         executor: Some(executor.into()),
+        owner: Some(choice.owner.clone()),
         lease: Some(unique()),
         lease_expires: Some(created + record.lease_seconds as f64),
         claim_key: Some(key.clone()),
@@ -2264,6 +2288,20 @@ pub fn configure(store: &mut Store, id: &str, request: &ConfigureRequest) -> Res
     if !request.deny.is_empty() {
         record.placement.deny = request.deny.iter().cloned().collect();
     }
+    // A reserve keeps leaving other work some room (`set_reserve`), so a capacity it would meet
+    // waits until the reserve is lowered or cleared.
+    if let Some(reserve) = reserve(&transaction, id)? {
+        let capacity = capacity(&transaction, &record)?;
+        ensure!(
+            applied(Some(reserve), capacity).is_some(),
+            "{id} keeps {} slots and {} MiB for prioritized owners: a capacity of {} slots and {} MiB \
+             would leave other work no room; lower or clear the reserve first",
+            reserve.slots,
+            reserve.memory_mb,
+            capacity.slots,
+            capacity.memory_mb
+        );
+    }
     save(&transaction, &record)?;
     let view = view(&transaction, &record)?;
     let configured = &view["configured"];
@@ -2288,10 +2326,15 @@ pub fn set_reserve(store: &mut Store, executor: &str, wanted: Reservation) -> Re
         format!("executor {executor} is not registered (local, or one executor-set registered)")
     })?;
     let clear = wanted.slots == 0 && wanted.memory_mb == 0;
+    let detail = json!({"executor":executor,"slots":wanted.slots,"memory_mb":wanted.memory_mb});
+    if clear && reserve(&transaction, executor)?.is_none() {
+        // Nothing to clear: no table, row or event.
+        return Ok(detail);
+    }
     if !clear {
         let capacity = capacity(&transaction, &record)?;
         ensure!(
-            wanted.slots < capacity.slots && wanted.memory_mb < capacity.memory_mb,
+            applied(Some(wanted), capacity).is_some(),
             "a reserve must stay below {executor}'s capacity of {} slots and {} MiB in both",
             capacity.slots,
             capacity.memory_mb
@@ -2309,7 +2352,6 @@ pub fn set_reserve(store: &mut Store, executor: &str, wanted: Reservation) -> Re
             params![executor, wanted.slots, wanted.memory_mb],
         )?;
     }
-    let detail = json!({"executor":executor,"slots":wanted.slots,"memory_mb":wanted.memory_mb});
     event(&transaction, "executor.reserve", executor, &detail)?;
     transaction.commit()?;
     Ok(detail)
@@ -2377,7 +2419,9 @@ fn view(db: &Connection, record: &ExecutorRecord) -> Result<Value> {
         json!({"id":record.id,"configured":{"slots":slots,"memory_mb":memory_mb},
         "effective":effective,
         "held":{"slots":held.slots,"memory_mb":held.memory_mb,"attempts":attempts},
-        "reserve":reserve(db, &record.id)?,
+        "reserve":reserve(db, &record.id)?.map(|reserve| json!({"slots":reserve.slots,
+            "memory_mb":reserve.memory_mb,
+            "applied":effective.is_some_and(|effective| applied(Some(reserve), effective).is_some())})),
         "lease_seconds":record.lease_seconds,"placement":record.placement,
         "observed":record.observed}),
     )
@@ -3896,15 +3940,28 @@ mod tests {
         assert!(!table_exists(&store.db, "executor_reserves").unwrap());
         assert_eq!(reserve(&store.db, LOCAL).unwrap(), None);
         assert_eq!(listed(&store, LOCAL), Value::Null);
+        // Clearing one never set changes nothing: no table, row or event.
+        assert_eq!(
+            set_reserve(&mut store, LOCAL, need((0, 0))).unwrap(),
+            json!({"executor":"local","slots":0,"memory_mb":0})
+        );
+        assert!(!table_exists(&store.db, "executor_reserves").unwrap());
+        assert!(events(&store.db, "executor.reserve").is_empty());
         assert_eq!(
             set_reserve(&mut store, LOCAL, need((2, 2048))).unwrap(),
             json!({"executor":"local","slots":2,"memory_mb":2048})
         );
-        assert_eq!(listed(&store, LOCAL), json!({"slots":2,"memory_mb":2048}));
+        assert_eq!(
+            listed(&store, LOCAL),
+            json!({"slots":2,"memory_mb":2048,"applied":true})
+        );
         assert_eq!(listed(&store, "mindy"), Value::Null);
         set_reserve(&mut store, LOCAL, need((3, 1024))).unwrap();
         assert_eq!(reserve(&store.db, LOCAL).unwrap(), Some(need((3, 1024))));
-        assert_eq!(listed(&store, LOCAL), json!({"slots":3,"memory_mb":1024}));
+        assert_eq!(
+            listed(&store, LOCAL),
+            json!({"slots":3,"memory_mb":1024,"applied":true})
+        );
         set_reserve(&mut store, LOCAL, need((0, 0))).unwrap();
         assert_eq!(listed(&store, LOCAL), Value::Null);
         let rows: i64 = store
@@ -3954,6 +4011,120 @@ mod tests {
         set_reserve(&mut store, LOCAL, need((4, 1))).unwrap_err();
         assert_eq!(reserve(&store.db, LOCAL).unwrap(), Some(need((3, 4095))));
         assert_eq!(events(&store.db, "executor.reserve").len(), 2);
+    }
+
+    #[test]
+    fn a_lane_claim_stays_the_lanes_when_a_train_shares_it_or_lets_go() {
+        // The lanes claimed lane-0 and lane-1 (all that local's 2/2048 reserve leaves them) before
+        // the train wanted lane-0: it is still lane work, so the lanes' share is not refunded, and a
+        // train that lets go of it later cannot leave lane work in the reserve.
+        let (_root, mut store) = reserve_lab((2, 2048));
+        lanes(&store, 3, 1.0, (1, 1024));
+        assert_eq!(local_claims(&mut store), ["lane-0", "lane-1"]);
+        shared_with(&store, "lane-0", "train");
+        assert_eq!(local_claims(&mut store), Vec::<String>::new());
+        assert_eq!(
+            held_unprioritized(&store.db, LOCAL).unwrap(),
+            need((2, 2048))
+        );
+        // The train's own claim counts as prioritized only while the train still wants it.
+        wants(&store, "prepare", "train", 9.0, (1, 1024));
+        assert_eq!(local_claims(&mut store), ["prepare"]);
+        assert_eq!(
+            held_unprioritized(&store.db, LOCAL).unwrap(),
+            need((2, 2048))
+        );
+        store
+            .db
+            .execute(
+                "UPDATE interests SET active=0 WHERE action='prepare' AND owner='train'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            held_unprioritized(&store.db, LOCAL).unwrap(),
+            need((3, 3072))
+        );
+    }
+
+    #[test]
+    fn work_without_priority_that_exactly_fills_what_the_reserve_leaves_is_claimed() {
+        let (_root, mut store) = reserve_lab((2, 2048));
+        wants(&store, "whole", "lane", 1.0, (2, 2048));
+        assert_eq!(local_claims(&mut store), ["whole"]);
+    }
+
+    #[test]
+    fn a_capacity_change_never_leaves_a_reserve_that_strands_other_work() {
+        // executor-set refuses a capacity the reserve would meet, and changes nothing.
+        let (_root, mut store) = reserve_lab((2, 2048));
+        let lower = ConfigureRequest {
+            slots: Some(2),
+            ..ConfigureRequest::default()
+        };
+        let refused = configure(&mut store, LOCAL, &lower)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("lower or clear the reserve first"),
+            "{refused}"
+        );
+        assert_eq!(store.capacity().unwrap(), (4, 4096));
+        let above = ConfigureRequest {
+            slots: Some(3),
+            ..ConfigureRequest::default()
+        };
+        configure(&mut store, LOCAL, &above).unwrap();
+        assert_eq!(store.capacity().unwrap(), (3, 4096));
+        // A cgroup limit the reserve meets (2048 MiB) can't be refused: the reserve is not applied,
+        // so lane work still runs, and the listing says so.
+        lanes(&store, 1, 1.0, (1, 1024));
+        let verified: Vec<String> = {
+            let mut stmt = store.db.prepare("SELECT id FROM profiles").unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let clamped = ClaimRequest {
+            claim_key: unique(),
+            verified,
+            memory_limit_mb: Some(2048),
+            ..ClaimRequest::default()
+        };
+        let response = claim_for(&mut store, LOCAL, &Scope::all(), &clamped).unwrap();
+        assert!(response.claim.is_some());
+        let listed = list(&store).unwrap();
+        let local = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["id"] == LOCAL)
+            .unwrap();
+        assert_eq!(
+            local["reserve"],
+            json!({"slots":2,"memory_mb":2048,"applied":false})
+        );
+    }
+
+    #[test]
+    fn work_the_reserve_leaves_to_other_executors_asks_for_no_verification() {
+        // Like work local can never fit: a lane job beyond what the reserve leaves (2/2048) has local
+        // verify nothing for it. The same job wanted by the train asks for its profile.
+        let (_root, mut store) = reserve_lab((2, 2048));
+        wants(&store, "big", "lane", 1.0, (3, 1024));
+        let ask = |store: &mut Store| {
+            let request = ClaimRequest {
+                claim_key: unique(),
+                ..ClaimRequest::default()
+            };
+            claim_for(store, LOCAL, &Scope::all(), &request).unwrap()
+        };
+        let response = ask(&mut store);
+        assert!(response.claim.is_none());
+        assert!(response.unverified.is_empty(), "{:?}", response.unverified);
+        shared_with(&store, "big", "train");
+        assert!(!ask(&mut store).unverified.is_empty());
     }
 
     /// Recorded occupancy, in seconds, of `job` in `profile` (its own lineage) of project `p-a`.
