@@ -190,6 +190,40 @@ pub fn fits(held: Reservation, wanted: Reservation, capacity: Reservation) -> bo
         && held.memory_mb + wanted.memory_mb <= capacity.memory_mb
 }
 
+/// What a reserve leaves of an executor's capacity to work no prioritized owner wants.
+fn unreserved(capacity: Reservation, reserve: Reservation) -> Reservation {
+    Reservation {
+        slots: capacity.slots.saturating_sub(reserve.slots),
+        memory_mb: capacity.memory_mb.saturating_sub(reserve.memory_mb),
+    }
+}
+
+/// Reservations of this executor's undrained attempts that no owner above priority 0 wants, by the
+/// rule `select` orders and holds work by: an action's priority is the highest among its active
+/// interests' owners. Prioritized work running inside the reserve or beyond it is never counted
+/// against what the reserve leaves to other work.
+fn held_unprioritized(db: &Connection, executor: &str) -> Result<Reservation> {
+    if !table_exists(db, "owner_priorities")? {
+        return held(db, executor);
+    }
+    Ok(db.query_row(
+        &format!(
+            "SELECT COALESCE(SUM(json_extract(body,'$.slots')),0),
+             COALESCE(SUM(json_extract(body,'$.memory_mb')),0)
+             FROM attempts WHERE drained=0 AND {EXECUTOR}=? AND NOT EXISTS (
+                 SELECT 1 FROM interests i JOIN owner_priorities p ON p.owner=i.owner
+                 WHERE i.action=attempts.action AND i.active=1 AND p.priority>0)"
+        ),
+        [executor],
+        |r| {
+            Ok(Reservation {
+                slots: r.get(0)?,
+                memory_mb: r.get(1)?,
+            })
+        },
+    )?)
+}
+
 /// Admissible work for one of its owners; `select` orders these by priority, fair share,
 /// critical-path rank and age.
 pub struct Choice {
@@ -212,6 +246,8 @@ pub struct Selection {
     /// held jobs waiting on each: it frees before they start, so it is not counted beside the hold
     /// as well (gate P3-3), and only for heads below that priority (re-gate P3-1).
     pub freed: Vec<(i64, Reservation)>,
+    /// What this executor keeps for owners above priority 0 (`set_reserve`).
+    pub reserve: Option<Reservation>,
 }
 
 /// The head of one executor's queue: work it may run and could ever fit, ordered by owner
@@ -234,6 +270,7 @@ pub fn select(
     };
     let ranks = ranks(&queued, &Durations::load(db, &queued)?);
     let priorities = owner_priorities(db)?;
+    let reserve = reserve(db, &record.id)?;
     let mut profiles = BTreeMap::new();
     let mut unverified = Vec::new();
     let mut choices = Vec::new();
@@ -327,13 +364,24 @@ pub fn select(
             .query_map([&action.id], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         for owner in owners {
+            let priority = priorities.get(&owner).copied().unwrap_or(0);
+            // Work of an owner at priority 0 or below that what the reserve leaves can never fit
+            // must not idle the executor behind it either; an owner above 0 may still run the same
+            // action in the reserve.
+            if priority <= 0
+                && reserve.is_some_and(|reserve| {
+                    let left = unreserved(capacity, reserve);
+                    reservation.slots > left.slots || reservation.memory_mb > left.memory_mb
+                })
+            {
+                continue;
+            }
             let served = db
                 .query_row("SELECT last FROM dispatches WHERE owner=?", [&owner], |r| {
                     r.get::<_, f64>(0)
                 })
                 .optional()?
                 .unwrap_or(0.0);
-            let priority = priorities.get(&owner).copied().unwrap_or(0);
             let choice = Choice {
                 owner,
                 priority,
@@ -374,6 +422,7 @@ pub fn select(
         unverified,
         hold,
         freed,
+        reserve,
     })
 }
 
@@ -908,8 +957,20 @@ pub fn claim_for(
         unverified,
         hold,
         freed,
+        reserve,
     } = select(&transaction, &record, scope, &verified, &refused, capacity)?;
     let held = held(&transaction, executor)?;
+    // The standing reserve (#4204, trains 92 and 95): work no owner above priority 0 wants is
+    // admitted only within what the reserve leaves, beside the other such work held here, so a
+    // train's first job fits when it is submitted whatever lanes claimed just before.
+    let beside_reserve = match (&choice, reserve) {
+        (Some(choice), Some(reserve)) if choice.priority <= 0 => fits(
+            held_unprioritized(&transaction, executor)?,
+            choice.reservation,
+            unreserved(capacity, reserve),
+        ),
+        _ => true,
+    };
     // A head is admitted only beside the demand of the higher priorities waiting (gate P3-1): a
     // train never holds back its own jobs, and a lower train waits only for the higher ones.
     let holding = |priority: i64| {
@@ -982,7 +1043,13 @@ pub fn claim_for(
         save(&transaction, &record)?;
     }
     let choice = match choice {
-        Some(choice) if fits(held, choice.reservation, capacity) && beside_hold(&choice) => choice,
+        Some(choice)
+            if fits(held, choice.reservation, capacity)
+                && beside_hold(&choice)
+                && beside_reserve =>
+        {
+            choice
+        }
         // Drain for the head: later small actions cannot starve its reservation.
         _ => {
             transaction.commit()?;
@@ -2212,6 +2279,61 @@ pub fn configure(store: &mut Store, id: &str, request: &ConfigureRequest) -> Res
     Ok(view)
 }
 
+/// Keeps part of an executor's capacity for owners above priority 0: other work is admitted only
+/// within what it leaves (`claim_for`). 0 slots and 0 MiB remove it. It stays below the capacity in
+/// both, so work of owners at priority 0 always keeps some room.
+pub fn set_reserve(store: &mut Store, executor: &str, wanted: Reservation) -> Result<Value> {
+    let transaction = store.transaction()?;
+    let record = load(&transaction, executor)?.with_context(|| {
+        format!("executor {executor} is not registered (local, or one executor-set registered)")
+    })?;
+    let clear = wanted.slots == 0 && wanted.memory_mb == 0;
+    if !clear {
+        let capacity = capacity(&transaction, &record)?;
+        ensure!(
+            wanted.slots < capacity.slots && wanted.memory_mb < capacity.memory_mb,
+            "a reserve must stay below {executor}'s capacity of {} slots and {} MiB in both",
+            capacity.slots,
+            capacity.memory_mb
+        );
+    }
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS executor_reserves (executor TEXT PRIMARY KEY, slots INTEGER NOT NULL, memory_mb INTEGER NOT NULL)",
+    )?;
+    if clear {
+        transaction.execute("DELETE FROM executor_reserves WHERE executor=?", [executor])?;
+    } else {
+        transaction.execute(
+            "INSERT INTO executor_reserves VALUES (?,?,?) ON CONFLICT(executor)
+             DO UPDATE SET slots=excluded.slots, memory_mb=excluded.memory_mb",
+            params![executor, wanted.slots, wanted.memory_mb],
+        )?;
+    }
+    let detail = json!({"executor":executor,"slots":wanted.slots,"memory_mb":wanted.memory_mb});
+    event(&transaction, "executor.reserve", executor, &detail)?;
+    transaction.commit()?;
+    Ok(detail)
+}
+
+/// What this executor keeps for prioritized owners. A store without reserves has none.
+pub fn reserve(db: &Connection, executor: &str) -> Result<Option<Reservation>> {
+    if !table_exists(db, "executor_reserves")? {
+        return Ok(None);
+    }
+    Ok(db
+        .query_row(
+            "SELECT slots, memory_mb FROM executor_reserves WHERE executor=?",
+            [executor],
+            |r| {
+                Ok(Reservation {
+                    slots: r.get(0)?,
+                    memory_mb: r.get(1)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
 /// Every executor with its budget, what it holds and what its coordinator last reported.
 pub fn list(store: &Store) -> Result<Value> {
     prepare(&store.db)?;
@@ -2255,6 +2377,7 @@ fn view(db: &Connection, record: &ExecutorRecord) -> Result<Value> {
         json!({"id":record.id,"configured":{"slots":slots,"memory_mb":memory_mb},
         "effective":effective,
         "held":{"slots":held.slots,"memory_mb":held.memory_mb,"attempts":attempts},
+        "reserve":reserve(db, &record.id)?,
         "lease_seconds":record.lease_seconds,"placement":record.placement,
         "observed":record.observed}),
     )
@@ -3551,6 +3674,286 @@ mod tests {
         assert_eq!(mindy_claims(&mut store, "k3").as_deref(), Some("lane"));
         assert_eq!(load(&store.db, "mindy").unwrap().unwrap().holding, None);
         assert_eq!(events(&store.db, "executor.hold_released").len(), 1);
+    }
+
+    fn need((slots, memory_mb): (u32, u32)) -> Reservation {
+        Reservation { slots, memory_mb }
+    }
+
+    /// The lab's local executor (4 slots, 4096 MiB) keeping `reserve` for prioritized owners, and
+    /// `train` at priority 1.
+    fn reserve_lab(reserve: (u32, u32)) -> (tempfile::TempDir, Store) {
+        let (root, mut store) = lab();
+        set_reserve(&mut store, LOCAL, need(reserve)).unwrap();
+        crate::worker::set_priority(&store, "train", 1).unwrap();
+        (root, store)
+    }
+
+    /// A queued action of `owner`, created at `created`, reserving `wanted`.
+    fn wants(store: &Store, id: &str, owner: &str, created: f64, wanted: (u32, u32)) {
+        queue(
+            &store.db,
+            Queue {
+                id,
+                owner,
+                created,
+                reservation: Some(wanted),
+                ..Queue::default()
+            },
+        );
+    }
+
+    /// `count` lane actions `lane-0`.. of `wanted`, created from `from` on.
+    fn lanes(store: &Store, count: usize, from: f64, wanted: (u32, u32)) {
+        for index in 0..count {
+            let id = format!("lane-{index}");
+            wants(store, &id, "lane", from + index as f64, wanted);
+        }
+    }
+
+    /// Another owner's active interest in a queued action.
+    fn shared_with(store: &Store, action: &str, owner: &str) {
+        store
+            .db
+            .execute(
+                "INSERT INTO interests VALUES (?,?,'',1)",
+                params![action, owner],
+            )
+            .unwrap();
+    }
+
+    /// Local claims until one admits nothing: the actions admitted, in order.
+    fn local_claims(store: &mut Store) -> Vec<String> {
+        std::iter::from_fn(|| local_claim(store).map(|attempt| attempt.action)).collect()
+    }
+
+    /// mindy's claims until one admits nothing.
+    fn mindy_claims_all(store: &mut Store) -> Vec<String> {
+        std::iter::from_fn(|| mindy_claims(store, &unique())).collect()
+    }
+
+    #[test]
+    fn work_without_priority_never_takes_the_reserve() {
+        // Trains 92 and 95 (#4204): lane runs claimed most of local just before the train was
+        // submitted, and its prepare waited 21 and 11 minutes for them. Local is 4/4096; the cases
+        // bind both dimensions, slots alone and memory alone.
+        for (reserve, lane, stopped) in [
+            ((2, 2048), (1, 1024), (2, 2048)),
+            ((2, 1024), (1, 512), (2, 1024)),
+            ((1, 2048), (1, 1024), (2, 2048)),
+        ] {
+            for priority in [0, -1] {
+                let (_root, mut store) = reserve_lab(reserve);
+                crate::worker::set_priority(&store, "lane", priority).unwrap();
+                lanes(&store, 4, 1.0, lane);
+                let case = format!("{reserve:?} {lane:?} at {priority}");
+                assert_eq!(local_claims(&mut store), ["lane-0", "lane-1"], "{case}");
+                assert_eq!(held(&store.db, LOCAL).unwrap(), need(stopped), "{case}");
+                // A block by the reserve is not a hold.
+                assert_eq!(load(&store.db, LOCAL).unwrap().unwrap().holding, None);
+                assert!(events(&store.db, "executor.held").is_empty(), "{case}");
+                // A train's job as large as the reserve is then claimed into it.
+                wants(&store, "prepare", "train", 9.0, reserve);
+                assert_eq!(local_claims(&mut store), ["prepare"], "{case}");
+                let full = need((stopped.0 + reserve.0, stopped.1 + reserve.1));
+                assert_eq!(held(&store.db, LOCAL).unwrap(), full, "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_prioritized_owner_may_fill_the_whole_executor_reserve_included() {
+        let (_root, mut store) = reserve_lab((2, 2048));
+        for index in 0..5 {
+            wants(
+                &store,
+                &format!("shard-{index}"),
+                "train",
+                index as f64,
+                (1, 1024),
+            );
+        }
+        assert_eq!(
+            local_claims(&mut store),
+            ["shard-0", "shard-1", "shard-2", "shard-3"]
+        );
+        assert_eq!(held(&store.db, LOCAL).unwrap(), need((4, 4096)));
+    }
+
+    #[test]
+    fn prioritized_running_work_never_shrinks_what_is_left_to_other_work() {
+        // Inside the reserve: the train's prepare holds half of it, and lanes still reach 2/2048.
+        let (_root, mut store) = reserve_lab((2, 2048));
+        wants(&store, "prepare", "train", 1.0, (1, 1024));
+        lanes(&store, 3, 2.0, (1, 1024));
+        assert_eq!(local_claims(&mut store), ["prepare", "lane-0", "lane-1"]);
+        // Beyond it: the train holds 3/3072, and the whole executor still bounds the lanes.
+        let (_root, mut store) = reserve_lab((2, 2048));
+        wants(&store, "prepare", "train", 1.0, (3, 3072));
+        lanes(&store, 3, 2.0, (1, 1024));
+        assert_eq!(local_claims(&mut store), ["prepare", "lane-0"]);
+        assert_eq!(held(&store.db, LOCAL).unwrap(), need((4, 4096)));
+    }
+
+    #[test]
+    fn an_action_a_prioritized_owner_shares_is_prioritized_claimed_and_counted() {
+        // Claimed: with the lanes' share full, a lane's action is claimed into the reserve once the
+        // train wants it too, and the claim is the train's.
+        let (_root, mut store) = reserve_lab((2, 2048));
+        lanes(&store, 2, 1.0, (1, 1024));
+        wants(&store, "shared", "lane", 3.0, (1, 1024));
+        assert_eq!(local_claims(&mut store), ["lane-0", "lane-1"]);
+        shared_with(&store, "shared", "train");
+        assert_eq!(local_claims(&mut store), ["shared"]);
+        let claims = events(&store.db, "attempt.claimed");
+        assert_eq!(claims.last().unwrap().1["owner"], "train");
+        // Counted: its running attempt is the train's, so the lanes still reach 2/2048.
+        let (_root, mut store) = reserve_lab((2, 2048));
+        wants(&store, "shared", "lane", 1.0, (1, 1024));
+        shared_with(&store, "shared", "train");
+        lanes(&store, 3, 2.0, (1, 1024));
+        assert_eq!(local_claims(&mut store), ["shared", "lane-0", "lane-1"]);
+    }
+
+    #[test]
+    fn work_without_priority_larger_than_the_reserve_leaves_is_skipped_not_drained_for() {
+        // Each exceeds what the reserve leaves of local (2/2048) in one dimension alone.
+        for big in [(3, 1024), (1, 3072)] {
+            let (_root, mut store) = reserve_lab((2, 2048));
+            wants(&store, "big", "lane", 1.0, big);
+            wants(&store, "small", "lane", 2.0, (1, 1024));
+            assert_eq!(local_claims(&mut store), ["small"], "{big:?}");
+            // With no reserve it is claimed, as without the reserve.
+            set_reserve(&mut store, LOCAL, need((0, 0))).unwrap();
+            assert_eq!(local_claims(&mut store), ["big"], "{big:?}");
+            let (_root, mut store) = lab();
+            wants(&store, "big", "lane", 1.0, big);
+            wants(&store, "small", "lane", 2.0, (1, 1024));
+            assert_eq!(local_claims(&mut store), ["big", "small"], "{big:?}");
+        }
+        // A prioritized owner's choice is never skipped, nor the train's choice of an action it
+        // shares with a lane.
+        let (_root, mut store) = reserve_lab((2, 2048));
+        wants(&store, "big", "lane", 1.0, (3, 3072));
+        shared_with(&store, "big", "train");
+        wants(&store, "small", "lane", 2.0, (1, 1024));
+        assert_eq!(local_claims(&mut store), ["big", "small"]);
+    }
+
+    #[test]
+    fn a_reserve_applies_on_its_own_executor_alone() {
+        // Kept on local, mindy (also 4/4096) gives lane work all of itself.
+        let (_root, mut store) = reserve_lab((2, 2048));
+        register(&store.db, "mindy", 4, 4096);
+        lanes(&store, 5, 1.0, (1, 1024));
+        assert_eq!(mindy_claims_all(&mut store).len(), 4);
+        assert_eq!(local_claims(&mut store), ["lane-4"]);
+        // Kept on mindy, local gives it all of itself and mindy keeps its own.
+        let (_root, mut store) = lab();
+        register(&store.db, "mindy", 4, 4096);
+        set_reserve(&mut store, "mindy", need((2, 2048))).unwrap();
+        lanes(&store, 7, 1.0, (1, 1024));
+        assert_eq!(local_claims(&mut store).len(), 4);
+        assert_eq!(mindy_claims_all(&mut store), ["lane-4", "lane-5"]);
+    }
+
+    #[test]
+    fn work_without_priority_fits_beside_both_the_hold_and_the_reserve() {
+        // mindy is 8/8192; another lane's attempt holds 2/2048 there; the train's shard waits on its
+        // running prepare and holds what it needs; the lane wants 2/2048.
+        for (reserve, shard, claimed, holding) in [
+            // Beside the hold (2 + 1 + 2 <= 8) but not in what the reserve leaves (2 + 2 > 3).
+            ((5, 5120), (1, 1024), None, false),
+            // In what the reserve leaves (2 + 2 <= 5) but not beside the hold (2 + 5 + 2 > 8).
+            ((3, 3072), (5, 5120), None, true),
+            ((3, 3072), (1, 1024), Some("lane"), false),
+        ] {
+            let (_root, mut store) = train_beside_lane("running", shard, (2, 2048));
+            hold(&store.db, "other", Some("mindy"), 2, 2048);
+            set_reserve(&mut store, "mindy", need(reserve)).unwrap();
+            let case = format!("{reserve:?} {shard:?}");
+            assert_eq!(mindy_claims(&mut store, "k1").as_deref(), claimed, "{case}");
+            let record = load(&store.db, "mindy").unwrap().unwrap();
+            assert_eq!(record.holding.is_some(), holding, "{case}");
+        }
+    }
+
+    #[test]
+    fn reserve_sets_replaces_and_clears_and_executors_lists_it() {
+        let (_root, mut store) = lab();
+        register(&store.db, "mindy", 4, 4096);
+        let listed = |store: &Store, id: &str| {
+            list(store)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["id"] == id)
+                .unwrap()["reserve"]
+                .clone()
+        };
+        // A store from before reserves, or never given one, has none.
+        assert!(!table_exists(&store.db, "executor_reserves").unwrap());
+        assert_eq!(reserve(&store.db, LOCAL).unwrap(), None);
+        assert_eq!(listed(&store, LOCAL), Value::Null);
+        assert_eq!(
+            set_reserve(&mut store, LOCAL, need((2, 2048))).unwrap(),
+            json!({"executor":"local","slots":2,"memory_mb":2048})
+        );
+        assert_eq!(listed(&store, LOCAL), json!({"slots":2,"memory_mb":2048}));
+        assert_eq!(listed(&store, "mindy"), Value::Null);
+        set_reserve(&mut store, LOCAL, need((3, 1024))).unwrap();
+        assert_eq!(reserve(&store.db, LOCAL).unwrap(), Some(need((3, 1024))));
+        assert_eq!(listed(&store, LOCAL), json!({"slots":3,"memory_mb":1024}));
+        set_reserve(&mut store, LOCAL, need((0, 0))).unwrap();
+        assert_eq!(listed(&store, LOCAL), Value::Null);
+        let rows: i64 = store
+            .db
+            .query_row("SELECT COUNT(*) FROM executor_reserves", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+        let detail = |slots: u32, memory_mb: u32| {
+            (
+                "local".to_owned(),
+                json!({"executor":"local","slots":slots,"memory_mb":memory_mb}),
+            )
+        };
+        assert_eq!(
+            events(&store.db, "executor.reserve"),
+            [detail(2, 2048), detail(3, 1024), detail(0, 0)]
+        );
+        // Cleared, lane work may take all of local again.
+        lanes(&store, 5, 1.0, (1, 1024));
+        assert_eq!(local_claims(&mut store).len(), 4);
+    }
+
+    #[test]
+    fn reserve_refuses_an_unknown_executor_and_one_that_leaves_no_room() {
+        let (_root, mut store) = lab();
+        register(&store.db, "mindy", 2, 2048);
+        for (executor, wanted, message) in [
+            ("ghost", (1, 512), "not registered"),
+            (LOCAL, (4, 1024), "below"),
+            (LOCAL, (1, 4096), "below"),
+            (LOCAL, (5, 8192), "below"),
+            ("mindy", (2, 512), "below"),
+            ("mindy", (1, 2048), "below"),
+        ] {
+            let error = set_reserve(&mut store, executor, need(wanted)).unwrap_err();
+            assert!(
+                format!("{error:#}").contains(message),
+                "{executor} {wanted:?}: {error:#}"
+            );
+        }
+        // A refusal writes nothing.
+        assert!(!table_exists(&store.db, "executor_reserves").unwrap());
+        assert!(events(&store.db, "executor.reserve").is_empty());
+        // Just below capacity in both is a reserve, and a later refusal leaves it standing.
+        set_reserve(&mut store, LOCAL, need((3, 4095))).unwrap();
+        set_reserve(&mut store, "mindy", need((1, 2047))).unwrap();
+        set_reserve(&mut store, LOCAL, need((4, 1))).unwrap_err();
+        assert_eq!(reserve(&store.db, LOCAL).unwrap(), Some(need((3, 4095))));
+        assert_eq!(events(&store.db, "executor.reserve").len(), 2);
     }
 
     /// Recorded occupancy, in seconds, of `job` in `profile` (its own lineage) of project `p-a`.
