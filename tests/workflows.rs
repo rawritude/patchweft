@@ -438,6 +438,74 @@ fn operator_priority_admits_a_train_before_earlier_lane_work() {
 }
 
 #[test]
+fn operator_reserve_keeps_local_capacity_for_prioritized_owners() {
+    let lab = Lab::new();
+    // The job takes the whole two-slot budget, so it never fits beside a one-slot reserve.
+    let profile = lab.profile(json!([
+        {"name":"prepare","command":["sh","-c","true"],"slots":2,"reuse":"never","report":{"kind":"command"}}
+    ]));
+    let reserve = |slots: &str, memory_mb: &str| {
+        lab.call(&[
+            "reserve",
+            "local",
+            "--slots",
+            slots,
+            "--memory-mb",
+            memory_mb,
+        ])
+    };
+    let listed = || {
+        lab.call(&["executors"])
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["id"] == "local")
+            .unwrap()["reserve"]
+            .clone()
+    };
+    lab.refuses(
+        &["reserve", "ghost", "--slots", "1", "--memory-mb", "1024"],
+        "not registered",
+    );
+    lab.refuses(
+        &["reserve", "local", "--slots", "2", "--memory-mb", "1024"],
+        "below",
+    );
+    lab.refuses(
+        &["reserve", "local", "--slots=-1", "--memory-mb", "1024"],
+        "invalid value",
+    );
+    assert_eq!(listed(), Value::Null);
+    assert_eq!(
+        reserve("1", "1024"),
+        json!({"executor":"local","slots":1,"memory_mb":1024})
+    );
+    assert_eq!(listed(), json!({"slots":1,"memory_mb":1024,"applied":true}));
+    lab.call(&[
+        "request",
+        "--revision",
+        &lab.base,
+        "--profile",
+        &profile,
+        "--job",
+        "prepare",
+        "--owner",
+        "api:claude-c",
+    ]);
+    // The worker skips what a lane can never claim beside the reserve instead of waiting for it.
+    lab.drain();
+    assert_eq!(lab.call(&["status"])["actions"][0]["state"], "queued");
+    lab.call(&["priority", "api:claude-c", "1"]);
+    lab.drain();
+    assert_eq!(lab.call(&["status"])["actions"][0]["state"], "passed");
+    assert_eq!(
+        reserve("0", "0"),
+        json!({"executor":"local","slots":0,"memory_mb":0})
+    );
+    assert_eq!(listed(), Value::Null);
+}
+
+#[test]
 fn successful_jobs_survive_retry_of_a_failed_obligation() {
     let lab = Lab::new();
     let profile = lab.profile(json!([

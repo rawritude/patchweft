@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};
 use patchweft::{
-    api, authority, client, engine, executor, http, mcp, source, store::Store, worker,
+    api, authority, client, engine, executor, http, mcp, model, source, store::Store, worker,
 };
 use serde_json::{Value, json};
 use std::{
@@ -54,6 +54,14 @@ enum Operation {
         owner: String,
         #[arg(allow_negative_numbers = true)]
         priority: i64,
+    },
+    /// Keep part of an executor's capacity for owners above priority 0 (0 and 0 clear it).
+    Reserve {
+        executor: String,
+        #[arg(long)]
+        slots: u32,
+        #[arg(long)]
+        memory_mb: u32,
     },
     /// Replace an existing principal's scope without rotating its credentials.
     Policy {
@@ -480,6 +488,15 @@ fn run(cli: Cli) -> Result<Value> {
             &credential_file,
         )?,
         Operation::Priority { owner, priority } => worker::set_priority(&store, &owner, priority)?,
+        Operation::Reserve {
+            executor,
+            slots,
+            memory_mb,
+        } => authority::set_reserve(
+            &mut store,
+            &executor,
+            model::Reservation { slots, memory_mb },
+        )?,
         Operation::Policy { policy } => {
             api::update_policy(&store, serde_json::from_slice(&fs::read(policy)?)?)?
         }
