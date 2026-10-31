@@ -36,8 +36,8 @@ are expected to take, so a new shard does not wait behind every known short job.
 preparation after an upgrade seeds the samples from the passes already recorded.
 Without history every rank is 0 and the oldest goes first. An executor drains for its head: a
 head that does not fit yet keeps smaller jobs back until it does, and ranking makes a long job
-the head more often. Another owner's job that is admitted on its own terms (it fits, beside the
-hold and within the reserve) still starts beside the head if, whichever of the executor's running
+the head more often. Another owner's job of the head's own priority that is admitted on its own
+terms (it fits, beside the hold and within the reserve) still starts beside the head if, whichever of the executor's running
 jobs end first, the head would start just as soon (backfill). None does with more than 12 jobs
 held there, while a hold above the head's priority applies there (a hold lifts wherever its job
 does not land, and the head would then start at once), or when its claim would move the median
