@@ -287,7 +287,9 @@ pub struct Selection {
     /// The verified choices after the head, in the same order: what a blocked head may admit
     /// beside it (`backfill`). Empty while the head is unverified, as it then admits nothing. A
     /// choice whose claim would move the median a job without history ranks by is left out: it
-    /// could change the head.
+    /// could change the head. Any estimated job of a profile with such a job queued counts as one,
+    /// whether or not its claim would move the median: only a job with no history at all is held
+    /// up by it, and only while it is queued.
     pub later: Vec<Choice>,
     /// Profiles of admissible work the executor has not verified (at most 32).
     pub unverified: Vec<String>,

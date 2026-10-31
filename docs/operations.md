@@ -41,9 +41,10 @@ hold and within the reserve) still starts beside the head if, whichever of the e
 jobs end first, the head would start just as soon (backfill). None does with more than 12 jobs
 held there, while a hold above the head's priority applies there (a hold lifts wherever its job
 does not land, and the head would then start at once), or when its claim would move the median
-a job without history is ranked by. The guarantee covers the head at the time of the claim: on
-an executor without a reserve, a train that arrives after a backfill can wait for the backfilled
-job, as for any lane admission there; a reserve bounds that. A higher-priority owner's job that waits only on a running dependency
+a job without history is ranked by. The guarantee covers the head and the holds at the time of
+the claim: a train that arrives, or a hold that starts, after a backfill can wait for the
+backfilled job, as for any lane admission there; on an executor with a reserve, the reserve
+bounds that for trains. A higher-priority owner's job that waits only on a running dependency
 (every dependency passed or running) holds the capacity it will need on each executor that may
 run it: a lower-priority job is admitted only if it fits beside the demand of the priorities
 above its own, counting the host's running work but not the dependencies being waited on, whose
