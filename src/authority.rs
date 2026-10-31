@@ -285,7 +285,9 @@ pub struct Choice {
 pub struct Selection {
     pub choice: Option<Choice>,
     /// The verified choices after the head, in the same order: what a blocked head may admit
-    /// beside it (`backfill`). Empty while the head is unverified, as it then admits nothing.
+    /// beside it (`backfill`). Empty while the head is unverified, as it then admits nothing. A
+    /// choice whose claim would move the median a job without history ranks by is left out: it
+    /// could change the head.
     pub later: Vec<Choice>,
     /// Profiles of admissible work the executor has not verified (at most 32).
     pub unverified: Vec<String>,
@@ -318,7 +320,20 @@ pub fn select(
             .map(|v| Ok(serde_json::from_str(&v?)?))
             .collect::<Result<_>>()?
     };
-    let ranks = ranks(&queued, &Durations::load(db, &queued)?);
+    let durations = Durations::load(db, &queued)?;
+    let ranks = ranks(&queued, &durations);
+    // A job without history ranks as the median of its profile's queued estimates (`ranks`), so a
+    // claim of one with an estimate beside such a job moves that median, and the order with it.
+    let estimated: BTreeSet<String> = queued
+        .iter()
+        .filter(|action| durations.expected(action).is_some())
+        .map(|action| action.id.clone())
+        .collect();
+    let unestimated: BTreeSet<String> = queued
+        .iter()
+        .filter(|action| durations.expected(action).is_none())
+        .map(|action| action.profile.clone())
+        .collect();
     let priorities = owner_priorities(db)?;
     let reserve = applied(reserve(db, &record.id)?, capacity);
     let mut profiles = BTreeMap::new();
@@ -479,7 +494,11 @@ pub fn select(
         .map(|(_, choice)| choice);
     let later = match choice {
         Some(_) => order
-            .filter(|(trusted, _)| *trusted)
+            .filter(|(trusted, choice)| {
+                *trusted
+                    && !(estimated.contains(&choice.action.id)
+                        && unestimated.contains(&choice.action.profile))
+            })
             .map(|(_, choice)| choice)
             .collect(),
         None => Vec::new(),
@@ -1139,11 +1158,14 @@ pub fn claim_for(
     let admitted = match choice {
         Some(choice) if admits(&choice, &current) => Some(choice),
         // Drain for the head: later small actions cannot starve its reservation, so only one
-        // admitted now on its own terms that never delays it goes beside it.
-        Some(head) => {
+        // admitted now on its own terms that never delays it goes beside it. Not while a hold
+        // above the head applies here: a hold lifts wherever the job it keeps room for does not
+        // land, and the head would then start at once.
+        Some(head) if holding(head.priority).is_none() => {
             let admissible = later.into_iter().filter(|choice| admits(choice, &current));
             backfill(&transaction, executor, &head, admissible, &freed, admits)?
         }
+        Some(_) => None,
         None => None,
     };
     let Some(choice) = admitted else {
@@ -4472,10 +4494,12 @@ mod tests {
     }
 
     #[test]
-    fn a_job_beside_a_head_the_hold_keeps_back_fits_beside_the_hold_and_never_delays_it() {
-        // mindy is 8/8192. The train's shard waits on its prepare, running elsewhere, and holds
-        // 1024 MiB; the head fits mindy now, but not beside the hold. wide fits mindy too, and
-        // beside the head once the 6144 MiB attempt ends, but not beside the hold now.
+    fn a_head_the_hold_keeps_back_admits_nothing_beside_it() {
+        // A hold lifts on every executor where the job it keeps room for does not land, and the
+        // head would then start at once: nothing backfilled may stand in its way. mindy is
+        // 8/8192. The train's shard waits on its prepare, running elsewhere, and holds 1024 MiB;
+        // the head fits mindy now, but not beside the hold. wide fits mindy too, and beside the
+        // head once the 6144 MiB attempt ends, but not beside the hold now.
         let (_root, mut store) = hold_lab();
         job_of(&store, "prepare", "train", "running", (1, 1), &[]);
         job_of(&store, "shard", "train", "queued", (1, 1024), &["prepare"]);
@@ -4484,8 +4508,8 @@ mod tests {
         job_of(&store, "wide", "b", "queued", (1, 1536), &[]);
         crate::worker::set_priority(&store, "train", 1).unwrap();
         assert_eq!(mindy_claims(&mut store, "k1"), None);
-        // Here the hold is 2048 MiB: once the 1536 MiB attempt ends, the head fits beside the hold
-        // and a 512 MiB job, not a 1024 MiB one. The hold is still the head's.
+        // Here the hold is 2048 MiB: once the 1536 MiB attempt ends, the head would fit beside the
+        // hold and lint, but lint stays back while the hold applies. The hold is still the head's.
         let (_root, mut store) = hold_lab();
         job_of(&store, "prepare", "train", "running", (1, 1), &[]);
         job_of(&store, "shard", "train", "queued", (1, 2048), &["prepare"]);
@@ -4495,7 +4519,7 @@ mod tests {
         job_of(&store, "late", "b", "queued", (1, 1024), &[]);
         job_of(&store, "lint", "c", "queued", (1, 512), &[]);
         crate::worker::set_priority(&store, "train", 1).unwrap();
-        assert_eq!(mindy_claims(&mut store, "k1").as_deref(), Some("lint"));
+        assert_eq!(mindy_claims(&mut store, "k1"), None);
         assert_eq!(
             load(&store.db, "mindy").unwrap().unwrap().holding,
             Some(Holding {
@@ -4505,8 +4529,7 @@ mod tests {
             })
         );
         assert_eq!(events(&store.db, "executor.held").len(), 1);
-        // A dependency the hold waits on frees no room for the head when it ends: the shard
-        // waiting on it takes that room. The head waits for the 4096 MiB attempt alone.
+        // Nor beside a head that waits on a dependency the hold waits on too.
         let (_root, mut store) = hold_lab();
         job_of(&store, "prepare", "train", "running", (1, 2048), &[]);
         running_on_mindy(&store, "prepare", (1, 2048));
@@ -4515,7 +4538,7 @@ mod tests {
         job_of(&store, "head", "a", "queued", (1, 3072), &[]);
         job_of(&store, "lint", "b", "queued", (1, 2048), &[]);
         crate::worker::set_priority(&store, "train", 1).unwrap();
-        assert_eq!(mindy_claims(&mut store, "k1").as_deref(), Some("lint"));
+        assert_eq!(mindy_claims(&mut store, "k1"), None);
     }
 
     #[test]
@@ -8224,5 +8247,123 @@ mod tests {
         assert_eq!(events[0].0, "mindy");
         assert_eq!(events[0].1["created"], true);
         assert_eq!(events[1].1["slots"], 2);
+    }
+
+    /// The train's shard waits on its prepare, running on no executor here; robin claims it once
+    /// prepare passes, so mindy's hold lifts without mindy's room being used.
+    fn shard_runs_on_robin(store: &mut Store) {
+        register(&store.db, "robin", 20, 24576);
+        hold(&store.db, "shard-a", Some("robin"), 1, 1);
+        store
+            .db
+            .execute_batch(
+                "UPDATE actions SET state='passed' WHERE id='prepare';
+                 UPDATE actions SET state='running',attempt='shard-a' WHERE id='shard'",
+            )
+            .unwrap();
+        assert!(load(&store.db, "mindy").unwrap().unwrap().holding.is_some());
+    }
+
+    #[test]
+    fn a_head_no_release_admits_beside_the_hold_admits_nothing_beside_it() {
+        // 10240 (hold) + 16384 (head) > 24576: no set of releases admits the head while the hold
+        // stands, so `releases` is empty and `all` is vacuously true.
+        let (_root, mut store) = mindy_running(&[]);
+        job_of(&store, "prepare", "train", "running", (1, 1), &[]);
+        job_of(&store, "shard", "train", "queued", (1, 10240), &["prepare"]);
+        crate::worker::set_priority(&store, "train", 1).unwrap();
+        wants(&store, "head", "a", 1.0, (6, 16384));
+        wants(&store, "j", "b", 2.0, (4, 9216));
+        let first = mindy_claims(&mut store, "k1");
+        shard_runs_on_robin(&mut store);
+        // Without j the head fits mindy now (16384 <= 24576); with it, 25600 does not.
+        assert_eq!(
+            mindy_claims(&mut store, "k2").as_deref(),
+            Some("head"),
+            "first claim admitted {first:?}"
+        );
+    }
+
+    #[test]
+    fn a_hold_that_lifts_elsewhere_finds_nothing_backfilled_in_the_heads_way() {
+        // run-0 6/12288. The shard's hold is 1/4096: the head (6/9216) is held back now and fits
+        // beside the hold once run-0 ends, with j (4/4096) too. The shard then runs on robin.
+        let (_root, mut store) = mindy_running(&[(6, 12288)]);
+        job_of(&store, "prepare", "train", "running", (1, 1), &[]);
+        job_of(&store, "shard", "train", "queued", (1, 4096), &["prepare"]);
+        crate::worker::set_priority(&store, "train", 1).unwrap();
+        wants(&store, "head", "a", 1.0, (6, 9216));
+        wants(&store, "j", "b", 2.0, (4, 4096));
+        let first = mindy_claims(&mut store, "k1");
+        shard_runs_on_robin(&mut store);
+        // Without j: 12288 + 9216 = 21504 fits. With j: 25600 does not, until run-0 or j ends.
+        assert_eq!(
+            mindy_claims(&mut store, "k2").as_deref(),
+            Some("head"),
+            "first claim admitted {first:?}"
+        );
+    }
+
+    #[test]
+    fn a_job_whose_claim_would_move_its_profiles_median_is_not_backfilled() {
+        // a: head (known 100 s, 6/9216) and h2 (no history, 6/12288, older). b: j (known 10 s).
+        // h2 ranks as the median of f-1's known queued jobs: 55 s with j queued, so head leads;
+        // once j runs, 100 s, h2 ties head and its age makes it a's head.
+        let (_root, mut store) = mindy_running(&[(6, 9216), (6, 9216)]);
+        let job = |id, owner, created, reservation| Queue {
+            id,
+            job: id,
+            owner,
+            created,
+            reservation: Some(reservation),
+            ..Queue::default()
+        };
+        queue(&store.db, job("head", "a", 1.0, (6, 9216)));
+        queue(&store.db, job("h2", "a", 0.5, (6, 12288)));
+        queue(&store.db, job("j", "b", 2.0, (4, 4608)));
+        history(&store.db, "f-1", "head", &[100.0]);
+        history(&store.db, "f-1", "j", &[10.0]);
+        assert_eq!(head(&store).as_deref(), Some("head"));
+        let first = mindy_claims(&mut store, "k1");
+        let after = head(&store);
+        ends(&store, "run-0");
+        // Without j, head starts now (18432). With j, h2 is the head and does not fit (26112).
+        assert_eq!(
+            mindy_claims(&mut store, "k2").as_deref(),
+            Some("head"),
+            "first claim admitted {first:?}, head after it {after:?}"
+        );
+    }
+
+    #[test]
+    fn a_hold_that_lifts_in_part_finds_nothing_backfilled_in_the_heads_way() {
+        // Two train shards (1/6144 each) wait on prepare elsewhere: mindy holds 12288. run-0 is
+        // 1/2048; the head (6/14336) fits beside the hold whatever ends: never. j (4/6144) fits
+        // beside the hold now, and beside the head with no hold at all. Prepare passes: s1 runs on
+        // local, s2 here.
+        let (_root, mut store) = mindy_running(&[(1, 2048)]);
+        job_of(&store, "prepare", "train", "running", (1, 1), &[]);
+        job_of(&store, "s1", "train", "queued", (1, 6144), &["prepare"]);
+        job_of(&store, "s2", "train", "queued", (1, 6144), &["prepare"]);
+        crate::worker::set_priority(&store, "train", 1).unwrap();
+        wants(&store, "head", "a", 1.0, (6, 14336));
+        wants(&store, "j", "b", 2.0, (4, 6144));
+        let first = mindy_claims(&mut store, "k1");
+        hold(&store.db, "s1-a", Some("local"), 1, 6144);
+        hold(&store.db, "s2-a", Some("mindy"), 1, 6144);
+        store
+            .db
+            .execute_batch(
+                "UPDATE actions SET state='passed' WHERE id='prepare';
+                 UPDATE actions SET state='running',attempt='s1-a' WHERE id='s1';
+                 UPDATE actions SET state='running',attempt='s2-a' WHERE id='s2'",
+            )
+            .unwrap();
+        // Without j: 2048 + 6144 + 14336 = 22528 fits. With j: 28672 does not.
+        assert_eq!(
+            mindy_claims(&mut store, "k2").as_deref(),
+            Some("head"),
+            "first claim admitted {first:?}"
+        );
     }
 }
