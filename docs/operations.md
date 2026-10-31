@@ -36,7 +36,10 @@ are expected to take, so a new shard does not wait behind every known short job.
 preparation after an upgrade seeds the samples from the passes already recorded.
 Without history every rank is 0 and the oldest goes first. An executor drains for its head: a
 head that does not fit yet keeps smaller jobs back until it does, and ranking makes a long job
-the head more often. A higher-priority owner's job that waits only on a running dependency
+the head more often. Another owner's job that is admitted on its own terms (it fits, beside the
+hold and within the reserve) still starts beside the head if, whichever of the executor's running
+jobs end first, the head would start just as soon (backfill); with more than 12 jobs held there,
+none does. A higher-priority owner's job that waits only on a running dependency
 (every dependency passed or running) holds the capacity it will need on each executor that may
 run it: a lower-priority job is admitted only if it fits beside the demand of the priorities
 above its own, counting the host's running work but not the dependencies being waited on, whose
