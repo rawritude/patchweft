@@ -76,7 +76,11 @@ impl Remote {
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(40));
+            .timeout(Duration::from_secs(40))
+            // Executors hold pooled connections to the API between polls; probing them keeps a
+            // NAT's idle mapping alive, so the NAT does not silently strand them. reqwest
+            // already defaults to 15 s; pinning it means an upgrade cannot quietly drop it.
+            .tcp_keepalive(Duration::from_secs(15));
         if let Some(path) = ca {
             builder =
                 builder.add_root_certificate(reqwest::Certificate::from_pem(&fs::read(path)?)?);
