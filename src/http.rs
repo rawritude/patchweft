@@ -796,6 +796,73 @@ fn maintain(mut store: Store, started: f64, stop: &AtomicBool) {
     }
 }
 
+// A peer behind a NAT that drops idle mappings leaves a half-open connection: no FIN or RST
+// ever arrives, so without probes the server holds that socket and its descriptor forever while
+// the peer reconnects on a fresh one. Probing after a minute idle, every 15 s, closes a dead peer
+// after four unanswered probes, about two minutes, while a live idle client costs one small
+// packet exchange a minute.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const KEEPALIVE_PROBES: u32 = 4;
+// macOS names the idle time TCP_KEEPALIVE; Linux, where the API runs, names it TCP_KEEPIDLE.
+#[cfg(target_vendor = "apple")]
+const KEEPALIVE_IDLE_OPTION: libc::c_int = libc::TCP_KEEPALIVE;
+#[cfg(not(target_vendor = "apple"))]
+const KEEPALIVE_IDLE_OPTION: libc::c_int = libc::TCP_KEEPIDLE;
+
+/// The listener `serve` accepts on, configured before any connection arrives.
+fn bind(listen: SocketAddr) -> std::io::Result<std::net::TcpListener> {
+    let listener = std::net::TcpListener::bind(listen)?;
+    // Tokio requires nonblocking sockets; otherwise a later accept can stall shutdown.
+    listener.set_nonblocking(true)?;
+    // Accepted sockets inherit these from the listener, so every connection is probed without
+    // touching the accept path (the test checks this on a real accepted socket).
+    let tcp = libc::IPPROTO_TCP;
+    set_socket_option(&listener, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)?;
+    set_socket_option(
+        &listener,
+        tcp,
+        KEEPALIVE_IDLE_OPTION,
+        KEEPALIVE_IDLE.as_secs() as libc::c_int,
+    )?;
+    set_socket_option(
+        &listener,
+        tcp,
+        libc::TCP_KEEPINTVL,
+        KEEPALIVE_INTERVAL.as_secs() as libc::c_int,
+    )?;
+    set_socket_option(
+        &listener,
+        tcp,
+        libc::TCP_KEEPCNT,
+        KEEPALIVE_PROBES as libc::c_int,
+    )?;
+    Ok(listener)
+}
+
+fn set_socket_option(
+    socket: &impl std::os::fd::AsRawFd,
+    level: libc::c_int,
+    name: libc::c_int,
+    value: libc::c_int,
+) -> std::io::Result<()> {
+    // SAFETY: the descriptor stays open for the call, and the pointer and length describe a c_int.
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            level,
+            name,
+            (&raw const value).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 pub fn serve(
     root: &FsPath,
     listen: SocketAddr,
@@ -815,9 +882,7 @@ pub fn serve(
     ensure!(!origins.contains("*"), "origins must be explicit");
     let api = Arc::new(Api::open(root)?);
     let maintenance = Store::open(root)?;
-    let listener = std::net::TcpListener::bind(listen)?;
-    // Tokio requires nonblocking sockets; otherwise a later accept can stall shutdown.
-    listener.set_nonblocking(true)?;
+    let listener = bind(listen)?;
     let address = listener.local_addr()?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -1309,5 +1374,57 @@ mod tests {
             .unwrap();
         drop(permit);
         assert_eq!(gate.available_permits(), 1);
+    }
+
+    fn socket_option(socket: &impl std::os::fd::AsRawFd, level: i32, name: i32) -> i32 {
+        let mut value: libc::c_int = 0;
+        let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: the descriptor stays open for the call, and value/length describe a c_int.
+        let result = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                level,
+                name,
+                (&raw mut value).cast(),
+                &raw mut length,
+            )
+        };
+        assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+        value
+    }
+
+    #[test]
+    fn accepted_connections_inherit_the_listener_keepalive() {
+        let listener = bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let _client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let accepted = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "no connection to accept");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        };
+        let tcp = libc::IPPROTO_TCP;
+        assert_ne!(
+            socket_option(&accepted, libc::SOL_SOCKET, libc::SO_KEEPALIVE),
+            0,
+            "SO_KEEPALIVE"
+        );
+        assert_eq!(
+            socket_option(&accepted, tcp, KEEPALIVE_IDLE_OPTION),
+            KEEPALIVE_IDLE.as_secs() as i32
+        );
+        assert_eq!(
+            socket_option(&accepted, tcp, libc::TCP_KEEPINTVL),
+            KEEPALIVE_INTERVAL.as_secs() as i32
+        );
+        assert_eq!(
+            socket_option(&accepted, tcp, libc::TCP_KEEPCNT),
+            KEEPALIVE_PROBES as i32
+        );
     }
 }
