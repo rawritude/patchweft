@@ -270,8 +270,8 @@ const LEND_PASSES: usize = 2;
 pub const LEND_IDLE_SECONDS: f64 = 120.0;
 
 /// The stop reason of an attempt `reclaim` stops: an interruption, after which its job is queued
-/// again within the requeue budget (`INTERRUPTIONS`). The job may be lent again; past the budget
-/// it ends interrupted with this reason (#4204 gate 2 P2-1).
+/// again within the requeue budget (`INTERRUPTIONS`). The job may be lent again: three requeues,
+/// and the next reclaim ends it interrupted with this reason (#4204 gate 2 P2-1, gate 3 P3-4).
 const RECLAIMED: &str = "reclaimed";
 
 /// Why an applied reserve on `executor` is not lent now, if it is not: an owner above priority 0
@@ -6457,8 +6457,9 @@ mod tests {
 
     #[test]
     fn a_reclaimed_job_whose_requeue_budget_is_spent_waits_for_an_operator() {
-        // A reclaim spends the requeue budget as any interruption does: past it, the job is not
-        // queued again but interrupted, and the train's prepare still gets the room.
+        // A reclaim spends the requeue budget as any interruption does: after three requeues, the
+        // next reclaim leaves the job interrupted, not queued, and the train's prepare still gets
+        // the room.
         let (_root, mut store, claims) = lent_on_mindy([LEND_SECONDS + 60.0, 60.0]);
         store
             .db

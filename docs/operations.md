@@ -117,9 +117,10 @@ executor, how long it ran and the work it was stopped for. A lane whose job is r
 attempt stop and end `interrupted` with reason `reclaimed`: nothing failed and no repair opens.
 The job is queued again within the same requeue budget as any interruption, and runs again like
 any other queued lane job: within the lanes' share, or lent the reserve again once lending is
-back on. A reclaimed job may be lent again, and stops after the requeue budget (three
-reclaims or other interruptions, then it ends `interrupted` with reason `reclaimed` and waits for
-an operator's `retry`). A train that arrives while the reserve is lent so waits
+back on. A reclaimed job may be lent again, within the requeue budget: three requeues, from
+reclaims or other interruptions, and the next reclaim ends it `interrupted` with reason
+`reclaimed`, waiting for an operator's `retry`. A job reclaimed every time is so reclaimed four
+times. A train that arrives while the reserve is lent so waits
 for lent work about 10 minutes at most, plus the stop and the job's cleanup; a remote executor
 learns of the stop at its next renewal, and one that cannot be reached holds the capacity until
 its lease lapses and its drain is reported or confirmed.
