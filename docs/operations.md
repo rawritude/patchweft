@@ -209,8 +209,10 @@ With a share on an executor:
   into the share whenever what lanes hold there (work lent the reserve aside) and the job fit the
   share, and the job fits the executor. The first lane job in queue order that fits is taken, so
   fair share among lanes stands, and never one whose claim would move the median a job without
-  history is ranked by. A lane job larger than the share never fits it, so it never keeps smaller
-  lane work out of the share while a train blocks.
+  history is ranked by. A lane job the share can hold is drained for: while it does not fit the
+  share's free part, the share takes no other lane job, so a census or prepare sized for it is
+  never starved by small jobs streaming in. A lane job larger than the share never becomes its
+  head, so it never keeps smaller lane work out of the share while a train blocks.
 - When the head is a lane job that does not fit and nothing prioritized blocks, the share takes
   nothing: the head drains the executor as it always has, so small lane jobs never stream past a
   large one through the share.

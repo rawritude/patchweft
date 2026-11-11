@@ -1896,9 +1896,10 @@ fn reclaim(
 /// back. The share gives lanes room the train cannot use; a lane head that merely does not fit
 /// drains the executor as it always has, so a large lane job is never starved by small ones
 /// streaming into the share (#4818 in-lane adversary P2-2). Then it is the first lane job, the
-/// head then the rest in order, that fits the share's free part (`Admission::in_share`), so fair
-/// share among lanes stands; a lane job larger than the share's room never fits it, so it keeps
-/// no smaller lane work out (#4818 review, B3). Like backfill, it never takes a job whose claim
+/// head then the rest in order, that the share can hold at all, so fair share among lanes stands:
+/// it is taken if it fits the share's free part (`Admission::in_share`), and otherwise the share
+/// drains for it, taking nothing else (#4818 gate P2-2). A lane job larger than the share never
+/// becomes the share's head, so it keeps no smaller lane work out (#4818 review, B3). Like backfill, it never takes a job whose claim
 /// would move the median a job without history ranks by (`Later::beside`): that could reorder the
 /// train.
 fn in_share(
@@ -1925,7 +1926,22 @@ fn in_share(
                 .filter(|later| later.beside)
                 .map(|later| &later.choice),
         )
-        .find(|choice| admission.in_share(choice, current))
+        // The share's own head: the first lane job it can hold at all. While it does not fit the
+        // share's free part, the share drains for it (#4818 gate P2-2).
+        .find(|choice| {
+            choice.priority <= 0
+                && admission.share.is_some_and(|share| {
+                    fits(
+                        Reservation {
+                            slots: 0,
+                            memory_mb: 0,
+                        },
+                        choice.reservation,
+                        share,
+                    )
+                })
+        })
+        .filter(|choice| admission.in_share(choice, current))
         .cloned()
 }
 
@@ -6030,14 +6046,23 @@ mod tests {
                                 .unwrap()
                                 .map(|body| serde_json::from_str(&body.unwrap()).unwrap())
                                 .collect();
-                            for action in queued {
-                                let wanted = action.reservation.unwrap();
-                                assert!(
-                                    !(fits(lanes, wanted, share) && fits(held, wanted, capacity)),
-                                    "{case}: {} fits the share",
-                                    action.id
-                                );
-                            }
+                            // A lane job that fits the share's free part waits only while the
+                            // share drains for one it can hold that does not.
+                            let holdable: Vec<Reservation> = queued
+                                .iter()
+                                .map(|action| action.reservation.unwrap())
+                                .filter(|wanted| fits(need((0, 0)), *wanted, share))
+                                .collect();
+                            let fitting = holdable
+                                .iter()
+                                .filter(|wanted| {
+                                    fits(lanes, **wanted, share) && fits(held, **wanted, capacity)
+                                })
+                                .count();
+                            assert!(
+                                fitting == 0 || fitting < holdable.len(),
+                                "{case}: {fitting} fit the share and none is drained for"
+                            );
                         }
                     }
                 }
@@ -6189,6 +6214,63 @@ mod tests {
         job_wants(&store, "known", "lane", "short", 2.0, (2, 2048));
         job_wants(&store, "new", "lane", "unknown", 3.0, (2, 2048));
         assert_eq!(claims_on(&mut store, "pw-robin"), ["new"]);
+    }
+
+    #[test]
+    fn the_share_drains_for_a_lane_job_it_can_hold() {
+        // #4818 gate P2-2: pw-robin keeps 8/12800 for lanes; the train runs vitest-core-3 there
+        // and its next job waits for what the share leaves. Two lane lints run in the share. A
+        // lane census (7/12800) or prepare (8 slots), which the share can hold, comes first in
+        // order: each round a lint ends and two more are queued, but the share drains for it and
+        // it starts once the lints already in the share end.
+        for (job, size) in [("census", (7, 12800)), ("prepare", (8, 4096))] {
+            let (_root, mut store) = robin_and_mauve();
+            set_share(&mut store, "pw-robin", need((8, 12800))).unwrap();
+            ng_wants(&store, "core-3", "train", "vitest-core-3", 0.1);
+            assert_eq!(claims_on(&mut store, "pw-robin"), ["core-3"]);
+            ng_wants(&store, "next", "train", "vitest-core-3", 0.2);
+            ng_wants(&store, "lint-0", "lane", "lint", 0.3);
+            ng_wants(&store, "lint-1", "lane", "lint", 0.4);
+            assert_eq!(claims_on(&mut store, "pw-robin"), ["lint-0", "lint-1"]);
+            queue(
+                &store.db,
+                Queue {
+                    id: job,
+                    owner: "lane",
+                    profile: "ng",
+                    job,
+                    created: 0.5,
+                    reservation: Some(size),
+                    ..Queue::default()
+                },
+            );
+            let mut started = None;
+            for round in 0..10 {
+                let oldest: Option<String> = store
+                    .db
+                    .query_row(
+                        "SELECT a.id FROM attempts a JOIN actions x ON x.attempt=a.id
+                         WHERE a.drained=0 AND json_extract(x.body,'$.job')='lint'
+                         ORDER BY a.rowid LIMIT 1",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .unwrap();
+                if let Some(oldest) = oldest {
+                    ends(&store, &oldest);
+                }
+                for index in 0..2 {
+                    let id = format!("lint-{round}-{index}");
+                    ng_wants(&store, &id, "lane", "lint", 1.0 + round as f64);
+                }
+                if claims_on(&mut store, "pw-robin").contains(&job.to_owned()) {
+                    started = Some(round);
+                    break;
+                }
+            }
+            assert_eq!(started, Some(1), "{job}");
+        }
     }
 
     #[test]
