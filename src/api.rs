@@ -1081,9 +1081,25 @@ fn query_inner(
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .map_err(ApiError::internal)?;
+            // Why the current attempt was stopped, or null: a lane reads `reclaimed` (lent capacity
+            // taken back for prioritized work) apart from a lost executor (lumenloop-ng#4204).
+            let stop: Option<String> = match &attempt {
+                Some(attempt) => store
+                    .db
+                    .query_row(
+                        "SELECT json_extract(body,'$.stop') FROM attempts WHERE id=?",
+                        [attempt],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(ApiError::internal)?
+                    .flatten(),
+                None => None,
+            };
             json!({"id":action,"revision":row.revision,"profile":row.profile,"job":row.job,
-                "dependencies":row.dependencies,"state":state,"attempt":attempt,"key":row.key,
-                "identity":row.identity,"reservation":row.reservation,"origin":row.origin})
+                "dependencies":row.dependencies,"state":state,"attempt":attempt,"stop":stop,
+                "key":row.key,"identity":row.identity,"reservation":row.reservation,
+                "origin":row.origin})
         }
         Query::Candidate { candidate } => {
             candidate_projects(store, principal, candidate, &mut BTreeSet::new())?;

@@ -126,7 +126,7 @@ POST `/v1/query` with a typed JSON query. Responses contain `api_version` and `r
 | `projects` | optional `after`, `limit` |
 | `profiles` | none; returns permitted IDs, names, resource requirements, timeouts, job dependencies and job identities (`recipe`) |
 | `revisions`, `actions`, `repairs` | `project`, optional `after`, `limit` |
-| `action` / `candidate` / `repair` | corresponding ID field; an action includes its key, job identity, reservation and origin |
+| `action` / `candidate` / `repair` | corresponding ID field; an action includes its key, job identity, reservation and origin, and `stop`: why its current attempt was stopped (`reclaimed`, `timeout`, `no-requesters`, …), or null |
 | `frontier` | `project`; returns the validated candidate and its certificate |
 | `logs` | `attempt`, optional byte `offset`, byte `limit` |
 | `artifacts` | `action`; returns the passing attempt's file manifest |
