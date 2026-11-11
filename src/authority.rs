@@ -335,6 +335,9 @@ const PRIORITIZED: &str =
 /// Whether an attempt row was lent the reserve (`Attempt::lent`); rows from before never were.
 const LENT: &str = "COALESCE(json_extract(body,'$.lent'),0)";
 
+/// Whether an attempt row was backfilled across priorities (`Attempt::backfilled`).
+const BACKFILLED: &str = "COALESCE(json_extract(body,'$.backfilled'),0)";
+
 /// Whether an attempt row is not prioritized: every row is, before owners had priorities.
 fn unprioritized(db: &Connection) -> Result<String> {
     Ok(if table_exists(db, "owner_priorities")? {
@@ -1374,18 +1377,26 @@ pub fn claim_for(
         &later,
         &current,
     );
+    // Work backfilled beside a prioritized head from a lower priority is reclaimable once it runs
+    // past its history's bound (#4818 gate P2-1).
+    let mut backfilled = false;
     let admitted = match choice {
         Some(choice) if admits(&choice, &current) => Some(choice),
-        Some(head) => beside(
-            &transaction,
-            executor,
-            &admission,
-            &head,
-            alone,
-            later,
-            &current,
-        )?
-        .or(shared),
+        Some(head) => {
+            let beside = beside(
+                &transaction,
+                executor,
+                &admission,
+                &head,
+                alone,
+                later,
+                &current,
+            )?;
+            backfilled = beside
+                .as_ref()
+                .is_some_and(|beside| beside.priority < head.priority);
+            beside.or(shared)
+        }
         None => shared,
     };
     let Some(choice) = admitted else {
@@ -1424,6 +1435,7 @@ pub fn claim_for(
         heal_until: None,
         refused: None,
         lent,
+        backfilled,
     };
     transaction.execute(
         "INSERT INTO attempts VALUES (?,?,'claimed',0,?)",
@@ -1774,16 +1786,17 @@ fn runnable_since(db: &Connection, action: &Action, owner: &str) -> Result<f64> 
 const MAX_BACKFILL_HELD: usize = 12;
 
 /// Takes back lent capacity for `head`, prioritized work this executor would run that `admits`
-/// does not admit beside `load` (#4204 gate P2-3). Among the lent attempts here that started more
-/// than `LEND_SECONDS` ago and still run, the fewest whose end would admit the head, the oldest
+/// does not admit beside `load` (#4204 gate P2-3). Among the lent attempts here, and the lane
+/// attempts backfilled beside a prioritized head on their history (`Attempt::backfilled`; #4818
+/// gate P2-1), that started more than `LEND_SECONDS` ago and still run, the fewest whose end would admit the head, the oldest
 /// first among as few, are stopped through the one stop path (`stopping`) with reason
 /// `RECLAIMED`: their executor is told at its next renewal, ends them and reports, and their jobs
 /// are queued again within the requeue budget (`unsettled`). Lent attempts already stopping, for
 /// a reclaim or any other reason, count as ended, so a later claim, or one after a restart, never
 /// stops more for the same room; one cleaning up after its action settled is neither stopped nor
 /// counted as ended. Nothing is stopped while the end of every such attempt would still not admit
-/// the head: the next claim after other work ends decides again. Never an attempt that was not
-/// lent.
+/// the head: the next claim after other work ends decides again. Never an attempt that was neither
+/// lent nor backfilled so.
 fn reclaim(
     db: &Connection,
     executor: &str,
@@ -1793,8 +1806,8 @@ fn reclaim(
 ) -> Result<()> {
     let mut stmt = db.prepare(&format!(
         "SELECT id, action, COALESCE(json_extract(body,'$.slots'),0),
-         COALESCE(json_extract(body,'$.memory_mb'),0), json_extract(body,'$.started')
-         FROM attempts WHERE drained=0 AND {EXECUTOR}=? AND ({}) AND {LENT}
+         COALESCE(json_extract(body,'$.memory_mb'),0), json_extract(body,'$.started'), {LENT}
+         FROM attempts WHERE drained=0 AND {EXECUTOR}=? AND ({}) AND ({LENT} OR {BACKFILLED})
          ORDER BY COALESCE(json_extract(body,'$.started'),json_extract(body,'$.created')), rowid",
         unprioritized(db)?
     ))?;
@@ -1810,8 +1823,8 @@ fn reclaim(
                         slots: r.get(2)?,
                         memory_mb: r.get(3)?,
                     },
-                    unprioritized: false,
-                    lent: true,
+                    unprioritized: !r.get::<_, bool>(5)?,
+                    lent: r.get(5)?,
                 },
                 r.get(4)?,
             ))
@@ -2136,15 +2149,39 @@ fn backfill(
                     admission.room(priority, wanted, load)
                 }
             };
+            // The distinct sizes of the higher-priority choices ranked from each position up to
+            // this one: those behind where the in-order prefix stops are demands of their own, as
+            // the train's own backfill could start one of them out of rank order (#4818 gate P2-1).
+            let mut behind: Vec<BTreeSet<(i64, u32, u32)>> = vec![BTreeSet::new(); *position + 1];
+            if lower {
+                for index in (0..*position).rev() {
+                    let mut sizes = behind[index + 1].clone();
+                    let ranked = ranked[index];
+                    if ranked.priority > choice.priority && ranked.action.id != choice.action.id {
+                        let need = ranked.reservation;
+                        sizes.insert((ranked.priority, need.slots, need.memory_mb));
+                    }
+                    behind[index] = sizes;
+                }
+            }
             let delays = releases.iter().zip(&without).any(|(load, loads)| {
                 let reached = (loads.len() - 1).min(*position);
                 let with = prefix(load.with(choice, lent), *position, Some(&choice.action.id));
+                let waiting = behind[reached].iter().map(|(priority, slots, memory_mb)| {
+                    (
+                        *priority,
+                        Reservation {
+                            slots: *slots,
+                            memory_mb: *memory_mb,
+                        },
+                    )
+                });
                 reached > 0 && with.len() - 1 < reached
-                    || demands.iter().any(|demand| {
+                    || demands.iter().copied().chain(waiting).any(|demand| {
                         (0..=reached.min(with.len() - 1))
                             .rev()
-                            .find(|count| roomy(*demand, &loads[*count]))
-                            .is_some_and(|count| !roomy(*demand, &with[count]))
+                            .find(|count| roomy(demand, &loads[*count]))
+                            .is_some_and(|count| !roomy(demand, &with[count]))
                     })
             });
             !delays
@@ -6071,9 +6108,9 @@ mod tests {
     fn backfill_judges_a_trains_jobs_by_what_the_share_leaves_them() {
         // pw-robin (16/24576) keeps 4/4096 for lanes, so trains have 12 slots. The train runs
         // 4/2048 and a lane attempt holds 2/14336, which the train's head (6/10241) waits for.
-        // Its next job (4/9216) never starts beside the head while the train's attempt runs: 14
-        // slots would pass the 12 the share leaves. So a 1/4096 lane job, which leaves room for
-        // the head whichever ends first, goes beside it.
+        // Its next job (4/11264) never starts beside the head while the train's attempt runs: 14
+        // slots would pass the 12 the share leaves. So a 1/2048 lane job, which leaves room for
+        // the head, and for both once both attempts end, goes beside it.
         let (_root, mut store) = robin_and_mauve();
         history(&store.db, "f-1", "test", &[60.0, 60.0]);
         set_share(&mut store, "pw-robin", need((4, 4096))).unwrap();
@@ -6081,8 +6118,8 @@ mod tests {
         assert_eq!(claims_on(&mut store, "pw-robin"), ["t-run"]);
         hold(&store.db, "lanes", Some("pw-robin"), 2, 14336);
         wants(&store, "head", "train", 1.0, (6, 10241));
-        wants(&store, "next", "train", 2.0, (4, 9216));
-        wants(&store, "install", "lane", 3.0, (1, 4096));
+        wants(&store, "next", "train", 2.0, (4, 11264));
+        wants(&store, "install", "lane", 3.0, (1, 2048));
         assert_eq!(claims_on(&mut store, "pw-robin"), ["install"]);
     }
 
@@ -6871,6 +6908,62 @@ mod tests {
         wants(&store, "head", "train", 1.0, (6, 16384));
         wants(&store, "install", "lane", 3.0, (2, 4096));
         assert_eq!(mindy_claims(&mut store, "k1"), None);
+    }
+
+    #[test]
+    fn a_lane_job_never_takes_the_room_of_a_train_job_its_own_backfill_would_start() {
+        // #4818 gate P2-1: mindy (20/24576) runs 5/9216, 5/9216 and 2/2048. The train's head
+        // (1/9216) waits on memory, and its t2 (10/512) on slots. Once the 2/2048 attempt ends
+        // t2 starts beside the head, out of rank order, as the train's own backfill; a 1/1024
+        // lane job held there would leave it a slot short. So the lane job waits, and t2 starts.
+        let (_root, mut store) = mindy_running(&[(5, 9216), (5, 9216), (2, 2048)]);
+        history(&store.db, "f-1", "test", &[60.0, 60.0]);
+        crate::worker::set_priority(&store, "train", 1).unwrap();
+        wants(&store, "head", "train", 1.0, (1, 9216));
+        wants(&store, "t2", "train", 2.0, (10, 512));
+        wants(&store, "lane", "lane", 3.0, (1, 1024));
+        assert_eq!(mindy_claims(&mut store, "k1"), None);
+        ends(&store, "run-2");
+        assert_eq!(mindy_claims(&mut store, "k2").as_deref(), Some("t2"));
+    }
+
+    #[test]
+    fn a_lane_job_backfilled_beside_a_trains_head_is_reclaimed_past_the_bound() {
+        // #4818 gate P2-1: a lane job goes beside a train's head on a history that shows it short.
+        // If that history lies and it runs past LEND_SECONDS while prioritized work it holds room
+        // from is blocked here, it is reclaimed as lent work is, not left to its timeout.
+        for (ran, reclaimed) in [(LEND_SECONDS + 60.0, 1), (60.0, 0)] {
+            let (_root, mut store) = a_lane_install_behind_a_trains_head(Queue {
+                id: "next",
+                owner: "train",
+                created: 2.0,
+                reservation: Some((6, 9216)),
+                ..Queue::default()
+            });
+            priority_set_ago(&store, "train", 3600.0);
+            assert_eq!(mindy_claims(&mut store, "k1").as_deref(), Some("install"));
+            let install = attempt_of(&store.db, "install");
+            let attempt = store.attempt(&install).unwrap();
+            assert!(attempt.backfilled && !attempt.lent);
+            store
+                .db
+                .execute(
+                    "UPDATE attempts SET body=json_set(body,'$.started',?) WHERE id=?",
+                    params![now() - ran, install],
+                )
+                .unwrap();
+            // A higher train's 2/4096 job arrives: it fits only once the install ends.
+            crate::worker::set_priority(&store, "train-2", 2).unwrap();
+            priority_set_ago(&store, "train-2", 3600.0);
+            wants(&store, "urgent", "train-2", 0.5, (2, 4096));
+            assert_eq!(mindy_claims(&mut store, "k2"), None);
+            let case = format!("{ran}");
+            assert_eq!(
+                events(&store.db, "attempt.reclaimed").len(),
+                reclaimed,
+                "{case}"
+            );
+        }
     }
 
     #[test]

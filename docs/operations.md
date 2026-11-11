@@ -50,12 +50,16 @@ A job queued behind a blocked head still starts beside it (backfill) when all of
   the head. This is how a train's small jobs start beside its own blocked shard.
 - Of a lower priority: its history holds at least two passes, every one under 10 minutes, as for
   lending, so that work no proof can see (the next train, a requeue, a restarted train) waits for
-  it about 10 minutes at most; no job of a higher priority than its own that fits now is ranked
+  it about 10 minutes; if its history was wrong and it runs past 10 minutes while prioritized work
+  that does not fit is waiting on the executor, it is reclaimed as lent work is (below), so the
+  wait stays about that bound and not the job's timeout; no job of a higher priority than its own that fits now is ranked
   ahead of it (a train's job that fits never waits for a lane's); and it is among the first 8
   such jobs the claim tries, which keeps a claim's cost flat however many lane jobs wait.
 - It delays nothing ranked before it: whichever of the executor's running jobs end first, the
   head and then each job ranked ahead of it, in rank order, start just as soon as they would
-  without it. A lower-priority job must also leave, in each of those cases, the room a train's
+  without it. A lower-priority job must also leave each higher-priority job ranked ahead of it
+  that is not reached in rank order the room it would find without it, as the train's own
+  backfill could start it out of order. And it must leave, in each of those cases, the room a train's
   queued work that is not ready yet would find without it: the hold for jobs waiting on a running
   dependency (that dependency's own room counted as freed while it runs here), and the prioritized
   jobs waiting on a dependency that has not started, each alone and all of them together with the
@@ -119,11 +123,12 @@ never against what the reserve leaves, and its attempt says `"lent": true`. From
 prioritized request nothing more is lent; lane work keeps what the reserve leaves while lent work
 drains, and short work larger than that is again left to other executors.
 
-Lent capacity is borrowed. Once a lent job has run 10 minutes while prioritized work on its
+Lent capacity is borrowed, and so is room a lane job takes beside a train's head through backfill
+(its attempt says `"backfilled": true`). Once such a job has run 10 minutes while prioritized work on its
 executor does not fit, and that work has been runnable as prioritized work for 10 seconds (since
 the latest of its creation, its dependencies' passes and its owner's last priority change; a few
 polls, so an executor with room takes it first and no lane job is stopped for work another
-executor starts at once), the store stops the fewest lent jobs past that bound whose end makes room for it, the
+executor starts at once), the store stops the fewest such jobs past that bound whose end makes room for it, the
 oldest first among as few, and records `attempt.reclaimed` with the action, the
 executor, how long it ran and the work it was stopped for. A lane whose job is reclaimed sees its
 attempt stop and end `interrupted` with reason `reclaimed`: nothing failed and no repair opens.

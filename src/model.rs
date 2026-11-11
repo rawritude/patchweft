@@ -303,6 +303,11 @@ pub struct Attempt {
     /// counts against the reserve, not against what the reserve leaves. Absent when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub lent: bool,
+    /// Admitted beside a prioritized head by backfill across priorities: on a history that shows it
+    /// short, so it may be reclaimed as lent work is once it runs past that bound. It counts
+    /// against the lanes' share like any lane work. Absent when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub backfilled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
