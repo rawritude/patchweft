@@ -813,35 +813,63 @@ const KEEPALIVE_IDLE_NAME: &str = "TCP_KEEPALIVE";
 const KEEPALIVE_IDLE_OPTION: libc::c_int = libc::TCP_KEEPIDLE;
 #[cfg(not(target_vendor = "apple"))]
 const KEEPALIVE_IDLE_NAME: &str = "TCP_KEEPIDLE";
+// Probes go only over an idle connection. One with data its peer never acknowledges, such as an
+// SSE stream to a peer lost behind a NAT, is retransmitted for about 15 minutes before the kernel
+// gives up (#4204 gate P3-6). Linux closes it once data has gone unacknowledged as long as the
+// probes take to find a dead idle peer, and the same bound then ends the probes.
+#[cfg(target_os = "linux")]
+const USER_TIMEOUT: Duration = Duration::from_secs(
+    KEEPALIVE_IDLE.as_secs() + KEEPALIVE_INTERVAL.as_secs() * KEEPALIVE_PROBES as u64,
+);
+
+/// A socket option `bind` sets on the listener: level, option, its name and value.
+type SocketOption = (libc::c_int, libc::c_int, &'static str, libc::c_int);
+
+/// What `bind` sets on the listener, in order. Accepted sockets inherit these from the listener,
+/// so every connection is probed without touching the accept path (the test checks this on a real
+/// accepted socket).
+fn listener_options() -> Vec<SocketOption> {
+    let tcp = libc::IPPROTO_TCP;
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    let mut options = vec![
+        (libc::SOL_SOCKET, libc::SO_KEEPALIVE, "SO_KEEPALIVE", 1),
+        (
+            tcp,
+            KEEPALIVE_IDLE_OPTION,
+            KEEPALIVE_IDLE_NAME,
+            KEEPALIVE_IDLE.as_secs() as libc::c_int,
+        ),
+        (
+            tcp,
+            libc::TCP_KEEPINTVL,
+            "TCP_KEEPINTVL",
+            KEEPALIVE_INTERVAL.as_secs() as libc::c_int,
+        ),
+        (
+            tcp,
+            libc::TCP_KEEPCNT,
+            "TCP_KEEPCNT",
+            KEEPALIVE_PROBES as libc::c_int,
+        ),
+    ];
+    #[cfg(target_os = "linux")]
+    options.push((
+        tcp,
+        libc::TCP_USER_TIMEOUT,
+        "TCP_USER_TIMEOUT",
+        USER_TIMEOUT.as_millis() as libc::c_int,
+    ));
+    options
+}
 
 /// The listener `serve` accepts on, configured before any connection arrives.
 fn bind(listen: SocketAddr) -> std::io::Result<std::net::TcpListener> {
     let listener = std::net::TcpListener::bind(listen)?;
     // Tokio requires nonblocking sockets; otherwise a later accept can stall shutdown.
     listener.set_nonblocking(true)?;
-    // Accepted sockets inherit these from the listener, so every connection is probed without
-    // touching the accept path (the test checks this on a real accepted socket).
-    let tcp = libc::IPPROTO_TCP;
-    set_socket_option(
-        &listener,
-        (libc::SOL_SOCKET, libc::SO_KEEPALIVE, "SO_KEEPALIVE"),
-        1,
-    )?;
-    set_socket_option(
-        &listener,
-        (tcp, KEEPALIVE_IDLE_OPTION, KEEPALIVE_IDLE_NAME),
-        KEEPALIVE_IDLE.as_secs() as libc::c_int,
-    )?;
-    set_socket_option(
-        &listener,
-        (tcp, libc::TCP_KEEPINTVL, "TCP_KEEPINTVL"),
-        KEEPALIVE_INTERVAL.as_secs() as libc::c_int,
-    )?;
-    set_socket_option(
-        &listener,
-        (tcp, libc::TCP_KEEPCNT, "TCP_KEEPCNT"),
-        KEEPALIVE_PROBES as libc::c_int,
-    )?;
+    for (level, name, label, value) in listener_options() {
+        set_socket_option(&listener, (level, name, label), value)?;
+    }
     Ok(listener)
 }
 
@@ -1436,11 +1464,35 @@ mod tests {
             socket_option(&accepted, tcp, libc::TCP_KEEPCNT),
             KEEPALIVE_PROBES as i32
         );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            socket_option(&accepted, tcp, libc::TCP_USER_TIMEOUT),
+            120_000,
+            "TCP_USER_TIMEOUT"
+        );
     }
 
     #[test]
     fn a_socket_option_that_cannot_be_set_is_named_in_the_error() {
         // `serve` fails with this error, so the operator learns which option the host refused.
+        // Each option `bind` sets carries its own name.
+        let names: Vec<&str> = listener_options()
+            .into_iter()
+            .map(|(_, _, name, _)| name)
+            .collect();
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            names,
+            [
+                "SO_KEEPALIVE",
+                "TCP_KEEPIDLE",
+                "TCP_KEEPINTVL",
+                "TCP_KEEPCNT",
+                "TCP_USER_TIMEOUT"
+            ]
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(names.len(), 4);
         let listener = bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let error = set_socket_option(&listener, (libc::IPPROTO_TCP, -1, "TCP_BOGUS"), 1)
             .unwrap_err()

@@ -374,6 +374,8 @@ pub struct Choice {
     /// applied and lent (`reserve_lent`), the job's remembered passes all ended within
     /// `LEND_SECONDS` (`Durations::lendable`), and no attempt of it was reclaimed (`reclaimed`).
     /// It takes the reserve only when what the reserve leaves has no room for it (`Load::lends`).
+    /// A choice of an owner above 0 never is: that owner's queued work keeps the reserve from
+    /// being lent at all.
     pub lent: bool,
 }
 
@@ -589,7 +591,7 @@ pub fn select(
                 action: action.clone(),
                 reservation,
                 timeout_seconds,
-                lent: lent && priority <= 0,
+                lent,
             };
             choices.push((priority, served, rank, trusted, choice));
         }
@@ -1338,11 +1340,9 @@ pub fn claim_for(
         save(&transaction, &record)?;
     }
     // Lent capacity is borrowed (#4204 gate P2-3): prioritized work this executor would run that
-    // does not fit takes it back from lent work that ran past its bound.
-    if let Some(head) = choice
-        .as_ref()
-        .filter(|head| head.priority > 0 && !admits(head, &current))
-    {
+    // does not fit takes it back from lent work that ran past its bound. `reclaim` stops nothing
+    // while the head fits.
+    if let Some(head) = choice.as_ref().filter(|head| head.priority > 0) {
         reclaim(&transaction, executor, head, &current, admits)?;
     }
     let admitted = match choice {
@@ -5464,6 +5464,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_trains_stopping_work_ends_lending_too() {
+        // Gate P3-1: a train's job its supervisor stopped on a timeout is stopping, and the train
+        // still wants it, so the reserve is not lent until it settles. Its attempt runs on mindy,
+        // so only that keeps local from lending.
+        let (_root, mut store) = reserve_lab((2, 2048));
+        register(&store.db, "mindy", 4, 4096);
+        estimates(&store.db);
+        wants(&store, "prepare", "train", 0.5, (1, 1024));
+        assert_eq!(mindy_claims(&mut store, "k1").as_deref(), Some("prepare"));
+        let prepare = attempt_of(&store.db, "prepare");
+        stopping(&store.db, "prepare", &prepare, Some("timeout")).unwrap();
+        assert_eq!(state(&store.db, "prepare"), "stopping");
+        job_wants(&store, "l-0", "lane", "long", 1.0, (1, 1024));
+        job_wants(&store, "l-1", "lane", "long", 2.0, (1, 1024));
+        job_wants(&store, "s-0", "lane", "short", 3.0, (1, 1024));
+        assert_eq!(local_lent_claims(&mut store), ["l-0", "l-1"]);
+        store
+            .db
+            .execute("UPDATE actions SET state='failed' WHERE id='prepare'", [])
+            .unwrap();
+        assert_eq!(local_lent_claims(&mut store), ["s-0 lent"]);
+    }
+
     /// Dates attempt `id` as claimed `claimed` seconds ago and, with `ended`, ended that long ago.
     fn claimed_ago(store: &Store, id: &str, claimed: f64, ended: Option<f64>) {
         store
@@ -5605,14 +5629,14 @@ mod tests {
 
     #[test]
     fn a_lent_attempt_past_the_bound_is_reclaimed_for_prioritized_work_that_does_not_fit() {
-        // Gate P2-3 (#4204): lent capacity is borrowed. s-0 has run eleven minutes, s-1 one, and
-        // l-0 an hour without being lent.
-        let (root, mut store, claims) = lent_on_mindy([LEND_SECONDS + 60.0, 60.0]);
+        // Gate P2-3 (#4204): lent capacity is borrowed. s-0 has run eleven minutes, s-1 half a
+        // minute less, and l-0 an hour without being lent.
+        let (root, mut store, claims) = lent_on_mindy([LEND_SECONDS + 60.0, LEND_SECONDS + 30.0]);
         // Without prioritized work nothing is reclaimed, however long it ran.
         assert_eq!(mindy_claims(&mut store, "k1"), None);
         assert!(events(&store.db, "attempt.reclaimed").is_empty());
-        // The train's prepare does not fit: s-0, the one lent attempt past the bound, is stopped
-        // for it, and its executor is told at its next renewal.
+        // The train's prepare does not fit: s-0, the older of the lent attempts past the bound, is
+        // stopped for it, and its executor is told at its next renewal.
         wants(&store, "prepare", "train", 9.0, (1, 1024));
         assert_eq!(mindy_claims(&mut store, "k2"), None);
         let reclaimed = events(&store.db, "attempt.reclaimed");
@@ -5637,12 +5661,14 @@ mod tests {
             vec![lease(&claims["s-0"])],
         );
         assert_eq!(status[0].stop.as_deref(), Some(RECLAIMED));
-        // A later claim, or one after a restart, reclaims nothing more for the same room.
+        // A later claim, or one after a restart, reclaims nothing more for the same room: s-1
+        // runs on.
         assert_eq!(mindy_claims(&mut store, "k3"), None);
         drop(store);
         let mut store = Store::open(root.path()).unwrap();
         assert_eq!(mindy_claims(&mut store, "k4"), None);
         assert_eq!(events(&store.db, "attempt.reclaimed").len(), 1);
+        assert_eq!(state(&store.db, "s-1"), "running");
         // The executor ends it and reports: its job is queued again, and once the attempt drains
         // the train's prepare is claimed in its room.
         let report = reclaimed_report(&claims["s-0"]);
@@ -5679,6 +5705,12 @@ mod tests {
         // Within the bound: s-0 and s-1 ran a minute, l-0 an hour without being lent.
         let (_root, mut store, _) = lent_on_mindy([60.0, 60.0]);
         wants(&store, "prepare", "train", 9.0, (1, 1024));
+        assert_eq!(mindy_claims(&mut store, "k1"), None);
+        assert!(events(&store.db, "attempt.reclaimed").is_empty());
+        // Nor for a lane's job: s-2 is short and waits for room in the reserve, which lent work
+        // past the bound holds.
+        let (_root, mut store, _) = lent_on_mindy([ran, ran]);
+        job_wants(&store, "s-2", "lane", "short", 9.0, (1, 1024));
         assert_eq!(mindy_claims(&mut store, "k1"), None);
         assert!(events(&store.db, "attempt.reclaimed").is_empty());
         // The prepare fits once l-1 ends: nothing is reclaimed for it.
