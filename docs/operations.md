@@ -435,7 +435,7 @@ Cutover, as one window:
    --memory-mb 18432 local`. Confirm that
    `patchweft executors` shows it with `"applied": true`: a reserve that meets the effective
    capacity, for example under a lower cgroup limit, is not applied.
-9. Merge the cutover's lab PR: `pw-ng.py` reads an attempt that ended `interrupted` with reason
+9. Merge the cutover's lab PR (lumenloop/ng-ci-lab#90): `pw-ng.py` reads an attempt that ended `interrupted` with reason
    `reclaimed` as HELD for a lane check, never FAIL (the lane did not cause it, and its job runs
    again), and LANES.md gains the lines on why a job waits (`waiting` on `executors`) and on
    reclaimed jobs.
