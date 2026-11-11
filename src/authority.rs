@@ -95,7 +95,10 @@ pub fn prepare(db: &Connection) -> Result<()> {
          CREATE TABLE IF NOT EXISTS manifest_sizes (attempt TEXT PRIMARY KEY, bytes INTEGER NOT NULL);
          CREATE TABLE IF NOT EXISTS requeues (action TEXT PRIMARY KEY, count INTEGER NOT NULL);
          CREATE INDEX IF NOT EXISTS attempts_held ON attempts(drained, state);
-         CREATE INDEX IF NOT EXISTS attempts_claim_key ON attempts(json_extract(body,'$.claim_key'));",
+         CREATE INDEX IF NOT EXISTS attempts_claim_key ON attempts(json_extract(body,'$.claim_key'));
+         CREATE INDEX IF NOT EXISTS attempts_action ON attempts(action);
+         CREATE INDEX IF NOT EXISTS attempts_created ON attempts(json_extract(body,'$.created'));
+         CREATE INDEX IF NOT EXISTS attempts_ended ON attempts(json_extract(body,'$.ended'));",
     )?;
     db.execute(
         "INSERT OR IGNORE INTO executors VALUES (?,?)",
@@ -250,27 +253,60 @@ fn held_where(db: &Connection, executor: &str, condition: &str) -> Result<Reserv
 }
 
 /// A job the reserve is lent to has ended within this many seconds every time it is remembered to
-/// have passed (`Durations::longest`): a train that arrives while capacity is lent waits about that
-/// long for it, unless the lent job hangs; then it waits for the job's timeout, as nothing
-/// preempts it (chief, #4204, 2026-11-11).
+/// have passed (`Durations::lendable`), and once a lent attempt has run longer while prioritized
+/// work here does not fit, it is stopped and its job queued again (`reclaim`): a train that
+/// arrives while capacity is lent waits about that long for it (chief, #4204, 2026-11-11).
 pub const LEND_SECONDS: f64 = 600.0;
 
-/// Whether an applied reserve is lent: no owner above priority 0 wants any action that is queued,
-/// running or stopping, on any executor (no train rides). A reserve kept while nobody it is for has
-/// work only idles its executor. While it is lent, work without priority whose every remembered
-/// pass ended within `LEND_SECONDS` may take it once what the reserve leaves is full; from the
-/// first prioritized request nothing more is lent, and what was lent runs until it ends.
-fn reserve_lent(db: &Connection) -> Result<bool> {
+/// Remembered passes a job needs before it may be lent: one quick pass says little.
+const LEND_PASSES: usize = 2;
+
+/// How long after its last prioritized attempt was claimed or ended an executor lends its reserve:
+/// trains run back to back, and the next one's first job should not find the reserve freshly
+/// lent (#4204 gate P3-4).
+pub const LEND_IDLE_SECONDS: f64 = 120.0;
+
+/// The stop reason of an attempt `reclaim` stops: an interruption, after which its job is queued
+/// again (`INTERRUPTIONS`), and which keeps that job from being lent again (`reclaimed`).
+const RECLAIMED: &str = "reclaimed";
+
+/// Whether an applied reserve on `executor` is lent: no owner above priority 0 wants any action
+/// that is queued, running or stopping, on any executor (no train rides), and no attempt claimed
+/// for such an owner here was claimed or ended within `LEND_IDLE_SECONDS`. A reserve kept while
+/// nobody it is for has work only idles its executor. While it is lent, work without priority
+/// whose remembered passes all ended within `LEND_SECONDS` may take it once what the reserve
+/// leaves is full; from the first prioritized request nothing more is lent, and what was lent
+/// runs until it ends or `reclaim` stops it.
+fn reserve_lent(db: &Connection, executor: &str) -> Result<bool> {
     if !table_exists(db, "owner_priorities")? {
         return Ok(true);
     }
     Ok(!db.query_row(
-        "SELECT EXISTS (SELECT 1 FROM interests i
-         JOIN owner_priorities p ON p.owner=i.owner AND p.priority>0
-         JOIN actions a ON a.id=i.action
-         WHERE i.active=1 AND a.state IN ('queued','running','stopping'))",
-        [],
+        &format!(
+            "SELECT EXISTS (SELECT 1 FROM interests i
+             JOIN owner_priorities p ON p.owner=i.owner AND p.priority>0
+             JOIN actions a ON a.id=i.action
+             WHERE i.active=1 AND a.state IN ('queued','running','stopping'))
+             OR EXISTS (SELECT 1 FROM attempts WHERE json_extract(body,'$.created')>=?2
+                        AND {EXECUTOR}=?1 AND {CLAIMED_PRIORITIZED})
+             OR EXISTS (SELECT 1 FROM attempts WHERE json_extract(body,'$.ended')>=?2
+                        AND {EXECUTOR}=?1 AND {CLAIMED_PRIORITIZED})"
+        ),
+        params![executor, now() - LEND_IDLE_SECONDS],
         |r| r.get::<_, bool>(0),
+    )?)
+}
+
+/// Whether an attempt row was claimed for an owner now above priority 0.
+const CLAIMED_PRIORITIZED: &str = "json_extract(body,'$.owner') IN
+     (SELECT owner FROM owner_priorities WHERE priority>0)";
+
+/// Whether `action` had an attempt `reclaim` stopped: its job is not lent the reserve again.
+fn reclaimed(db: &Connection, action: &str) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT EXISTS (SELECT 1 FROM attempts WHERE action=? AND json_extract(body,'$.stop')=?)",
+        params![action, RECLAIMED],
+        |r| r.get(0),
     )?)
 }
 
@@ -335,9 +371,9 @@ pub struct Choice {
     pub reservation: Reservation,
     pub timeout_seconds: u64,
     /// Work of priority 0 or below that may be lent the reserve now: the executor's reserve is
-    /// applied and lent (`reserve_lent`), and every remembered pass of the job ended within
-    /// `LEND_SECONDS` (`Durations::longest`). A job with none never is. It takes the reserve only
-    /// when what the reserve leaves has no room for it (`Load::lends`).
+    /// applied and lent (`reserve_lent`), the job's remembered passes all ended within
+    /// `LEND_SECONDS` (`Durations::lendable`), and no attempt of it was reclaimed (`reclaimed`).
+    /// It takes the reserve only when what the reserve leaves has no room for it (`Load::lends`).
     pub lent: bool,
 }
 
@@ -412,7 +448,7 @@ pub fn select(
         .collect();
     let priorities = owner_priorities(db)?;
     let reserve = applied(reserve(db, &record.id)?, capacity);
-    let lending = reserve.is_some() && reserve_lent(db)?;
+    let lending = reserve.is_some() && reserve_lent(db, &record.id)?;
     let mut profiles = BTreeMap::new();
     let mut unverified = Vec::new();
     let mut choices = Vec::new();
@@ -444,10 +480,7 @@ pub fn select(
         // Work of an owner at priority 0 or below that what the reserve leaves can never fit must
         // not idle the executor behind it either, unless it may be lent the reserve and fits that;
         // an owner above 0 may still run the same action in the reserve.
-        let lent = lending
-            && durations
-                .longest(&action)
-                .is_some_and(|seconds| seconds < LEND_SECONDS);
+        let lent = lending && durations.lendable(&action) && !reclaimed(db, &action.id)?;
         let beyond = |room: Reservation| {
             reservation.slots > room.slots || reservation.memory_mb > room.memory_mb
         };
@@ -930,6 +963,8 @@ struct Estimate {
     median: f64,
     /// The longest of them: what lending the reserve is bounded by.
     longest: f64,
+    /// How many there are.
+    passes: usize,
 }
 
 impl Durations {
@@ -965,8 +1000,13 @@ impl Durations {
                 .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
                 .collect();
             let longest = samples.iter().copied().reduce(f64::max);
+            let passes = samples.len();
             if let (Some(median), Some(longest)) = (median(samples), longest) {
-                let estimate = Estimate { median, longest };
+                let estimate = Estimate {
+                    median,
+                    longest,
+                    passes,
+                };
                 durations.by_key.insert((profile, job.clone()), estimate);
                 durations
                     .by_lineage
@@ -980,11 +1020,15 @@ impl Durations {
         self.estimate(action).map(|estimate| estimate.median)
     }
 
-    /// The longest remembered pass of the samples `expected` takes its median of: a job is lent
-    /// the reserve only if every one ended within `LEND_SECONDS`, so a job with some quick and
-    /// some long passes is not (#4204 in-lane adversary P2).
-    fn longest(&self, action: &Action) -> Option<f64> {
-        self.estimate(action).map(|estimate| estimate.longest)
+    /// Whether the job may be lent the reserve: the row `expected` takes its median of holds at
+    /// least `LEND_PASSES` remembered passes, and the longest ended within `LEND_SECONDS`, so a
+    /// job with some quick and some long passes is not (#4204 in-lane adversary P2, gate P3-7).
+    /// Rows are per profile and job, not per executor, and a profile without its own takes its
+    /// lineage's.
+    fn lendable(&self, action: &Action) -> bool {
+        self.estimate(action).is_some_and(|estimate| {
+            estimate.passes >= LEND_PASSES && estimate.longest < LEND_SECONDS
+        })
     }
 
     /// The row of the action's own profile and job, else the newest of its lineage's.
@@ -1293,6 +1337,14 @@ pub fn claim_for(
         record.holding = now_holding;
         save(&transaction, &record)?;
     }
+    // Lent capacity is borrowed (#4204 gate P2-3): prioritized work this executor would run that
+    // does not fit takes it back from lent work that ran past its bound.
+    if let Some(head) = choice
+        .as_ref()
+        .filter(|head| head.priority > 0 && !admits(head, &current))
+    {
+        reclaim(&transaction, executor, head, &current, admits)?;
+    }
     let admitted = match choice {
         Some(choice) if admits(&choice, &current) => Some(choice),
         // Drain for the head: later small actions cannot starve its reservation, so only one
@@ -1428,8 +1480,119 @@ impl Load {
 }
 
 /// Held attempts beyond which a blocked head admits nothing beside it: `backfill` checks every
-/// set of them that could end first.
+/// set of them that could end first. `reclaim` considers as many lent attempts at most.
 const MAX_BACKFILL_HELD: usize = 12;
+
+/// Takes back lent capacity for `head`, prioritized work this executor would run that `admits`
+/// does not admit beside `load` (#4204 gate P2-3). Among the lent attempts here that started more
+/// than `LEND_SECONDS` ago and still run, the fewest whose end would admit the head, the oldest
+/// first among as few, are stopped through the one stop path (`stopping`) with reason
+/// `RECLAIMED`: their executor is told at its next renewal, ends them and reports, and their jobs
+/// are queued again within the requeue budget (`unsettled`), not to be lent again (`reclaimed`).
+/// Attempts already stopping for a reclaim count as ended, so a later claim, or one after a
+/// restart, never reclaims again for the same room. Nothing is stopped while the end of every
+/// such attempt would still not admit the head: the next claim after other work ends decides
+/// again. Never an attempt that was not lent.
+fn reclaim(
+    db: &Connection,
+    executor: &str,
+    head: &Choice,
+    load: &Load,
+    admits: impl Fn(&Choice, &Load) -> bool,
+) -> Result<()> {
+    let mut stmt = db.prepare(&format!(
+        "SELECT id, action, COALESCE(json_extract(body,'$.slots'),0),
+         COALESCE(json_extract(body,'$.memory_mb'),0), json_extract(body,'$.started'),
+         json_extract(body,'$.stop')
+         FROM attempts WHERE drained=0 AND {EXECUTOR}=? AND ({}) AND {LENT}
+         ORDER BY COALESCE(json_extract(body,'$.started'),json_extract(body,'$.created')), rowid",
+        unprioritized(db)?
+    ))?;
+    type Row = (String, String, Reservation, Option<f64>, Option<String>);
+    let rows: Vec<Row> = stmt
+        .query_map([executor], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                Reservation {
+                    slots: r.get(2)?,
+                    memory_mb: r.get(3)?,
+                },
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let release = |load: &Load, reservation: Reservation| Load {
+        held: Reservation {
+            slots: load.held.slots.saturating_sub(reservation.slots),
+            memory_mb: load.held.memory_mb.saturating_sub(reservation.memory_mb),
+        },
+        lent: Reservation {
+            slots: load.lent.slots.saturating_sub(reservation.slots),
+            memory_mb: load.lent.memory_mb.saturating_sub(reservation.memory_mb),
+        },
+        ..load.clone()
+    };
+    let mut base = load.clone();
+    let mut candidates = Vec::new();
+    let now = now();
+    for (attempt, action, reservation, started, stop) in rows {
+        if stop.as_deref() == Some(RECLAIMED) {
+            base = release(&base, reservation);
+            continue;
+        }
+        let running: Option<(String, Option<String>)> = db
+            .query_row(
+                "SELECT state,attempt FROM actions WHERE id=?",
+                [&action],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let current = running.is_some_and(|(state, current)| {
+            state == "running" && current.as_deref() == Some(attempt.as_str())
+        });
+        if let Some(started) = started.filter(|started| current && now - started > LEND_SECONDS) {
+            candidates.push((attempt, action, reservation, now - started));
+        }
+    }
+    if admits(head, &base) {
+        return Ok(());
+    }
+    candidates.truncate(MAX_BACKFILL_HELD);
+    // The fewest that admit the head; among as few, the oldest first (`candidates` is oldest
+    // first, so the first set in lexicographic order of positions).
+    let mut sets: Vec<Vec<usize>> = (1..1u32 << candidates.len())
+        .map(|set| {
+            (0..candidates.len())
+                .filter(|index| set & (1 << index) != 0)
+                .collect()
+        })
+        .collect();
+    sets.sort_by(|a: &Vec<usize>, b| a.len().cmp(&b.len()).then(a.cmp(b)));
+    let Some(set) = sets.into_iter().find(|set| {
+        let load = set.iter().fold(base.clone(), |load, index| {
+            release(&load, candidates[*index].2)
+        });
+        admits(head, &load)
+    }) else {
+        return Ok(());
+    };
+    for index in set {
+        let (attempt, action, _, ran) = &candidates[index];
+        if stopping(db, action, attempt, Some(RECLAIMED))?.is_some() {
+            event(
+                db,
+                "attempt.reclaimed",
+                attempt,
+                &json!({"action":action,"executor":executor,"ran_seconds":ran,
+                        "for":{"action":head.action.id,"owner":head.owner,
+                               "priority":head.priority}}),
+            )?;
+        }
+    }
+    Ok(())
+}
 
 /// Which choice after a verified head that `admits` keeps back goes beside it (#4204, lane run
 /// 4456: mindy drained most of 80 minutes for a third shard while smaller jobs that would not have
@@ -2323,7 +2486,13 @@ fn drain_lapsed(
 }
 
 /// Stops after which the action may simply be retried: nothing about the revision failed.
-const INTERRUPTIONS: [&str; 4] = ["supervisor-stop", "partition", "fenced", "revoked"];
+const INTERRUPTIONS: [&str; 5] = [
+    "supervisor-stop",
+    "partition",
+    "fenced",
+    "revoked",
+    RECLAIMED,
+];
 
 /// Whether a report says nothing about the revision, so its drained action may be queued again:
 /// nothing ran, the supervisor was lost, or an interruption stopped the command (one that failed
@@ -2844,7 +3013,7 @@ fn view(db: &Connection, record: &ExecutorRecord) -> Result<Value> {
             let lent_held = held_lent(db, &record.id)?;
             Some(
                 json!({"slots":reserve.slots,"memory_mb":reserve.memory_mb,"applied":applied,
-                "lent":applied && reserve_lent(db)?,
+                "lent":applied && reserve_lent(db, &record.id)?,
                 "lent_held":{"slots":lent_held.slots,"memory_mb":lent_held.memory_mb}}),
             )
         }
@@ -5089,10 +5258,11 @@ mod tests {
         );
     }
 
-    /// Estimates for the lab's `short` job, within `LEND_SECONDS`, and its hour-long `long` one.
+    /// Two remembered passes each of the lab's `short` job, within `LEND_SECONDS`, and of its
+    /// hour-long `long` one.
     fn estimates(db: &Connection) {
-        history(db, "f-1", "short", &[60.0]);
-        history(db, "f-1", "long", &[3600.0]);
+        history(db, "f-1", "short", &[60.0, 60.0]);
+        history(db, "f-1", "long", &[3600.0, 3600.0]);
     }
 
     /// Local claims until one admits nothing: the actions admitted, in order, each marked if its
@@ -5155,12 +5325,14 @@ mod tests {
         // A job without history could run for its whole timeout, and one that took the bound did
         // not end within it: neither takes the reserve. Just below the bound it does. The bound is
         // on every remembered pass, not their median (in-lane adversary P2): four quick passes and
-        // three long ones expect a quick one, but the next may be long.
+        // three long ones expect a quick one, but the next may be long. One pass is not enough
+        // (gate P3-7).
         for (samples, claimed, lent) in [
             (&[][..], 2, 0),
-            (&[LEND_SECONDS][..], 2, 0),
-            (&[LEND_SECONDS + 1.0][..], 2, 0),
-            (&[LEND_SECONDS - 1.0][..], 4, 2),
+            (&[60.0][..], 2, 0),
+            (&[LEND_SECONDS, 60.0][..], 2, 0),
+            (&[LEND_SECONDS + 1.0, 60.0][..], 2, 0),
+            (&[LEND_SECONDS - 1.0, 60.0][..], 4, 2),
             (&[60.0, 60.0, 60.0, 60.0, 900.0, 900.0, 900.0][..], 2, 0),
             (&[60.0, 300.0, LEND_SECONDS - 1.0][..], 4, 2),
         ] {
@@ -5257,7 +5429,8 @@ mod tests {
     #[test]
     fn a_trains_running_work_ends_lending_wherever_it_runs() {
         // The train wants nothing queued, only its running prepare, here or on mindy: the short
-        // job is not lent the reserve, though local has room in it. Once the prepare passes, it is.
+        // job is not lent the reserve, though local has room in it. Once the prepare passes, it is,
+        // here only once the prepare's claim here is two minutes old (gate P3-4).
         for here in [true, false] {
             let (_root, mut store) = reserve_lab((2, 2048));
             register(&store.db, "mindy", 4, 4096);
@@ -5277,13 +5450,307 @@ mod tests {
                 Vec::<String>::new(),
                 "{here}"
             );
-            ends(&store, &attempt_of(&store.db, "prepare"));
+            let prepare = attempt_of(&store.db, "prepare");
+            ends(&store, &prepare);
             store
                 .db
                 .execute("UPDATE actions SET state='passed' WHERE id='prepare'", [])
                 .unwrap();
+            if here {
+                assert_eq!(local_lent_claims(&mut store), Vec::<String>::new());
+                claimed_ago(&store, &prepare, LEND_IDLE_SECONDS + 1.0, None);
+            }
             assert_eq!(local_lent_claims(&mut store), ["s-0 lent"], "{here}");
         }
+    }
+
+    /// Dates attempt `id` as claimed `claimed` seconds ago and, with `ended`, ended that long ago.
+    fn claimed_ago(store: &Store, id: &str, claimed: f64, ended: Option<f64>) {
+        store
+            .db
+            .execute(
+                "UPDATE attempts SET body=json_set(body,'$.created',?,'$.ended',?) WHERE id=?",
+                params![now() - claimed, ended.map(|ended| now() - ended), id],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn the_reserve_is_lent_only_two_minutes_after_the_last_prioritized_attempt_here() {
+        // Gate P3-4: trains run back to back, and the next one's first job should not find the
+        // reserve freshly lent. A train's attempt claimed or ended here within the last two
+        // minutes keeps it from being lent; one on another executor does not.
+        let idle = LEND_IDLE_SECONDS;
+        for (executor, claimed, ended, lent) in [
+            (LOCAL, idle - 1.0, None, false),
+            (LOCAL, idle + 1.0, None, true),
+            (LOCAL, idle + 300.0, Some(idle - 1.0), false),
+            (LOCAL, idle + 300.0, Some(idle + 1.0), true),
+            ("mindy", 10.0, Some(5.0), true),
+        ] {
+            let (_root, mut store) = reserve_lab((2, 2048));
+            register(&store.db, "mindy", 4, 4096);
+            estimates(&store.db);
+            hold(&store.db, "train-run", Some(executor), 1, 1024);
+            store
+                .db
+                .execute_batch(
+                    "UPDATE attempts SET state='passed',drained=1,
+                     body=json_set(body,'$.owner','train') WHERE id='train-run'",
+                )
+                .unwrap();
+            claimed_ago(&store, "train-run", claimed, ended);
+            job_wants(&store, "l-0", "lane", "long", 1.0, (1, 1024));
+            job_wants(&store, "l-1", "lane", "long", 2.0, (1, 1024));
+            job_wants(&store, "s-0", "lane", "short", 3.0, (1, 1024));
+            let expected: &[&str] = if lent {
+                &["l-0", "l-1", "s-0 lent"]
+            } else {
+                &["l-0", "l-1"]
+            };
+            let case = format!("{executor} {claimed} {ended:?}");
+            assert_eq!(local_lent_claims(&mut store), expected, "{case}");
+        }
+    }
+
+    #[test]
+    fn the_lending_lookups_read_indexes_not_every_attempt() {
+        // The attempts table keeps every attempt ever made: lending reads it on every claim.
+        let (_root, store) = lab();
+        for (query, index) in [
+            (
+                format!(
+                    "SELECT 1 FROM attempts WHERE json_extract(body,'$.ended')>=?2
+                     AND {EXECUTOR}=?1 AND {CLAIMED_PRIORITIZED}"
+                ),
+                "attempts_ended",
+            ),
+            (
+                format!(
+                    "SELECT 1 FROM attempts WHERE json_extract(body,'$.created')>=?2
+                     AND {EXECUTOR}=?1 AND {CLAIMED_PRIORITIZED}"
+                ),
+                "attempts_created",
+            ),
+            (
+                "SELECT 1 FROM attempts WHERE action=?1 AND json_extract(body,'$.stop')=?2".into(),
+                "attempts_action",
+            ),
+        ] {
+            crate::worker::set_priority(&store, "train", 1).unwrap();
+            let plan: String = store
+                .db
+                .query_row(
+                    &format!("EXPLAIN QUERY PLAN {query}"),
+                    params!["local", 0.0],
+                    |r| r.get(3),
+                )
+                .unwrap();
+            assert!(plan.contains(index), "{plan}");
+        }
+    }
+
+    /// mindy (4/4096) keeps 2/2048 for the train, at priority 1. Two hour-long lane jobs fill the
+    /// lanes' share and two short ones are lent the reserve, `s-0` started `ran[0]` seconds ago
+    /// and `s-1` `ran[1]`; `l-0`, not lent, started two bounds ago. The claims, by action.
+    fn lent_on_mindy(ran: [f64; 2]) -> (tempfile::TempDir, Store, BTreeMap<String, Claim>) {
+        let (root, mut store) = lab();
+        register(&store.db, "mindy", 4, 4096);
+        set_reserve(&mut store, "mindy", need((2, 2048))).unwrap();
+        crate::worker::set_priority(&store, "train", 1).unwrap();
+        estimates(&store.db);
+        job_wants(&store, "l-0", "lane", "long", 1.0, (1, 1024));
+        job_wants(&store, "l-1", "lane", "long", 2.0, (1, 1024));
+        job_wants(&store, "s-0", "lane", "short", 3.0, (1, 1024));
+        job_wants(&store, "s-1", "lane", "short", 4.0, (1, 1024));
+        let claims: BTreeMap<String, Claim> = std::iter::from_fn(|| {
+            claim_for(
+                &mut store,
+                "mindy",
+                &Scope::all(),
+                &ask(&unique(), &["f-1"]),
+            )
+            .unwrap()
+            .claim
+        })
+        .map(|claim| (claim.action.id.clone(), claim))
+        .collect();
+        assert_eq!(held_lent(&store.db, "mindy").unwrap(), need((2, 2048)));
+        for (action, seconds) in [
+            ("s-0", ran[0]),
+            ("s-1", ran[1]),
+            ("l-0", 2.0 * LEND_SECONDS),
+        ] {
+            store
+                .db
+                .execute(
+                    "UPDATE attempts SET body=json_set(body,'$.started',?) WHERE id=?",
+                    params![now() - seconds, claims[action].attempt.id],
+                )
+                .unwrap();
+        }
+        (root, store, claims)
+    }
+
+    /// The report of a supervisor that ended attempt `claim` as reclaimed, drained.
+    fn reclaimed_report(claim: &Claim) -> CompleteRequest {
+        finish(
+            claim,
+            Outcome::Completed,
+            Some(RECLAIMED),
+            124,
+            json!({"exit_code":124,"reason":RECLAIMED,"artifacts":{}}),
+        )
+    }
+
+    #[test]
+    fn a_lent_attempt_past_the_bound_is_reclaimed_for_prioritized_work_that_does_not_fit() {
+        // Gate P2-3 (#4204): lent capacity is borrowed. s-0 has run eleven minutes, s-1 one, and
+        // l-0 an hour without being lent.
+        let (root, mut store, claims) = lent_on_mindy([LEND_SECONDS + 60.0, 60.0]);
+        // Without prioritized work nothing is reclaimed, however long it ran.
+        assert_eq!(mindy_claims(&mut store, "k1"), None);
+        assert!(events(&store.db, "attempt.reclaimed").is_empty());
+        // The train's prepare does not fit: s-0, the one lent attempt past the bound, is stopped
+        // for it, and its executor is told at its next renewal.
+        wants(&store, "prepare", "train", 9.0, (1, 1024));
+        assert_eq!(mindy_claims(&mut store, "k2"), None);
+        let reclaimed = events(&store.db, "attempt.reclaimed");
+        assert_eq!(reclaimed.len(), 1);
+        let (attempt, detail) = &reclaimed[0];
+        assert_eq!(attempt, &claims["s-0"].attempt.id);
+        assert_eq!(
+            (&detail["action"], &detail["executor"], &detail["for"]),
+            (
+                &json!("s-0"),
+                &json!("mindy"),
+                &json!({"action":"prepare","owner":"train","priority":1})
+            )
+        );
+        assert!(detail["ran_seconds"].as_f64().unwrap() > LEND_SECONDS + 59.0);
+        let states = ["s-0", "s-1", "l-0"].map(|action| state(&store.db, action));
+        assert_eq!(states, ["stopping", "running", "running"]);
+        let status = heartbeat(
+            &mut store,
+            "mindy",
+            &Scope::all(),
+            vec![lease(&claims["s-0"])],
+        );
+        assert_eq!(status[0].stop.as_deref(), Some(RECLAIMED));
+        // A later claim, or one after a restart, reclaims nothing more for the same room.
+        assert_eq!(mindy_claims(&mut store, "k3"), None);
+        drop(store);
+        let mut store = Store::open(root.path()).unwrap();
+        assert_eq!(mindy_claims(&mut store, "k4"), None);
+        assert_eq!(events(&store.db, "attempt.reclaimed").len(), 1);
+        // The executor ends it and reports: its job is queued again, and once the attempt drains
+        // the train's prepare is claimed in its room.
+        let report = reclaimed_report(&claims["s-0"]);
+        complete(
+            &mut store,
+            "mindy",
+            &Scope::all(),
+            &report,
+            Outputs::InPlace,
+        )
+        .unwrap();
+        assert_eq!(state(&store.db, "s-0"), "queued");
+        assert_eq!(mindy_claims(&mut store, "k5").as_deref(), Some("prepare"));
+        // Once the train is gone and two minutes have passed, the reserve is lent again, but not
+        // to the reclaimed job: it waits for the lanes' share, and another short job is lent.
+        let prepare = attempt_of(&store.db, "prepare");
+        ends(&store, &prepare);
+        store
+            .db
+            .execute("UPDATE actions SET state='passed' WHERE id='prepare'", [])
+            .unwrap();
+        claimed_ago(&store, &prepare, LEND_IDLE_SECONDS + 1.0, None);
+        job_wants(&store, "s-2", "lane", "short", 10.0, (1, 1024));
+        assert_eq!(mindy_claims(&mut store, "k6").as_deref(), Some("s-2"));
+        assert!(store.attempt(&attempt_of(&store.db, "s-2")).unwrap().lent);
+        assert_eq!(state(&store.db, "s-0"), "queued");
+    }
+
+    #[test]
+    fn reclaim_spares_lent_work_within_the_bound_work_not_lent_and_room_the_train_has() {
+        // Gate P2-3: only lent attempts past the bound are reclaimed, only while the prioritized
+        // job does not fit, and as few as admit it, the oldest first among as few.
+        let ran = LEND_SECONDS + 60.0;
+        // Within the bound: s-0 and s-1 ran a minute, l-0 an hour without being lent.
+        let (_root, mut store, _) = lent_on_mindy([60.0, 60.0]);
+        wants(&store, "prepare", "train", 9.0, (1, 1024));
+        assert_eq!(mindy_claims(&mut store, "k1"), None);
+        assert!(events(&store.db, "attempt.reclaimed").is_empty());
+        // The prepare fits once l-1 ends: nothing is reclaimed for it.
+        let (_root, mut store, claims) = lent_on_mindy([ran, ran]);
+        ends(&store, &claims["l-1"].attempt.id);
+        wants(&store, "prepare", "train", 9.0, (1, 1024));
+        assert_eq!(mindy_claims(&mut store, "k1").as_deref(), Some("prepare"));
+        assert!(events(&store.db, "attempt.reclaimed").is_empty());
+        // One slot: the older of two past the bound; two slots: both.
+        for (wanted, stopped) in [((1, 1024), &["s-0"][..]), ((2, 2048), &["s-0", "s-1"][..])] {
+            let (_root, mut store, _) = lent_on_mindy([ran + 10.0, ran]);
+            wants(&store, "prepare", "train", 9.0, wanted);
+            assert_eq!(mindy_claims(&mut store, "k1"), None);
+            let reclaimed: Vec<String> = events(&store.db, "attempt.reclaimed")
+                .into_iter()
+                .map(|(_, detail)| detail["action"].as_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(reclaimed, stopped, "{wanted:?}");
+            assert_eq!(state(&store.db, "l-0"), "running");
+        }
+        // The fewest: mindy (6/6144) keeps 3/3072; s-0 (1/1024) was lent first, s-1 (2/2048)
+        // after. The train's 2/2048 job needs s-1's end alone, not s-0's as well.
+        let (_root, mut store) = lab();
+        register(&store.db, "mindy", 6, 6144);
+        set_reserve(&mut store, "mindy", need((3, 3072))).unwrap();
+        crate::worker::set_priority(&store, "train", 1).unwrap();
+        estimates(&store.db);
+        for index in 0..3 {
+            let id = format!("l-{index}");
+            job_wants(&store, &id, "lane", "long", 1.0 + index as f64, (1, 1024));
+        }
+        job_wants(&store, "s-0", "lane", "short", 4.0, (1, 1024));
+        job_wants(&store, "s-1", "lane", "short", 5.0, (2, 2048));
+        assert_eq!(mindy_claims_all(&mut store).len(), 5);
+        for (action, seconds) in [("s-0", ran + 10.0), ("s-1", ran)] {
+            store
+                .db
+                .execute(
+                    "UPDATE attempts SET body=json_set(body,'$.started',?) WHERE id=?",
+                    params![now() - seconds, attempt_of(&store.db, action)],
+                )
+                .unwrap();
+        }
+        wants(&store, "prepare", "train", 9.0, (2, 2048));
+        assert_eq!(mindy_claims(&mut store, "k1"), None);
+        let reclaimed = events(&store.db, "attempt.reclaimed");
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].1["action"], "s-1");
+    }
+
+    #[test]
+    fn a_reclaimed_job_whose_requeue_budget_is_spent_waits_for_an_operator() {
+        // A reclaim spends the requeue budget as any interruption does: past it, the job is not
+        // queued again but interrupted, and the train's prepare still gets the room.
+        let (_root, mut store, claims) = lent_on_mindy([LEND_SECONDS + 60.0, 60.0]);
+        store
+            .db
+            .execute("INSERT INTO requeues VALUES ('s-0',?)", [REQUEUE_BUDGET])
+            .unwrap();
+        wants(&store, "prepare", "train", 9.0, (1, 1024));
+        assert_eq!(mindy_claims(&mut store, "k1"), None);
+        let report = reclaimed_report(&claims["s-0"]);
+        complete(
+            &mut store,
+            "mindy",
+            &Scope::all(),
+            &report,
+            Outputs::InPlace,
+        )
+        .unwrap();
+        assert_eq!(state(&store.db, "s-0"), "interrupted");
+        assert_eq!(mindy_claims(&mut store, "k2").as_deref(), Some("prepare"));
     }
 
     /// The head of `executor`'s queue, the lab's `f-1` verified, without claiming it.
@@ -6198,7 +6665,8 @@ mod tests {
         let action = action(&q);
         Durations::load(db, std::slice::from_ref(&action))
             .unwrap()
-            .longest(&action)
+            .estimate(&action)
+            .map(|estimate| estimate.longest)
     }
 
     #[test]
