@@ -816,7 +816,10 @@ const KEEPALIVE_IDLE_NAME: &str = "TCP_KEEPIDLE";
 // Probes go only over an idle connection. One with data its peer never acknowledges, such as an
 // SSE stream to a peer lost behind a NAT, is retransmitted for about 15 minutes before the kernel
 // gives up (#4204 gate P3-6). Linux closes it once data has gone unacknowledged as long as the
-// probes take to find a dead idle peer, and the same bound then ends the probes.
+// probes take to find a dead idle peer, and the same bound then ends the probes. It also bounds
+// zero-window probing, so a live client that stops reading for more than two minutes, such as a
+// paused `events --follow`, is reset too; accepted (gate 2 P3-3): the follower reconnects from its
+// last event.
 #[cfg(target_os = "linux")]
 const USER_TIMEOUT: Duration = Duration::from_secs(
     KEEPALIVE_IDLE.as_secs() + KEEPALIVE_INTERVAL.as_secs() * KEEPALIVE_PROBES as u64,

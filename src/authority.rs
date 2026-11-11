@@ -1526,6 +1526,24 @@ impl Load {
             && unreserved.is_some_and(|left| !fits(self.unprioritized, choice.reservation, left))
     }
 
+    /// What would be held once attempt `held` here ends: the inverse of `with`.
+    fn without(&self, held: &HeldAttempt) -> Self {
+        let sub = |load: Reservation| Reservation {
+            slots: load.slots.saturating_sub(held.reservation.slots),
+            memory_mb: load.memory_mb.saturating_sub(held.reservation.memory_mb),
+        };
+        Self {
+            held: sub(self.held),
+            unprioritized: if held.unprioritized {
+                sub(self.unprioritized)
+            } else {
+                self.unprioritized
+            },
+            lent: if held.lent { sub(self.lent) } else { self.lent },
+            freed: self.freed.clone(),
+        }
+    }
+
     /// What would be held once `choice` is claimed too: it is no dependency anyone waits on yet,
     /// is prioritized as its owner is, and is lent the reserve if `lent` (`lends`, judged where it
     /// is claimed: it stays where it was admitted whatever ends first).
@@ -1586,11 +1604,12 @@ const MAX_BACKFILL_HELD: usize = 12;
 /// than `LEND_SECONDS` ago and still run, the fewest whose end would admit the head, the oldest
 /// first among as few, are stopped through the one stop path (`stopping`) with reason
 /// `RECLAIMED`: their executor is told at its next renewal, ends them and reports, and their jobs
-/// are queued again within the requeue budget (`unsettled`), not to be lent again (`reclaimed`).
-/// Attempts already stopping for a reclaim count as ended, so a later claim, or one after a
-/// restart, never reclaims again for the same room. Nothing is stopped while the end of every
-/// such attempt would still not admit the head: the next claim after other work ends decides
-/// again. Never an attempt that was not lent.
+/// are queued again within the requeue budget (`unsettled`). Lent attempts already stopping, for
+/// a reclaim or any other reason, count as ended, so a later claim, or one after a restart, never
+/// stops more for the same room; one cleaning up after its action settled is neither stopped nor
+/// counted as ended. Nothing is stopped while the end of every such attempt would still not admit
+/// the head: the next claim after other work ends decides again. Never an attempt that was not
+/// lent.
 fn reclaim(
     db: &Connection,
     executor: &str,
@@ -1600,58 +1619,50 @@ fn reclaim(
 ) -> Result<()> {
     let mut stmt = db.prepare(&format!(
         "SELECT id, action, COALESCE(json_extract(body,'$.slots'),0),
-         COALESCE(json_extract(body,'$.memory_mb'),0), json_extract(body,'$.started'),
-         json_extract(body,'$.stop')
+         COALESCE(json_extract(body,'$.memory_mb'),0), json_extract(body,'$.started')
          FROM attempts WHERE drained=0 AND {EXECUTOR}=? AND ({}) AND {LENT}
          ORDER BY COALESCE(json_extract(body,'$.started'),json_extract(body,'$.created')), rowid",
         unprioritized(db)?
     ))?;
-    type Row = (String, String, Reservation, Option<f64>, Option<String>);
+    type Row = (String, String, HeldAttempt, Option<f64>);
     let rows: Vec<Row> = stmt
         .query_map([executor], |r| {
             Ok((
                 r.get(0)?,
                 r.get(1)?,
-                Reservation {
-                    slots: r.get(2)?,
-                    memory_mb: r.get(3)?,
+                HeldAttempt {
+                    reservation: Reservation {
+                        slots: r.get(2)?,
+                        memory_mb: r.get(3)?,
+                    },
+                    unprioritized: false,
+                    lent: true,
                 },
                 r.get(4)?,
-                r.get(5)?,
             ))
         })?
         .collect::<rusqlite::Result<_>>()?;
-    let release = |load: &Load, reservation: Reservation| Load {
-        held: Reservation {
-            slots: load.held.slots.saturating_sub(reservation.slots),
-            memory_mb: load.held.memory_mb.saturating_sub(reservation.memory_mb),
-        },
-        lent: Reservation {
-            slots: load.lent.slots.saturating_sub(reservation.slots),
-            memory_mb: load.lent.memory_mb.saturating_sub(reservation.memory_mb),
-        },
-        ..load.clone()
-    };
     let mut base = load.clone();
     let mut candidates = Vec::new();
     let now = now();
-    for (attempt, action, reservation, started, stop) in rows {
-        if stop.as_deref() == Some(RECLAIMED) {
-            base = release(&base, reservation);
-            continue;
-        }
-        let running: Option<(String, Option<String>)> = db
+    for (attempt, action, held, started) in rows {
+        let (state, current): (String, Option<String>) = db
             .query_row(
                 "SELECT state,attempt FROM actions WHERE id=?",
                 [&action],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .optional()?;
-        let current = running.is_some_and(|(state, current)| {
-            state == "running" && current.as_deref() == Some(attempt.as_str())
-        });
-        if let Some(started) = started.filter(|started| current && now - started > LEND_SECONDS) {
-            candidates.push((attempt, action, reservation, now - started));
+            .optional()?
+            .unwrap_or_default();
+        let current = current.as_deref() == Some(attempt.as_str());
+        if current && state == "stopping" {
+            base = base.without(&held);
+            continue;
+        }
+        if let Some(started) =
+            started.filter(|started| current && state == "running" && now - started > LEND_SECONDS)
+        {
+            candidates.push((attempt, action, held, now - started));
         }
     }
     if admits(head, &base) {
@@ -1670,7 +1681,7 @@ fn reclaim(
     sets.sort_by(|a: &Vec<usize>, b| a.len().cmp(&b.len()).then(a.cmp(b)));
     let Some(set) = sets.into_iter().find(|set| {
         let load = set.iter().fold(base.clone(), |load, index| {
-            release(&load, candidates[*index].2)
+            load.without(&candidates[*index].2)
         });
         admits(head, &load)
     }) else {
@@ -5228,6 +5239,20 @@ mod tests {
     }
 
     #[test]
+    fn an_action_two_owners_want_counts_once_among_the_jobs_ranked_before_a_backfill() {
+        // Gate 2 P3-2: b and c both want `shared` (8192 MiB), ranked between the head and d's
+        // 1024 MiB job. Once both attempts end, the head and `shared` start with 8192 MiB to
+        // spare, and the job beside them leaves 7168: `shared` runs once, so the job never
+        // delays it.
+        let (_root, mut store) = mindy_running(&[(1, 5120), (1, 12288)]);
+        wants(&store, "head", "a", 1.0, (1, 8192));
+        wants(&store, "shared", "b", 2.0, (1, 8192));
+        shared_with(&store, "shared", "c");
+        wants(&store, "small", "d", 3.0, (1, 1024));
+        assert_eq!(mindy_claims(&mut store, "k1").as_deref(), Some("small"));
+    }
+
+    #[test]
     fn nothing_unverified_is_admitted_beside_a_head() {
         // An unverified head admits nothing until it is judged, beside it or otherwise.
         let (_root, mut store) = mindy_running(&[(6, 9216), (6, 9216)]);
@@ -6019,6 +6044,8 @@ mod tests {
             (&[60.0][..], false, "too-few-passes"),
             (&[60.0, 900.0][..], false, "too-long"),
             (&[60.0, 60.0][..], true, "train-has-work"),
+            // The job's own condition is named first: it outlasts the train.
+            (&[][..], true, "no-history"),
         ] {
             let (_root, store) = reserve_lab((3, 3072));
             if !samples.is_empty() {
@@ -6101,6 +6128,19 @@ mod tests {
                 json!({"action":"shard2","owner":"b","reason":"behind","head":"head"})
             ]
         );
+        // At most 32 are listed, the head first.
+        let (_root, mut store) = reserve_lab((3, 3072));
+        estimates(&store.db);
+        job_wants(&store, "l-0", "lane", "long", 1.0, (1, 1024));
+        assert_eq!(local_lent_claims(&mut store), ["l-0"]);
+        job_wants(&store, "l-1", "lane", "long", 2.0, (1, 1024));
+        for index in 0..40 {
+            let id = format!("wide-{index}");
+            job_wants(&store, &id, "lane", "x", 3.0 + index as f64, (2, 2048));
+        }
+        let waiting = waiting_on(&store, LOCAL);
+        assert_eq!(waiting.len(), MAX_WAITING);
+        assert_eq!(waiting[0]["action"], "l-1");
         // A prioritized owner's hold keeps the head back.
         let (_root, mut store) = hold_lab();
         job_of(&store, "prepare", "train", "running", (1, 1), &[]);
@@ -6171,6 +6211,71 @@ mod tests {
                 reclaimed,
                 "{case}"
             );
+        }
+    }
+
+    #[test]
+    fn reclaim_takes_only_a_lent_attempt_still_running_its_job() {
+        // Gate 2 P3-1: s-0, the older lent attempt past the bound, is cleaning up after its job
+        // passed: it cannot be stopped, so s-1 is reclaimed for the train in its stead, and no
+        // reclaim of s-0 is recorded.
+        let (_root, mut store, claims) = lent_on_mindy([LEND_SECONDS + 120.0, LEND_SECONDS + 60.0]);
+        store
+            .db
+            .execute("UPDATE actions SET state='passed' WHERE id='s-0'", [])
+            .unwrap();
+        wants(&store, "prepare", "train", 9.0, (1, 1024));
+        assert_eq!(mindy_claims(&mut store, "k1"), None);
+        let reclaimed: Vec<String> = events(&store.db, "attempt.reclaimed")
+            .into_iter()
+            .map(|(attempt, _)| attempt)
+            .collect();
+        assert_eq!(reclaimed, [claims["s-1"].attempt.id.clone()]);
+        assert_eq!(state(&store.db, "s-0"), "passed");
+        // s-0 already stopping on its timeout is ending: its room is the train's once it drains,
+        // and nothing more is stopped or recorded as reclaimed.
+        let (_root, mut store, claims) = lent_on_mindy([LEND_SECONDS + 120.0, LEND_SECONDS + 60.0]);
+        stopping(&store.db, "s-0", &claims["s-0"].attempt.id, Some("timeout")).unwrap();
+        wants(&store, "prepare", "train", 9.0, (1, 1024));
+        assert_eq!(mindy_claims(&mut store, "k1"), None);
+        assert!(events(&store.db, "attempt.reclaimed").is_empty());
+        assert_eq!(state(&store.db, "s-1"), "running");
+    }
+
+    #[test]
+    fn a_load_without_an_attempt_undoes_the_load_with_its_claim() {
+        // Gate 2 P3-4: `without` is `with`'s inverse, pool by pool, whichever pool the claim took.
+        let load = Load {
+            held: need((3, 3072)),
+            unprioritized: need((1, 1024)),
+            lent: need((1, 1024)),
+            freed: Vec::new(),
+        };
+        let choice = |priority: i64| Choice {
+            owner: "lane".into(),
+            priority,
+            action: action(&Queue {
+                id: "x",
+                ..Queue::default()
+            }),
+            reservation: need((1, 512)),
+            timeout_seconds: 60,
+            lent: true,
+            unlent: None,
+        };
+        for (priority, lent, unprioritized) in
+            [(0, true, false), (0, false, true), (1, false, false)]
+        {
+            let held = HeldAttempt {
+                reservation: need((1, 512)),
+                unprioritized,
+                lent,
+            };
+            let with = load.with(&choice(priority), lent);
+            let back = with.without(&held);
+            let pools = |load: &Load| (load.held, load.unprioritized, load.lent);
+            assert_ne!(pools(&with), pools(&load), "{priority} {lent}");
+            assert_eq!(pools(&back), pools(&load), "{priority} {lent}");
         }
     }
 

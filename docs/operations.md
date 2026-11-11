@@ -94,7 +94,9 @@ smaller work back; only short work that fits the reserve stays while the reserve
 An executor's reserve is lent while no owner above 0 wants any work that is queued, running or
 stopping, on any executor (no train rides), and no attempt for such an owner was claimed or ended
 on that executor in the last 2 minutes. The pause keeps the reserve from being lent in the gap
-between back-to-back trains. A job of an owner at 0 or below may then take the reserve, beside
+between back-to-back trains. It is per executor: a train's last attempt on mindy does not keep
+mauve's reserve from being lent if mauve ran none of that train's work in those 2 minutes. That is
+enough for a reserve host every train touches, and an executor no train used lends at once. A job of an owner at 0 or below may then take the reserve, beside
 the other lent work and up to the reserve's size, if it does not fit the capacity less the
 reserve and its history holds at least two passes, every one under 10 minutes: a job with one
 pass or none is never lent, nor one that mostly takes a minute but sometimes a quarter of an
@@ -396,8 +398,11 @@ Logs, revisions, events, attempts and artifacts are retained in the store.
 `serve` deletes uploads nobody consumed within 24 hours; other automatic retention
 and garbage collection are not implemented. Monitor disk space. Deleting files
 inside the state store can invalidate evidence or replay; there is no supported
-selective pruning command. On NG's authority host, attempts' directories are pruned by an
-operator timer and script outside the engine, not by the engine.
+selective pruning command. Nothing prunes the store, on NG's hosts or elsewhere. A future pruner
+is handed off and gated on its own, and may delete only an attempt's directory that is drained,
+past its retention, and neither a dependency of a live action nor a reused result: `logs` reads
+`attempts/<id>/output.log`, and a `local` claim reads its dependencies' artifacts from
+`attempts/<producer>/artifacts`.
 
 ### Cutover of the lent reserve (lumenloop-ng#4204)
 
@@ -423,7 +428,10 @@ Cutover, as one window:
    --memory-mb 18432 local`. Confirm that
    `patchweft executors` shows it with `"applied": true`: a reserve that meets the effective
    capacity, for example under a lower cgroup limit, is not applied.
-9. Merge the lab pull request with the LANES.md lines on why a job waits and on reclaimed jobs.
+9. Merge the cutover's lab PR: `pw-ng.py` reads an attempt that ended `interrupted` with reason
+   `reclaimed` as HELD for a lane check, never FAIL (the lane did not cause it, and its job runs
+   again), and LANES.md gains the lines on why a job waits (`waiting` on `executors`) and on
+   reclaimed jobs.
 
 What can go wrong: a missed v27 queued action sits refused; the reserve does not apply under the
 cgroup limit; the cold proving train runs long; lending turns on in gaps during that cold window,
@@ -455,6 +463,10 @@ its mirror's newest revisions as `have`, so each new commit is fetched once per
 project and host. Bundles are limited to 1 GiB. Incremental uploads are possible
 when the server already has the prerequisites. Large histories, Git packing,
 disk pressure and network bandwidth can dominate request time.
+
+The API listener probes idle connections (60 s, then every 15 s, 4 probes) and, on Linux,
+closes one whose data has gone unacknowledged for 2 minutes. That also resets a live client that
+stops reading for more than 2 minutes; `events --follow` then reconnects from its last event.
 
 The API has bounded calls, blocking operations, streams, transfers and pending
 actions. Each artifact or log file is limited to 1 GiB and an attempt's outputs to
