@@ -400,7 +400,8 @@ Cutover, as one window:
 6. Repoint the 16 lane configs. Cancel or resubmit anything still queued under v27, which
    `patchweft executors` lists as refused.
 7. Run one proving train. It is cold, so every job executes.
-8. Set mauve's reserve: `patchweft reserve mauve --slots 8 --memory-mb 18432`. Confirm that
+8. Set mauve's reserve (its executor is `local`): `patchweft --state ~/state reserve --slots 8
+   --memory-mb 18432 local`. Confirm that
    `patchweft executors` shows it with `"applied": true`: a reserve that meets the effective
    capacity, for example under a lower cgroup limit, is not applied.
 9. Merge the lab pull request with the LANES.md lines on why a job waits and on reclaimed jobs.
@@ -416,7 +417,8 @@ Rollback:
    drain leaves none held; the indexes stay and are harmless.
 3. Repoint the 16 lane configs back to v27, which is still registered.
 4. Cancel or resubmit work queued under v28.
-5. Put mauve's reserve back to the stopgap: `patchweft reserve mauve --slots 8 --memory-mb 9216`.
+5. Put mauve's reserve back to the stopgap: `patchweft --state ~/state reserve --slots 8
+   --memory-mb 9216 local`.
    The old binary cannot lend, so 18432 MiB would bring back the 40 to 50 minute lane queueing.
 
 What can go wrong: forgetting step 5, and v28 work left queued and refused. v28's samples stay
