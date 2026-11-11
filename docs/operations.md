@@ -110,18 +110,35 @@ executor does not fit, the store stops the fewest lent jobs past that bound whos
 for it, the oldest first among as few, and records `attempt.reclaimed` with the action, the
 executor, how long it ran and the work it was stopped for. A lane whose job is reclaimed sees its
 attempt stop and end `interrupted` with reason `reclaimed`: nothing failed and no repair opens.
-The job is queued again within the same requeue budget as any interruption (three, then it waits
-for an operator's `retry`), and runs again later within the lanes' own share: a job reclaimed
-once is never lent the reserve again. A train that arrives while the reserve is lent so waits
+The job is queued again within the same requeue budget as any interruption, and runs again like
+any other queued lane job: within the lanes' share, or lent the reserve again once lending is
+back on. A reclaimed job may be lent again, and stops after the requeue budget (three
+reclaims or other interruptions, then it ends `interrupted` with reason `reclaimed` and waits for
+an operator's `retry`). A train that arrives while the reserve is lent so waits
 for lent work about 10 minutes at most, plus the stop and the job's cleanup; a remote executor
 learns of the stop at its next renewal, and one that cannot be reached holds the capacity until
 its lease lapses and its drain is reported or confirmed.
 
-Why a job waits shows on `patchweft executors`: `held` (what runs there), `holding` (a hold above
-its priority), and the reserve with `applied`, `lent` (the reserve is applied and lent now) and
-`lent_held` (what lent work still holds). A head that does not fit drains the executor without
-any of these changing. The lines lanes read in LANES.md come with a lab pull request at the
-cutover (below).
+Why a job waits shows on `patchweft executors`. Each executor lists, under `waiting`, at most 32
+queued jobs it may run but does not admit now, each with its action, owner and `reason`:
+
+- `drain`: the executor's head, which does not fit yet; the executor drains for it.
+- `hold`: the head, kept back by a prioritized owner's hold (`priority`).
+- `lanes-share`: larger than what the reserve leaves to lanes now, and not lent the reserve;
+  `lending` names why: `no-history`, `too-few-passes` (fewer than two), `too-long` (a pass took
+  10 minutes or more), `train-has-work`, `train-recent` (a train's attempt on that executor was
+  claimed or ended in the last 2 minutes), `reserve-full` (what the reserve holds for lent work
+  is taken) or `larger-than-reserve`.
+- `behind`: queued behind the head (`head`) the executor drains for or holds; the one job backfill
+  would start beside the head is not listed.
+- `capacity`: larger than the executor.
+
+Each executor judges with its placement and the profiles it last reported verified or refused; a
+grant narrower than every project and profile can keep more work from it. A job that every
+executor lists is one nothing will run until the cause changes. `held` shows what runs there,
+`holding` a hold above some priority, and the reserve `applied`, `lent` (the reserve is applied
+and lent now) and `lent_held` (what lent work still holds). The lines lanes read in LANES.md come
+with the cutover's lab PR (below).
 
 A queued action counts as prioritized while any owner above 0 wants it, as it does for ordering,
 and its claim is that owner's. A running attempt counts as prioritized while the owner it was
@@ -383,7 +400,7 @@ operator timer and script outside the engine, not by the engine.
 ### Cutover of the lent reserve (lumenloop-ng#4204)
 
 The change adds an optional `lent` key to attempt bodies, read as false where it is missing, and
-three indexes on `attempts` that the first open after the upgrade builds. No table, queue format
+two indexes on `attempts` that the first open after the upgrade builds. No table, queue format
 or row changes. The reserve itself is operator state in the store, set with `patchweft reserve`
 and recorded as an `executor.reserve` event; nothing in code or configuration sets it. In-flight
 runs cannot cross the swap: `worker` refuses to start while the previous binary's attempts are

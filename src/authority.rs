@@ -24,6 +24,8 @@ pub const LOCAL_LEASE_SECONDS: u64 = 3600;
 /// A `refused` key with which an executor declines every profile, saying why (MUST-FIX 8).
 pub const REFUSE_ALL: &str = "*";
 const MAX_UNVERIFIED: usize = 32;
+/// Entries an executor's `waiting` list shows at most.
+const MAX_WAITING: usize = 32;
 /// The executor of an attempt row. Attempts claimed before executors existed are local.
 const EXECUTOR: &str = "COALESCE(json_extract(body,'$.executor'),'local')";
 
@@ -96,7 +98,6 @@ pub fn prepare(db: &Connection) -> Result<()> {
          CREATE TABLE IF NOT EXISTS requeues (action TEXT PRIMARY KEY, count INTEGER NOT NULL);
          CREATE INDEX IF NOT EXISTS attempts_held ON attempts(drained, state);
          CREATE INDEX IF NOT EXISTS attempts_claim_key ON attempts(json_extract(body,'$.claim_key'));
-         CREATE INDEX IF NOT EXISTS attempts_action ON attempts(action);
          CREATE INDEX IF NOT EXISTS attempts_created ON attempts(json_extract(body,'$.created'));
          CREATE INDEX IF NOT EXISTS attempts_ended ON attempts(json_extract(body,'$.ended'));",
     )?;
@@ -253,7 +254,7 @@ fn held_where(db: &Connection, executor: &str, condition: &str) -> Result<Reserv
 }
 
 /// A job the reserve is lent to has ended within this many seconds every time it is remembered to
-/// have passed (`Durations::lendable`), and once a lent attempt has run longer while prioritized
+/// have passed (`Durations::unlendable`), and once a lent attempt has run longer while prioritized
 /// work here does not fit, it is stopped and its job queued again (`reclaim`): a train that
 /// arrives while capacity is lent waits about that long for it (chief, #4204, 2026-11-11).
 pub const LEND_SECONDS: f64 = 600.0;
@@ -267,48 +268,49 @@ const LEND_PASSES: usize = 2;
 pub const LEND_IDLE_SECONDS: f64 = 120.0;
 
 /// The stop reason of an attempt `reclaim` stops: an interruption, after which its job is queued
-/// again (`INTERRUPTIONS`), and which keeps that job from being lent again (`reclaimed`).
+/// again within the requeue budget (`INTERRUPTIONS`). The job may be lent again; past the budget
+/// it ends interrupted with this reason (#4204 gate 2 P2-1).
 const RECLAIMED: &str = "reclaimed";
 
-/// Whether an applied reserve on `executor` is lent: no owner above priority 0 wants any action
-/// that is queued, running or stopping, on any executor (no train rides), and no attempt claimed
-/// for such an owner here was claimed or ended within `LEND_IDLE_SECONDS`. A reserve kept while
-/// nobody it is for has work only idles its executor. While it is lent, work without priority
-/// whose remembered passes all ended within `LEND_SECONDS` may take it once what the reserve
-/// leaves is full; from the first prioritized request nothing more is lent, and what was lent
-/// runs until it ends or `reclaim` stops it.
-fn reserve_lent(db: &Connection, executor: &str) -> Result<bool> {
+/// Why an applied reserve on `executor` is not lent now, if it is not: an owner above priority 0
+/// wants an action that is queued, running or stopping, on any executor (`train-has-work`: a
+/// train rides), or an attempt claimed for such an owner here was claimed or ended within
+/// `LEND_IDLE_SECONDS` (`train-recent`). A reserve kept while nobody it is for has work only idles
+/// its executor. While it is lent, work without priority whose remembered passes all ended within
+/// `LEND_SECONDS` may take it once what the reserve leaves is full; from the first prioritized
+/// request nothing more is lent, and what was lent runs until it ends or `reclaim` stops it. The
+/// pause is per executor: a train's last attempt elsewhere does not keep this reserve.
+fn lend_block(db: &Connection, executor: &str) -> Result<Option<&'static str>> {
     if !table_exists(db, "owner_priorities")? {
-        return Ok(true);
+        return Ok(None);
     }
-    Ok(!db.query_row(
+    let riding: bool = db.query_row(
+        "SELECT EXISTS (SELECT 1 FROM interests i
+         JOIN owner_priorities p ON p.owner=i.owner AND p.priority>0
+         JOIN actions a ON a.id=i.action
+         WHERE i.active=1 AND a.state IN ('queued','running','stopping'))",
+        [],
+        |r| r.get(0),
+    )?;
+    if riding {
+        return Ok(Some("train-has-work"));
+    }
+    let recent: bool = db.query_row(
         &format!(
-            "SELECT EXISTS (SELECT 1 FROM interests i
-             JOIN owner_priorities p ON p.owner=i.owner AND p.priority>0
-             JOIN actions a ON a.id=i.action
-             WHERE i.active=1 AND a.state IN ('queued','running','stopping'))
-             OR EXISTS (SELECT 1 FROM attempts WHERE json_extract(body,'$.created')>=?2
+            "SELECT EXISTS (SELECT 1 FROM attempts WHERE json_extract(body,'$.created')>=?2
                         AND {EXECUTOR}=?1 AND {CLAIMED_PRIORITIZED})
              OR EXISTS (SELECT 1 FROM attempts WHERE json_extract(body,'$.ended')>=?2
                         AND {EXECUTOR}=?1 AND {CLAIMED_PRIORITIZED})"
         ),
         params![executor, now() - LEND_IDLE_SECONDS],
-        |r| r.get::<_, bool>(0),
-    )?)
+        |r| r.get(0),
+    )?;
+    Ok(recent.then_some("train-recent"))
 }
 
 /// Whether an attempt row was claimed for an owner now above priority 0.
 const CLAIMED_PRIORITIZED: &str = "json_extract(body,'$.owner') IN
      (SELECT owner FROM owner_priorities WHERE priority>0)";
-
-/// Whether `action` had an attempt `reclaim` stopped: its job is not lent the reserve again.
-fn reclaimed(db: &Connection, action: &str) -> Result<bool> {
-    Ok(db.query_row(
-        "SELECT EXISTS (SELECT 1 FROM attempts WHERE action=? AND json_extract(body,'$.stop')=?)",
-        params![action, RECLAIMED],
-        |r| r.get(0),
-    )?)
-}
 
 /// Whether an attempt row is prioritized, as `held_unprioritized` counts it.
 const PRIORITIZED: &str =
@@ -371,12 +373,15 @@ pub struct Choice {
     pub reservation: Reservation,
     pub timeout_seconds: u64,
     /// Work of priority 0 or below that may be lent the reserve now: the executor's reserve is
-    /// applied and lent (`reserve_lent`), the job's remembered passes all ended within
-    /// `LEND_SECONDS` (`Durations::lendable`), and no attempt of it was reclaimed (`reclaimed`).
-    /// It takes the reserve only when what the reserve leaves has no room for it (`Load::lends`).
-    /// A choice of an owner above 0 never is: that owner's queued work keeps the reserve from
-    /// being lent at all.
+    /// applied and lent (`lend_block`), and the job's remembered passes all ended within
+    /// `LEND_SECONDS` (`Durations::unlendable`). A job reclaimed before may be lent again. It
+    /// takes the reserve only when what the reserve leaves has no room for it (`Load::lends`). A
+    /// choice of an owner above 0 never is: that owner's queued work keeps the reserve from being
+    /// lent at all.
     pub lent: bool,
+    /// On an executor with a reserve, why the job may not be lent it now (`waiting`); None when it
+    /// may, or without a reserve.
+    pub unlent: Option<&'static str>,
 }
 
 pub struct Selection {
@@ -393,6 +398,10 @@ pub struct Selection {
     pub alone: bool,
     /// Profiles of admissible work the executor has not verified (at most 32).
     pub unverified: Vec<String>,
+    /// Queued work this executor may run that it skips, and why (at most `MAX_WAITING`): larger
+    /// than the executor (`capacity`), or than what the reserve leaves while it may not be lent
+    /// (`lanes-share`, with the lending condition that fails).
+    pub skipped: Vec<Value>,
     /// Capacity held for prioritized work this executor could run once a running dependency
     /// passes (the train-first hold): what it needs, per priority.
     pub hold: BTreeMap<i64, Reservation>,
@@ -450,7 +459,11 @@ pub fn select(
         .collect();
     let priorities = owner_priorities(db)?;
     let reserve = applied(reserve(db, &record.id)?, capacity);
-    let lending = reserve.is_some() && reserve_lent(db, &record.id)?;
+    let lend_block = match reserve {
+        Some(_) => lend_block(db, &record.id)?,
+        None => None,
+    };
+    let mut skipped = Vec::new();
     let mut profiles = BTreeMap::new();
     let mut unverified = Vec::new();
     let mut choices = Vec::new();
@@ -472,6 +485,9 @@ pub fn select(
         let (reservation, timeout_seconds) = budget(db, &mut profiles, &action)?;
         // Work this executor can never fit must not idle it behind the head.
         if reservation.slots > capacity.slots || reservation.memory_mb > capacity.memory_mb {
+            if skipped.len() < MAX_WAITING {
+                skipped.push(json!({"action":action.id,"reason":"capacity"}));
+            }
             continue;
         }
         let mut stmt =
@@ -482,7 +498,10 @@ pub fn select(
         // Work of an owner at priority 0 or below that what the reserve leaves can never fit must
         // not idle the executor behind it either, unless it may be lent the reserve and fits that;
         // an owner above 0 may still run the same action in the reserve.
-        let lent = lending && durations.lendable(&action) && !reclaimed(db, &action.id)?;
+        // Why the job may not be lent the reserve now: its history first, as that outlasts a
+        // train.
+        let unlent = reserve.and_then(|_| durations.unlendable(&action).or(lend_block));
+        let lent = reserve.is_some() && unlent.is_none();
         let beyond = |room: Reservation| {
             reservation.slots > room.slots || reservation.memory_mb > room.memory_mb
         };
@@ -577,6 +596,12 @@ pub fn select(
         for owner in owners {
             let priority = priorities.get(&owner).copied().unwrap_or(0);
             if beyond_reserve(priority) {
+                if skipped.len() < MAX_WAITING {
+                    skipped.push(
+                        json!({"action":action.id,"owner":owner,"reason":"lanes-share",
+                        "lending":unlent.unwrap_or("larger-than-reserve")}),
+                    );
+                }
                 continue;
             }
             let served = db
@@ -592,6 +617,7 @@ pub fn select(
                 reservation,
                 timeout_seconds,
                 lent,
+                unlent,
             };
             choices.push((priority, served, rank, trusted, choice));
         }
@@ -647,6 +673,7 @@ pub fn select(
         later,
         alone,
         unverified,
+        skipped,
         hold,
         freed,
         reserve,
@@ -1022,15 +1049,18 @@ impl Durations {
         self.estimate(action).map(|estimate| estimate.median)
     }
 
-    /// Whether the job may be lent the reserve: the row `expected` takes its median of holds at
-    /// least `LEND_PASSES` remembered passes, and the longest ended within `LEND_SECONDS`, so a
-    /// job with some quick and some long passes is not (#4204 in-lane adversary P2, gate P3-7).
-    /// Rows are per profile and job, not per executor, and a profile without its own takes its
-    /// lineage's.
-    fn lendable(&self, action: &Action) -> bool {
-        self.estimate(action).is_some_and(|estimate| {
-            estimate.passes >= LEND_PASSES && estimate.longest < LEND_SECONDS
-        })
+    /// Why the job may not be lent the reserve, if it may not: the row `expected` takes its median
+    /// of must hold at least `LEND_PASSES` remembered passes (`no-history`, `too-few-passes`), and
+    /// the longest must have ended within `LEND_SECONDS` (`too-long`), so a job with some quick
+    /// and some long passes is not lent (#4204 in-lane adversary P2, gate P3-7). Rows are per
+    /// profile and job, not per executor, and a profile without its own takes its lineage's.
+    fn unlendable(&self, action: &Action) -> Option<&'static str> {
+        match self.estimate(action) {
+            None => Some("no-history"),
+            Some(estimate) if estimate.passes < LEND_PASSES => Some("too-few-passes"),
+            Some(estimate) if estimate.longest >= LEND_SECONDS => Some("too-long"),
+            Some(_) => None,
+        }
     }
 
     /// The row of the action's own profile and job, else the newest of its lineage's.
@@ -1223,101 +1253,20 @@ pub fn claim_for(
         hold,
         freed,
         reserve,
+        ..
     } = select(&transaction, &record, scope, &verified, &refused, capacity)?;
-    let held = held(&transaction, executor)?;
-    // Only a reserve reads them.
-    let (unprioritized, lent) = match reserve {
-        Some(_) => (
-            held_unprioritized(&transaction, executor)?,
-            held_lent(&transaction, executor)?,
-        ),
-        None => (
-            held,
-            Reservation {
-                slots: 0,
-                memory_mb: 0,
-            },
-        ),
+    let current = current_load(&transaction, executor, reserve, freed)?;
+    let admission = Admission {
+        capacity,
+        reserve,
+        hold: &hold,
     };
-    let current = Load {
-        held,
-        unprioritized,
-        lent,
-        freed,
-    };
-    let left = reserve.map(|reserve| unreserved(capacity, reserve));
-    // The standing reserve (#4204, trains 92 and 95): work no owner above priority 0 wants is
-    // admitted only within what the reserve leaves, beside the other such work held here, so a
-    // train's first job fits when it is submitted whatever lanes claimed just before. While the
-    // reserve is lent, short work that does not fit there may take the reserve itself, beside the
-    // other work lent it here; work lent the reserve never counts against what it leaves.
-    let beside_reserve = |choice: &Choice, load: &Load| match (reserve, left) {
-        (Some(reserve), Some(left)) if choice.priority <= 0 => {
-            fits(load.unprioritized, choice.reservation, left)
-                || (choice.lent && fits(load.lent, choice.reservation, reserve))
-        }
-        _ => true,
-    };
-    // A head is admitted only beside the demand of the higher priorities waiting (gate P3-1): a
-    // train never holds back its own jobs, and a lower train waits only for the higher ones.
-    let holding = |priority: i64| {
-        let demand = hold.range(priority + 1..).fold(
-            Reservation {
-                slots: 0,
-                memory_mb: 0,
-            },
-            |sum, (_, need)| Reservation {
-                slots: sum.slots.saturating_add(need.slots),
-                memory_mb: sum.memory_mb.saturating_add(need.memory_mb),
-            },
-        );
-        (demand.slots > 0 || demand.memory_mb > 0).then_some(demand)
-    };
-    let beside_hold = |choice: &Choice, load: &Load| {
-        holding(choice.priority).is_none_or(|demand| {
-            // Only dependencies higher priorities wait on free room for this head.
-            let freed = load
-                .freed
-                .iter()
-                .filter(|(priority, _)| *priority > choice.priority)
-                .fold(
-                    Reservation {
-                        slots: 0,
-                        memory_mb: 0,
-                    },
-                    |sum, (_, need)| Reservation {
-                        slots: sum.slots.saturating_add(need.slots),
-                        memory_mb: sum.memory_mb.saturating_add(need.memory_mb),
-                    },
-                );
-            fits(
-                Reservation {
-                    slots: load
-                        .held
-                        .slots
-                        .saturating_sub(freed.slots)
-                        .saturating_add(demand.slots),
-                    memory_mb: load
-                        .held
-                        .memory_mb
-                        .saturating_sub(freed.memory_mb)
-                        .saturating_add(demand.memory_mb),
-                },
-                choice.reservation,
-                capacity,
-            )
-        })
-    };
-    let admits = |choice: &Choice, load: &Load| {
-        fits(load.held, choice.reservation, capacity)
-            && beside_hold(choice, load)
-            && beside_reserve(choice, load)
-    };
+    let admits = |choice: &Choice, load: &Load| admission.admits(choice, load);
     let blocked = choice
         .as_ref()
-        .filter(|choice| !beside_hold(choice, &current));
+        .filter(|choice| !admission.beside_hold(choice, &current));
     let now_holding = blocked.and_then(|choice| {
-        let demand = holding(choice.priority)?;
+        let demand = admission.holding(choice.priority)?;
         Some(Holding {
             priority: hold.keys().next_back().copied().unwrap_or(choice.priority),
             slots: demand.slots,
@@ -1351,12 +1300,8 @@ pub fn claim_for(
         // admitted now on its own terms that never delays it goes beside it. Not while a hold
         // above the head applies here: a hold lifts wherever the job it keeps room for does not
         // land, and the head would then start at once.
-        Some(head) if holding(head.priority).is_none() => {
-            // Where a choice claimed beside `load` goes: nowhere, or the lanes' share or the
-            // reserve lent (`Load::lends`).
-            let place = |choice: &Choice, load: &Load| {
-                admits(choice, load).then(|| load.lends(choice, left))
-            };
+        Some(head) if admission.holding(head.priority).is_none() => {
+            let place = |choice: &Choice, load: &Load| admission.place(choice, load);
             backfill(&transaction, executor, &head, alone, later, &current, place)?
         }
         _ => None,
@@ -1369,7 +1314,7 @@ pub fn claim_for(
             unverified,
         });
     };
-    let lent = current.lends(&choice, left);
+    let lent = current.lends(&choice, admission.left());
     let created = now();
     let attempt = Attempt {
         id: unique(),
@@ -1426,6 +1371,132 @@ pub fn claim_for(
         fenced: None,
         unverified,
     })
+}
+
+/// What admission counts as held on `executor` now.
+fn current_load(
+    db: &Connection,
+    executor: &str,
+    reserve: Option<Reservation>,
+    freed: Vec<(i64, Reservation)>,
+) -> Result<Load> {
+    let held = held(db, executor)?;
+    // Only a reserve reads them.
+    let (unprioritized, lent) = match reserve {
+        Some(_) => (held_unprioritized(db, executor)?, held_lent(db, executor)?),
+        None => (
+            held,
+            Reservation {
+                slots: 0,
+                memory_mb: 0,
+            },
+        ),
+    };
+    Ok(Load {
+        held,
+        unprioritized,
+        lent,
+        freed,
+    })
+}
+
+/// The rules a choice is admitted by on one executor: its capacity, its reserve, and the holds of
+/// the priorities waiting on running dependencies (`Selection`).
+struct Admission<'a> {
+    capacity: Reservation,
+    reserve: Option<Reservation>,
+    hold: &'a BTreeMap<i64, Reservation>,
+}
+
+impl Admission<'_> {
+    /// What the reserve leaves to work without priority.
+    fn left(&self) -> Option<Reservation> {
+        self.reserve
+            .map(|reserve| unreserved(self.capacity, reserve))
+    }
+
+    /// The standing reserve (#4204, trains 92 and 95): work no owner above priority 0 wants is
+    /// admitted only within what the reserve leaves, beside the other such work held here, so a
+    /// train's first job fits when it is submitted whatever lanes claimed just before. While the
+    /// reserve is lent, short work that does not fit there may take the reserve itself, beside
+    /// the other work lent it here; work lent the reserve never counts against what it leaves.
+    fn beside_reserve(&self, choice: &Choice, load: &Load) -> bool {
+        match (self.reserve, self.left()) {
+            (Some(reserve), Some(left)) if choice.priority <= 0 => {
+                fits(load.unprioritized, choice.reservation, left)
+                    || (choice.lent && fits(load.lent, choice.reservation, reserve))
+            }
+            _ => true,
+        }
+    }
+
+    /// The demand of the priorities above `priority` waiting here, if any: a head is admitted only
+    /// beside it (gate P3-1), so a train never holds back its own jobs, and a lower train waits
+    /// only for the higher ones.
+    fn holding(&self, priority: i64) -> Option<Reservation> {
+        let demand = self.hold.range(priority + 1..).fold(
+            Reservation {
+                slots: 0,
+                memory_mb: 0,
+            },
+            |sum, (_, need)| Reservation {
+                slots: sum.slots.saturating_add(need.slots),
+                memory_mb: sum.memory_mb.saturating_add(need.memory_mb),
+            },
+        );
+        (demand.slots > 0 || demand.memory_mb > 0).then_some(demand)
+    }
+
+    /// Whether `choice` fits beside the hold above its priority. Only dependencies higher
+    /// priorities wait on free room for it.
+    fn beside_hold(&self, choice: &Choice, load: &Load) -> bool {
+        self.holding(choice.priority).is_none_or(|demand| {
+            let freed = load
+                .freed
+                .iter()
+                .filter(|(priority, _)| *priority > choice.priority)
+                .fold(
+                    Reservation {
+                        slots: 0,
+                        memory_mb: 0,
+                    },
+                    |sum, (_, need)| Reservation {
+                        slots: sum.slots.saturating_add(need.slots),
+                        memory_mb: sum.memory_mb.saturating_add(need.memory_mb),
+                    },
+                );
+            fits(
+                Reservation {
+                    slots: load
+                        .held
+                        .slots
+                        .saturating_sub(freed.slots)
+                        .saturating_add(demand.slots),
+                    memory_mb: load
+                        .held
+                        .memory_mb
+                        .saturating_sub(freed.memory_mb)
+                        .saturating_add(demand.memory_mb),
+                },
+                choice.reservation,
+                self.capacity,
+            )
+        })
+    }
+
+    /// Whether `choice` is admitted beside `load`: it fits the executor, the hold and the reserve.
+    fn admits(&self, choice: &Choice, load: &Load) -> bool {
+        fits(load.held, choice.reservation, self.capacity)
+            && self.beside_hold(choice, load)
+            && self.beside_reserve(choice, load)
+    }
+
+    /// Where `choice` claimed beside `load` goes: nowhere, or the lanes' share or the reserve lent
+    /// (`Load::lends`).
+    fn place(&self, choice: &Choice, load: &Load) -> Option<bool> {
+        self.admits(choice, load)
+            .then(|| load.lends(choice, self.left()))
+    }
 }
 
 /// What admission counts as held on an executor.
@@ -3004,7 +3075,7 @@ fn view(db: &Connection, record: &ExecutorRecord) -> Result<Value> {
         })?
         .collect::<rusqlite::Result<_>>()?
     };
-    // `lent`: the reserve is applied and lent now (`reserve_lent`); `lent_held`: what the work it
+    // `lent`: the reserve is applied and lent now (`lend_block`); `lent_held`: what the work it
     // was lent to still holds of it.
     let reserve = match reserve(db, &record.id)? {
         Some(reserve) => {
@@ -3013,7 +3084,7 @@ fn view(db: &Connection, record: &ExecutorRecord) -> Result<Value> {
             let lent_held = held_lent(db, &record.id)?;
             Some(
                 json!({"slots":reserve.slots,"memory_mb":reserve.memory_mb,"applied":applied,
-                "lent":applied && reserve_lent(db, &record.id)?,
+                "lent":applied && lend_block(db, &record.id)?.is_none(),
                 "lent_held":{"slots":lent_held.slots,"memory_mb":lent_held.memory_mb}}),
             )
         }
@@ -3024,9 +3095,93 @@ fn view(db: &Connection, record: &ExecutorRecord) -> Result<Value> {
         "effective":effective,
         "held":{"slots":held.slots,"memory_mb":held.memory_mb,"attempts":attempts},
         "reserve":reserve,
+        "waiting":match effective {
+            Some(capacity) => waiting(db, record, capacity)?,
+            None => Vec::new(),
+        },
         "lease_seconds":record.lease_seconds,"placement":record.placement,
         "observed":record.observed}),
     )
+}
+
+/// Why queued work this executor may run is not admitted there now (#4204 gate 2 P2-1), at most
+/// `MAX_WAITING` entries, judged as a claim would without making one: first the head (`hold`: a
+/// prioritized owner's hold keeps it back; `drain`: it does not fit yet and the executor drains
+/// for it; `lanes-share`: it fits the executor but not what the reserve leaves, and may not be
+/// lent the reserve, with the lending condition that fails), then the work the executor skips
+/// (`Selection::skipped`), then the work behind a head it drains for or holds (`behind`), but for
+/// the one job backfill would start beside it. Judged with the executor's placement and its last
+/// reported verification and refusals: a grant narrower than every project and profile keeps
+/// more from it.
+fn waiting(db: &Connection, record: &ExecutorRecord, capacity: Reservation) -> Result<Vec<Value>> {
+    let refused: BTreeSet<String> = record.observed.refused.keys().cloned().collect();
+    let Selection {
+        choice,
+        later,
+        alone,
+        skipped,
+        hold,
+        freed,
+        reserve,
+        ..
+    } = select(
+        db,
+        record,
+        &Scope::all(),
+        &record.observed.verified,
+        &refused,
+        capacity,
+    )?;
+    let mut waiting = Vec::new();
+    let mut behind = Vec::new();
+    if let Some(head) = choice {
+        let current = current_load(db, &record.id, reserve, freed)?;
+        let admission = Admission {
+            capacity,
+            reserve,
+            hold: &hold,
+        };
+        if !admission.admits(&head, &current) {
+            let mut entry = json!({"action":head.action.id,"owner":head.owner});
+            if !admission.beside_hold(&head, &current) {
+                entry["reason"] = json!("hold");
+                entry["priority"] = json!(hold.keys().next_back());
+            } else if !fits(current.held, head.reservation, capacity) {
+                entry["reason"] = json!("drain");
+            } else {
+                entry["reason"] = json!("lanes-share");
+                entry["lending"] = json!(head.unlent.unwrap_or("reserve-full"));
+            }
+            waiting.push(entry);
+            let queued: Vec<(String, String)> = later
+                .iter()
+                .map(|later| (later.choice.action.id.clone(), later.choice.owner.clone()))
+                .collect();
+            let beside = match admission.holding(head.priority) {
+                None => {
+                    let place = |choice: &Choice, load: &Load| admission.place(choice, load);
+                    backfill(db, &record.id, &head, alone, later, &current, place)?
+                }
+                Some(_) => None,
+            };
+            behind = queued
+                .into_iter()
+                .filter(|(action, owner)| {
+                    beside
+                        .as_ref()
+                        .is_none_or(|beside| beside.action.id != *action || beside.owner != *owner)
+                })
+                .map(|(action, owner)| {
+                    json!({"action":action,"owner":owner,"reason":"behind",
+                           "head":head.action.id})
+                })
+                .collect();
+        }
+    }
+    waiting.extend(skipped);
+    waiting.extend(behind);
+    waiting.truncate(MAX_WAITING);
+    Ok(waiting)
 }
 
 #[cfg(test)]
@@ -5556,10 +5711,6 @@ mod tests {
                 ),
                 "attempts_created",
             ),
-            (
-                "SELECT 1 FROM attempts WHERE action=?1 AND json_extract(body,'$.stop')=?2".into(),
-                "attempts_action",
-            ),
         ] {
             crate::worker::set_priority(&store, "train", 1).unwrap();
             let plan: String = store
@@ -5682,8 +5833,8 @@ mod tests {
         .unwrap();
         assert_eq!(state(&store.db, "s-0"), "queued");
         assert_eq!(mindy_claims(&mut store, "k5").as_deref(), Some("prepare"));
-        // Once the train is gone and two minutes have passed, the reserve is lent again, but not
-        // to the reclaimed job: it waits for the lanes' share, and another short job is lent.
+        // Once the train is gone and two minutes have passed, the reclaimed job is lent the
+        // reserve again (gate 2 P2-1): the reclaim spent one of its requeues.
         let prepare = attempt_of(&store.db, "prepare");
         ends(&store, &prepare);
         store
@@ -5691,10 +5842,9 @@ mod tests {
             .execute("UPDATE actions SET state='passed' WHERE id='prepare'", [])
             .unwrap();
         claimed_ago(&store, &prepare, LEND_IDLE_SECONDS + 1.0, None);
-        job_wants(&store, "s-2", "lane", "short", 10.0, (1, 1024));
-        assert_eq!(mindy_claims(&mut store, "k6").as_deref(), Some("s-2"));
-        assert!(store.attempt(&attempt_of(&store.db, "s-2")).unwrap().lent);
-        assert_eq!(state(&store.db, "s-0"), "queued");
+        assert_eq!(mindy_claims(&mut store, "k6").as_deref(), Some("s-0"));
+        assert!(store.attempt(&attempt_of(&store.db, "s-0")).unwrap().lent);
+        assert_eq!(requeues(&store.db, "s-0"), 1);
     }
 
     #[test]
@@ -5759,6 +5909,184 @@ mod tests {
         let reclaimed = events(&store.db, "attempt.reclaimed");
         assert_eq!(reclaimed.len(), 1);
         assert_eq!(reclaimed[0].1["action"], "s-1");
+    }
+
+    #[test]
+    fn a_reclaimed_job_larger_than_the_lanes_share_is_lent_again_once_the_train_is_gone() {
+        // Gate 2 P2-1 (#4204): mindy (4/4096) keeps 3/3072, so lanes have 1/1024, and a short
+        // 2/2048 job runs only when lent the reserve. Reclaimed for the train's 3/3072 prepare,
+        // it is queued again, says why it waits while the train rides and for two minutes after,
+        // and is then lent the reserve again rather than stranded.
+        let (_root, mut store) = lab();
+        register(&store.db, "mindy", 4, 4096);
+        set_reserve(&mut store, "mindy", need((3, 3072))).unwrap();
+        crate::worker::set_priority(&store, "train", 1).unwrap();
+        estimates(&store.db);
+        job_wants(&store, "wide", "lane", "short", 1.0, (2, 2048));
+        let wide = grant(&mut store, "k1");
+        assert!(store.attempt(&wide.attempt.id).unwrap().lent);
+        store
+            .db
+            .execute(
+                "UPDATE attempts SET body=json_set(body,'$.started',?) WHERE id=?",
+                params![now() - LEND_SECONDS - 60.0, wide.attempt.id],
+            )
+            .unwrap();
+        wants(&store, "prepare", "train", 2.0, (3, 3072));
+        assert_eq!(mindy_claims(&mut store, "k2"), None);
+        assert_eq!(state(&store.db, "wide"), "stopping");
+        let report = reclaimed_report(&wide);
+        complete(
+            &mut store,
+            "mindy",
+            &Scope::all(),
+            &report,
+            Outputs::InPlace,
+        )
+        .unwrap();
+        assert_eq!(state(&store.db, "wide"), "queued");
+        assert_eq!(mindy_claims(&mut store, "k3").as_deref(), Some("prepare"));
+        let why = |store: &Store| {
+            waiting_on(store, "mindy")
+                .into_iter()
+                .find(|entry| entry["action"] == "wide")
+                .map(|entry| entry["lending"].clone())
+        };
+        assert_eq!(why(&store), Some(json!("train-has-work")));
+        let prepare = attempt_of(&store.db, "prepare");
+        ends(&store, &prepare);
+        store
+            .db
+            .execute("UPDATE actions SET state='passed' WHERE id='prepare'", [])
+            .unwrap();
+        assert_eq!(why(&store), Some(json!("train-recent")));
+        assert_eq!(mindy_claims(&mut store, "k4"), None);
+        claimed_ago(&store, &prepare, LEND_IDLE_SECONDS + 1.0, None);
+        assert_eq!(why(&store), None);
+        assert_eq!(mindy_claims(&mut store, "k5").as_deref(), Some("wide"));
+        assert!(store.attempt(&attempt_of(&store.db, "wide")).unwrap().lent);
+    }
+
+    /// The `waiting` list `executors` shows for `executor`.
+    fn waiting_on(store: &Store, executor: &str) -> Vec<Value> {
+        list(store)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == executor)
+            .unwrap()["waiting"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn executors_say_why_queued_work_waits_there() {
+        // Gate 2 P2-1: a job that cannot run on an executor never just sits. Local (4/4096) keeps
+        // 3/3072, so lanes have 1/1024; a 2/2048 job fits only lent the reserve, and its history
+        // or a riding train says why it is not. A 4-slot job fits neither share, and a 5-slot one
+        // not local at all.
+        for (samples, train, lending) in [
+            (&[][..], false, "no-history"),
+            (&[60.0][..], false, "too-few-passes"),
+            (&[60.0, 900.0][..], false, "too-long"),
+            (&[60.0, 60.0][..], true, "train-has-work"),
+        ] {
+            let (_root, store) = reserve_lab((3, 3072));
+            if !samples.is_empty() {
+                history(&store.db, "f-1", "x", samples);
+            }
+            if train {
+                train_running(&store, "prepare");
+            }
+            job_wants(&store, "wide", "lane", "x", 1.0, (2, 2048));
+            assert_eq!(
+                waiting_on(&store, LOCAL),
+                [
+                    json!({"action":"wide","owner":"lane","reason":"lanes-share",
+                        "lending":lending})
+                ],
+                "{lending}"
+            );
+        }
+        let (_root, store) = reserve_lab((3, 3072));
+        estimates(&store.db);
+        job_wants(&store, "wider", "lane", "short", 1.0, (4, 1024));
+        job_wants(&store, "huge", "lane", "short", 2.0, (5, 1024));
+        assert_eq!(
+            waiting_on(&store, LOCAL),
+            [
+                json!({"action":"wider","owner":"lane","reason":"lanes-share",
+                       "lending":"larger-than-reserve"}),
+                json!({"action":"huge","reason":"capacity"})
+            ]
+        );
+        // The head: one the lanes' share keeps back, with the lending condition that fails, or
+        // with the reserve lent full.
+        let (_root, mut store) = reserve_lab((2, 2048));
+        estimates(&store.db);
+        job_wants(&store, "l-0", "lane", "long", 1.0, (1, 1024));
+        job_wants(&store, "l-1", "lane", "long", 2.0, (1, 1024));
+        assert_eq!(local_lent_claims(&mut store), ["l-0", "l-1"]);
+        job_wants(&store, "l-2", "lane", "long", 3.0, (1, 1024));
+        assert_eq!(
+            waiting_on(&store, LOCAL),
+            [json!({"action":"l-2","owner":"lane","reason":"lanes-share","lending":"too-long"})]
+        );
+        let (_root, store) = half_of_each_share_held();
+        assert_eq!(
+            waiting_on(&store, LOCAL),
+            [
+                json!({"action":"wide","owner":"lane","reason":"lanes-share",
+                    "lending":"reserve-full"})
+            ]
+        );
+        // A head that does not fit drains the executor: what waits behind it says so, but the job
+        // backfill would start beside it.
+        let (_root, mut store) = mindy_running(&[(6, 9216), (6, 9216)]);
+        wants(&store, "head", "a", 1.0, (6, 9216));
+        wants(&store, "shard", "b", 2.0, (4, 4608));
+        wants(&store, "wide", "c", 3.0, (6, 9216));
+        // As mindy last reported verifying the lab's profile.
+        store
+            .db
+            .execute(
+                "UPDATE executors SET body=json_set(body,'$.observed.verified',json('[\"f-1\"]'))
+                 WHERE id='mindy'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            waiting_on(&store, "mindy"),
+            [
+                json!({"action":"head","owner":"a","reason":"drain"}),
+                json!({"action":"wide","owner":"c","reason":"behind","head":"head"})
+            ]
+        );
+        assert_eq!(mindy_claims(&mut store, "k1").as_deref(), Some("shard"));
+        wants(&store, "shard2", "b", 4.0, (4, 4608));
+        assert_eq!(
+            waiting_on(&store, "mindy"),
+            [
+                json!({"action":"head","owner":"a","reason":"drain"}),
+                json!({"action":"wide","owner":"c","reason":"behind","head":"head"}),
+                json!({"action":"shard2","owner":"b","reason":"behind","head":"head"})
+            ]
+        );
+        // A prioritized owner's hold keeps the head back.
+        let (_root, mut store) = hold_lab();
+        job_of(&store, "prepare", "train", "running", (1, 1), &[]);
+        job_of(&store, "shard", "train", "queued", (1, 2048), &["prepare"]);
+        hold(&store.db, "larger", Some("mindy"), 1, 3072);
+        hold(&store.db, "smaller", Some("mindy"), 1, 1536);
+        job_of(&store, "head", "a", "queued", (1, 2560), &[]);
+        crate::worker::set_priority(&store, "train", 1).unwrap();
+        assert_eq!(mindy_claims(&mut store, "k1"), None);
+        assert_eq!(
+            waiting_on(&store, "mindy"),
+            [json!({"action":"head","owner":"a","reason":"hold","priority":1})]
+        );
     }
 
     #[test]
