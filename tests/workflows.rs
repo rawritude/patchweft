@@ -480,7 +480,11 @@ fn operator_reserve_keeps_local_capacity_for_prioritized_owners() {
         reserve("1", "1024"),
         json!({"executor":"local","slots":1,"memory_mb":1024})
     );
-    assert_eq!(listed(), json!({"slots":1,"memory_mb":1024,"applied":true}));
+    assert_eq!(
+        listed(),
+        json!({"slots":1,"memory_mb":1024,"applied":true,"lent":true,
+               "lent_held":{"slots":0,"memory_mb":0}})
+    );
     lab.call(&[
         "request",
         "--revision",

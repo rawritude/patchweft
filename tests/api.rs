@@ -1996,6 +1996,31 @@ async fn running_on_mindy(lab: &Lab, key: &str) -> (String, String, String) {
     (attempt, lease, action)
 }
 
+/// The action query names why its current attempt was stopped, so a lane tells lent capacity
+/// taken back for a train (`reclaimed`) from a lost executor (lumenloop-ng#4204, gate 2).
+#[tokio::test]
+async fn the_action_query_names_why_its_attempt_was_stopped() {
+    let lab = Lab::new();
+    register_mindy(&lab);
+    let (attempt, _, action) = running_on_mindy(&lab, "stopped").await;
+    let query = Query::Action {
+        action: action.clone(),
+    };
+    let read = |lab: &Lab| lab.api.query(ALICE, &query).unwrap();
+    let running = read(&lab);
+    assert_eq!(
+        (&running["state"], &running["attempt"], &running["stop"]),
+        (&json!("running"), &json!(attempt), &Value::Null)
+    );
+    let store = Store::open(&lab.root).unwrap();
+    patchweft::authority::stopping(&store.db, &action, &attempt, Some("reclaimed")).unwrap();
+    let stopped = read(&lab);
+    assert_eq!(
+        (&stopped["state"], &stopped["attempt"], &stopped["stop"]),
+        (&json!("stopping"), &json!(attempt), &json!("reclaimed"))
+    );
+}
+
 /// A passing report naming a log and `dist/report.txt`.
 fn passing(attempt: &str, lease: &str, log: &[u8], artifact: &[u8]) -> Value {
     let entry = json!({"sha256":hash(artifact),"mode":0o644,"bytes":artifact.len()});

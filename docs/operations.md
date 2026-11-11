@@ -36,7 +36,33 @@ are expected to take, so a new shard does not wait behind every known short job.
 preparation after an upgrade seeds the samples from the passes already recorded.
 Without history every rank is 0 and the oldest goes first. An executor drains for its head: a
 head that does not fit yet keeps smaller jobs back until it does, and ranking makes a long job
-the head more often. A higher-priority owner's job that waits only on a running dependency
+the head more often.
+
+A job queued behind a blocked head still starts beside it (backfill) when all of these hold:
+
+- It is admitted on its own terms: it fits, beside the hold and within the reserve or the lent
+  reserve.
+- It is of the head's own priority.
+- It is another owner's job, or the head's own owner's while no other owner has queued work of
+  that priority that may run on the executor, whatever that work's dependencies: the claim moves
+  its owner's fair share, and another owner's work could then pass the head. This is how a
+  train's small jobs start beside its own blocked shard.
+- It delays nothing ranked before it at that priority: whichever of the executor's running jobs
+  end first, the head and then each job of its priority ranked ahead of it, in rank order, start
+  just as soon as they would without it.
+- No unverified job of that priority is ranked ahead of it, at most 12 jobs are held on the
+  executor, no hold above the head's priority applies there (a hold lifts wherever its job does
+  not land, and the head would then start at once), and its claim would not move the median a
+  job without history is ranked by.
+
+The owner test is per executor while fair share is global, so a backfill of the head's own owner's
+job can move that owner behind another owner on a different executor. The guarantee covers the
+jobs queued and the holds at the time of the claim: a train that arrives, or a hold that starts,
+after a backfill can wait for the backfilled job, as for any lane admission there. On an executor
+with a reserve, lane work backfilled within what the reserve leaves never takes the reserve, and
+lane work backfilled into the lent reserve is bounded by the lending bound (below).
+
+A higher-priority owner's job that waits only on a running dependency
 (every dependency passed or running) holds the capacity it will need on each executor that may
 run it: a lower-priority job is admitted only if it fits beside the demand of the priorities
 above its own, counting the host's running work but not the dependencies being waited on, whose
@@ -52,17 +78,77 @@ The hold has nothing to hold for before a train is submitted, and priority never
 lane work claimed just before a train can keep its first job waiting. A standing reserve covers
 that: `reserve EXECUTOR --slots N --memory-mb M` keeps part of an executor's capacity for owners
 with priority above 0, and `--slots 0 --memory-mb 0` clears it. `patchweft executors` shows it as
-`reserve`, and each change is an `executor.reserve` event. Trains run almost back to back, so
-prioritized work seldom leaves the reserve idle.
+`reserve`, and each change is an `executor.reserve` event. Between trains the reserve would sit
+idle, so it is lent to short lane work (below).
 
-Work no owner above 0 wants never occupies the reserve: it is admitted only if it fits, beside
-the other such work held there, within the capacity less the reserve. Prioritized work running
-there, inside the reserve or beyond it, never counts against what is left to priority 0; the
-whole capacity still bounds everything the executor runs, and a lower-priority head must fit
-beside both the hold and the reserve. A head the reserve keeps back drains the executor as one
-that does not fit yet does; it is not a hold and does not set `holding`. Work of an owner at 0
-or below that is larger than the capacity less the reserve is left to other executors, as work
-larger than an executor is, so it never keeps that executor's smaller work back.
+Work no owner above 0 wants occupies the reserve only while it is lent (below): otherwise it is
+admitted only if it fits, beside the other such work held there, within the capacity less the
+reserve. Prioritized work running there, inside the reserve or beyond it, never counts against
+what is left to priority 0; the whole capacity still bounds everything the executor runs, and a
+lower-priority head must fit beside both the hold and the reserve. A head the reserve keeps back
+drains the executor as one that does not fit yet does; it is not a hold and does not set
+`holding`. Work of an owner at 0 or below that is larger than the capacity less the reserve is
+left to other executors, as work larger than an executor is, so it never keeps that executor's
+smaller work back; only short work that fits the reserve stays while the reserve is lent.
+
+An executor's reserve is lent while no owner above 0 wants any work that is queued, running or
+stopping, on any executor (no train rides), and no attempt for such an owner was claimed or ended
+on that executor in the last 2 minutes. The pause keeps the reserve from being lent in the gap
+between back-to-back trains. It is per executor: a train's last attempt on mindy does not keep
+mauve's reserve from being lent if mauve ran none of that train's work in those 2 minutes. That is
+enough for a reserve host every train touches, and an executor no train used lends at once. A job of an owner at 0 or below may then take the reserve, beside
+the other lent work and up to the reserve's size, if it does not fit the capacity less the
+reserve and its history holds at least two passes, every one under 10 minutes: a job with one
+pass or none is never lent, nor one that mostly takes a minute but sometimes a quarter of an
+hour. History is per profile and job, not per host, so a job quick on one host is lent on a
+slower one too, and after a profile change it comes from the previous profile of the same name
+(lineage) until the new one has passes of its own. Lent work counts against the reserve only,
+never against what the reserve leaves, and its attempt says `"lent": true`. From the first
+prioritized request nothing more is lent; lane work keeps what the reserve leaves while lent work
+drains, and short work larger than that is again left to other executors.
+
+Lent capacity is borrowed. Once a lent job has run 10 minutes while prioritized work on its
+executor does not fit, and that work has been runnable as prioritized work for 10 seconds (since
+the latest of its creation, its dependencies' passes and its owner's last priority change; a few
+polls, so an executor with room takes it first and no lane job is stopped for work another
+executor starts at once), the store stops the fewest lent jobs past that bound whose end makes room for it, the
+oldest first among as few, and records `attempt.reclaimed` with the action, the
+executor, how long it ran and the work it was stopped for. A lane whose job is reclaimed sees its
+attempt stop and end `interrupted` with reason `reclaimed`: nothing failed and no repair opens.
+The job is queued again within the same requeue budget as any interruption, and runs again like
+any other queued lane job: within the lanes' share, or lent the reserve again once lending is
+back on. A reclaimed job may be lent again, within the requeue budget: three requeues, from
+reclaims or other interruptions, and the next reclaim ends it `interrupted` with reason
+`reclaimed`, waiting for an operator's `retry`. A job reclaimed every time is so reclaimed four
+times. A train that arrives while the reserve is lent so waits
+for lent work about 10 minutes at most, plus the stop and the job's cleanup; a remote executor
+learns of the stop at its next renewal, and one that cannot be reached holds the capacity until
+its lease lapses and its drain is reported or confirmed.
+
+Why a job waits shows on `patchweft executors`. Each executor lists, under `waiting`, at most 32
+queued jobs it may run but does not admit now, each with its action, owner and `reason`, and
+`waiting_more` counts the ones left off the list:
+
+- `verify`: the executor's head, whose profile (`profile`) the executor has not verified;
+  nothing is admitted there until it has. After a profile is registered again, this is the first
+  wait to expect.
+- `drain`: the executor's head, which does not fit yet; the executor drains for it.
+- `hold`: the head, kept back by a prioritized owner's hold (`priority`).
+- `lanes-share`: larger than what the reserve leaves to lanes now, and not lent the reserve;
+  `lending` names why: `no-history`, `too-few-passes` (fewer than two), `too-long` (a pass took
+  10 minutes or more), `train-has-work`, `train-recent` (a train's attempt on that executor was
+  claimed or ended in the last 2 minutes), `reserve-full` (what the reserve holds for lent work
+  is taken) or `larger-than-reserve`.
+- `behind`: queued behind the head (`head`) the executor drains for, holds or awaits verification
+  of; the one job backfill would start beside the head is not listed.
+- `capacity`: larger than the executor.
+
+Each executor judges with its placement and the profiles it last reported verified or refused; a
+grant narrower than every project and profile can keep more work from it. A job that every
+executor lists is one nothing will run until the cause changes. `held` shows what runs there,
+`holding` a hold above some priority, and the reserve `applied`, `lent` (the reserve is applied
+and lent now) and `lent_held` (what lent work still holds). The lines lanes read in LANES.md come
+with the cutover's lab PR (below).
 
 A queued action counts as prioritized while any owner above 0 wants it, as it does for ordering,
 and its claim is that owner's. A running attempt counts as prioritized while the owner it was
@@ -318,7 +404,59 @@ Logs, revisions, events, attempts and artifacts are retained in the store.
 `serve` deletes uploads nobody consumed within 24 hours; other automatic retention
 and garbage collection are not implemented. Monitor disk space. Deleting files
 inside the state store can invalidate evidence or replay; there is no supported
-selective pruning command.
+selective pruning command. Nothing prunes the store, on NG's hosts or elsewhere. A future pruner
+is handed off and gated on its own, and may delete only an attempt's directory that is drained,
+past its retention, and neither a dependency of a live action nor a reused result: `logs` reads
+`attempts/<id>/output.log`, and a `local` claim reads its dependencies' artifacts from
+`attempts/<producer>/artifacts`.
+
+### Cutover of the lent reserve (lumenloop-ng#4204)
+
+The change adds an optional `lent` key to attempt bodies, read as false where it is missing, and
+two indexes on `attempts` and a small one on `events` (priority changes only) that the first open
+after the upgrade builds. No table, queue format
+or row changes. The reserve itself is operator state in the store, set with `patchweft reserve`
+and recorded as an `executor.reserve` event; nothing in code or configuration sets it. In-flight
+runs cannot cross the swap: `worker` refuses to start while the previous binary's attempts are
+held, so drain first. The chief names the moment.
+
+Cutover, as one window:
+
+1. No train riding, after #4772, #4773 and #4779 land.
+2. Stop accepting work and drain mauve, mindy and pw-robin.
+3. Back up the whole state directory.
+4. Install the one binary on the API server, on all three executors and on every remote client
+   binary the lanes use, together.
+5. Register the new profile (v28) and grant it.
+6. Repoint the 16 lane configs. Cancel or resubmit anything still queued under v27, which
+   `patchweft executors` lists as refused.
+7. Run one proving train. It is cold, so every job executes.
+8. Set mauve's reserve (its executor is `local`): `patchweft --state ~/state reserve --slots 8
+   --memory-mb 18432 local`. Confirm that
+   `patchweft executors` shows it with `"applied": true`: a reserve that meets the effective
+   capacity, for example under a lower cgroup limit, is not applied.
+9. Merge the cutover's lab PR (lumenloop/ng-ci-lab#90): `pw-ng.py` reads an attempt that ended `interrupted` with reason
+   `reclaimed` as HELD for a lane check, never FAIL (the lane did not cause it, and its job runs
+   again), and LANES.md gains the lines on why a job waits (`waiting` on `executors`) and on
+   reclaimed jobs.
+
+What can go wrong: a missed v27 queued action sits refused; the reserve does not apply under the
+cgroup limit; the cold proving train runs long; lending turns on in gaps during that cold window,
+using v27's estimates by lineage.
+
+Rollback:
+
+1. Drain.
+2. Reinstall the old binary everywhere. The old binary reads `"lent": true` bodies, and the
+   drain leaves none held; the indexes stay and are harmless.
+3. Repoint the 16 lane configs back to v27, which is still registered.
+4. Cancel or resubmit work queued under v28.
+5. Put mauve's reserve back to the stopgap: `patchweft --state ~/state reserve --slots 8
+   --memory-mb 9216 local`.
+   The old binary cannot lend, so 18432 MiB would bring back the 40 to 50 minute lane queueing.
+
+What can go wrong: forgetting step 5, and v28 work left queued and refused. v28's samples stay
+in `job_estimates`, and v27's own rows come first, so its estimates stay sane.
 
 ## Connections and limits
 
@@ -332,6 +470,10 @@ its mirror's newest revisions as `have`, so each new commit is fetched once per
 project and host. Bundles are limited to 1 GiB. Incremental uploads are possible
 when the server already has the prerequisites. Large histories, Git packing,
 disk pressure and network bandwidth can dominate request time.
+
+The API listener probes idle connections (60 s, then every 15 s, 4 probes) and, on Linux,
+closes one whose data has gone unacknowledged for 2 minutes. That also resets a live client that
+stops reading for more than 2 minutes; `events --follow` then reconnects from its last event.
 
 The API has bounded calls, blocking operations, streams, transfers and pending
 actions. Each artifact or log file is limited to 1 GiB and an attempt's outputs to
