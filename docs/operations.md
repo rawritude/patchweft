@@ -125,8 +125,12 @@ learns of the stop at its next renewal, and one that cannot be reached holds the
 its lease lapses and its drain is reported or confirmed.
 
 Why a job waits shows on `patchweft executors`. Each executor lists, under `waiting`, at most 32
-queued jobs it may run but does not admit now, each with its action, owner and `reason`:
+queued jobs it may run but does not admit now, each with its action, owner and `reason`, and
+`waiting_more` counts the ones left off the list:
 
+- `verify`: the executor's head, whose profile (`profile`) the executor has not verified;
+  nothing is admitted there until it has. After a profile is registered again, this is the first
+  wait to expect.
 - `drain`: the executor's head, which does not fit yet; the executor drains for it.
 - `hold`: the head, kept back by a prioritized owner's hold (`priority`).
 - `lanes-share`: larger than what the reserve leaves to lanes now, and not lent the reserve;
@@ -134,8 +138,8 @@ queued jobs it may run but does not admit now, each with its action, owner and `
   10 minutes or more), `train-has-work`, `train-recent` (a train's attempt on that executor was
   claimed or ended in the last 2 minutes), `reserve-full` (what the reserve holds for lent work
   is taken) or `larger-than-reserve`.
-- `behind`: queued behind the head (`head`) the executor drains for or holds; the one job backfill
-  would start beside the head is not listed.
+- `behind`: queued behind the head (`head`) the executor drains for, holds or awaits verification
+  of; the one job backfill would start beside the head is not listed.
 - `capacity`: larger than the executor.
 
 Each executor judges with its placement and the profiles it last reported verified or refused; a

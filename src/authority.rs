@@ -388,9 +388,12 @@ pub struct Choice {
 
 pub struct Selection {
     pub choice: Option<Choice>,
+    /// The head when its profile is not verified here: nothing is admitted until it is
+    /// (`waiting`'s `verify`).
+    pub unverified_head: Option<Choice>,
     /// Every choice after the head, verified or not, in the same order: what a blocked head may
-    /// admit beside it, and the jobs ranked before each that it must not delay (`backfill`). Empty
-    /// while the head is unverified, as it then admits nothing.
+    /// admit beside it, and the jobs ranked before each that it must not delay (`backfill`). A
+    /// claim reads none of it while the head is unverified, as it then admits nothing.
     pub later: Vec<Later>,
     /// Whether the head's owner is the only one with queued work of the head's priority that may
     /// run on this executor, whatever its dependencies' or prerequisites' state, verified or not:
@@ -404,6 +407,8 @@ pub struct Selection {
     /// than the executor (`capacity`), or than what the reserve leaves while it may not be lent
     /// (`lanes-share`, with the lending condition that fails).
     pub skipped: Vec<Value>,
+    /// How many more it skips than `skipped` lists.
+    pub skipped_more: usize,
     /// Capacity held for prioritized work this executor could run once a running dependency
     /// passes (the train-first hold): what it needs, per priority.
     pub hold: BTreeMap<i64, Reservation>,
@@ -466,6 +471,7 @@ pub fn select(
         None => None,
     };
     let mut skipped = Vec::new();
+    let mut skipped_more = 0;
     let mut profiles = BTreeMap::new();
     let mut unverified = Vec::new();
     let mut choices = Vec::new();
@@ -489,6 +495,8 @@ pub fn select(
         if reservation.slots > capacity.slots || reservation.memory_mb > capacity.memory_mb {
             if skipped.len() < MAX_WAITING {
                 skipped.push(json!({"action":action.id,"reason":"capacity"}));
+            } else {
+                skipped_more += 1;
             }
             continue;
         }
@@ -603,6 +611,8 @@ pub fn select(
                         json!({"action":action.id,"owner":owner,"reason":"lanes-share",
                         "lending":unlent.unwrap_or("larger-than-reserve")}),
                     );
+                } else {
+                    skipped_more += 1;
                 }
                 continue;
             }
@@ -643,39 +653,39 @@ pub fn select(
     let mut order = choices
         .into_iter()
         .map(|(_, _, _, trusted, choice)| (trusted, choice));
-    let choice = order
-        .next()
-        .filter(|(trusted, _)| *trusted)
-        .map(|(_, choice)| choice);
+    let (choice, unverified_head) = match order.next() {
+        Some((true, choice)) => (Some(choice), None),
+        Some((false, choice)) => (None, Some(choice)),
+        None => (None, None),
+    };
     let rest: Vec<(bool, Choice)> = order.collect();
     let alone = choice.as_ref().is_some_and(|head| {
         wanting
             .iter()
             .all(|(priority, owner)| *priority != head.priority || *owner == head.owner)
     });
-    let later = match choice {
-        Some(_) => rest
-            .into_iter()
-            .map(|(trusted, choice)| Later {
-                beside: trusted
-                    && !(estimated.contains(&choice.action.id)
-                        && unestimated.contains(&choice.action.profile)),
-                verified: trusted,
-                choice,
-            })
-            .collect(),
-        None => Vec::new(),
-    };
+    let later = rest
+        .into_iter()
+        .map(|(trusted, choice)| Later {
+            beside: trusted
+                && !(estimated.contains(&choice.action.id)
+                    && unestimated.contains(&choice.action.profile)),
+            verified: trusted,
+            choice,
+        })
+        .collect();
     let freed = waited_on
         .into_values()
         .map(|(priority, slots, memory_mb)| (priority, Reservation { slots, memory_mb }))
         .collect();
     Ok(Selection {
         choice,
+        unverified_head,
         later,
         alone,
         unverified,
         skipped,
+        skipped_more,
         hold,
         freed,
         reserve,
@@ -1300,14 +1310,15 @@ pub fn claim_for(
     }
     let admitted = match choice {
         Some(choice) if admits(&choice, &current) => Some(choice),
-        // Drain for the head: later small actions cannot starve its reservation, so only one
-        // admitted now on its own terms that never delays it goes beside it. Not while a hold
-        // above the head applies here: a hold lifts wherever the job it keeps room for does not
-        // land, and the head would then start at once.
-        Some(head) if admission.holding(head.priority).is_none() => {
-            let place = |choice: &Choice, load: &Load| admission.place(choice, load);
-            backfill(&transaction, executor, &head, alone, later, &current, place)?
-        }
+        Some(head) => beside(
+            &transaction,
+            executor,
+            &admission,
+            &head,
+            alone,
+            later,
+            &current,
+        )?,
         _ => None,
     };
     let Some(choice) = admitted else {
@@ -1710,6 +1721,27 @@ fn reclaim(
         }
     }
     Ok(())
+}
+
+/// What goes beside a blocked `head` while its executor drains for it: later small actions cannot
+/// starve its reservation, so only one admitted now on its own terms that never delays it goes
+/// beside it (`backfill`). Nothing while a hold above the head applies here: a hold lifts wherever
+/// the job it keeps room for does not land, and the head would then start at once. `claim_for`
+/// claims it, and `waiting` leaves it out.
+fn beside(
+    db: &Connection,
+    executor: &str,
+    admission: &Admission,
+    head: &Choice,
+    alone: bool,
+    later: Vec<Later>,
+    current: &Load,
+) -> Result<Option<Choice>> {
+    if admission.holding(head.priority).is_some() {
+        return Ok(None);
+    }
+    let place = |choice: &Choice, load: &Load| admission.place(choice, load);
+    backfill(db, executor, head, alone, later, current, place)
 }
 
 /// Which choice after a verified head that `admits` keeps back goes beside it (#4204, lane run
@@ -3137,36 +3169,44 @@ fn view(db: &Connection, record: &ExecutorRecord) -> Result<Value> {
         }
         None => None,
     };
+    let (waiting, waiting_more) = match effective {
+        Some(capacity) => waiting(db, record, capacity)?,
+        None => (Vec::new(), 0),
+    };
     Ok(
         json!({"id":record.id,"configured":{"slots":slots,"memory_mb":memory_mb},
         "effective":effective,
         "held":{"slots":held.slots,"memory_mb":held.memory_mb,"attempts":attempts},
         "reserve":reserve,
-        "waiting":match effective {
-            Some(capacity) => waiting(db, record, capacity)?,
-            None => Vec::new(),
-        },
+        "waiting":waiting,"waiting_more":waiting_more,
         "lease_seconds":record.lease_seconds,"placement":record.placement,
         "observed":record.observed}),
     )
 }
 
 /// Why queued work this executor may run is not admitted there now (#4204 gate 2 P2-1), at most
-/// `MAX_WAITING` entries, judged as a claim would without making one: first the head (`hold`: a
-/// prioritized owner's hold keeps it back; `drain`: it does not fit yet and the executor drains
-/// for it; `lanes-share`: it fits the executor but not what the reserve leaves, and may not be
-/// lent the reserve, with the lending condition that fails), then the work the executor skips
-/// (`Selection::skipped`), then the work behind a head it drains for or holds (`behind`), but for
-/// the one job backfill would start beside it. Judged with the executor's placement and its last
-/// reported verification and refusals: a grant narrower than every project and profile keeps
-/// more from it.
-fn waiting(db: &Connection, record: &ExecutorRecord, capacity: Reservation) -> Result<Vec<Value>> {
+/// `MAX_WAITING` entries and how many more there are, judged as a claim would without making one.
+/// First the head: `verify` (its profile, named, is not verified here, so nothing is admitted),
+/// `hold` (a prioritized owner's hold keeps it back), `drain` (it does not fit yet and the
+/// executor drains for it), or `lanes-share` (it fits the executor but not what the reserve leaves,
+/// and may not be lent the reserve, with the lending condition that fails). Then the work the
+/// executor skips (`Selection::skipped`), then the work behind a head it drains for, holds or
+/// awaits verification of (`behind`), but for the one job `beside` would start beside it. Judged
+/// with the executor's placement and its last reported verification and refusals: a grant
+/// narrower than every project and profile keeps more from it.
+fn waiting(
+    db: &Connection,
+    record: &ExecutorRecord,
+    capacity: Reservation,
+) -> Result<(Vec<Value>, usize)> {
     let refused: BTreeSet<String> = record.observed.refused.keys().cloned().collect();
     let Selection {
         choice,
+        unverified_head,
         later,
         alone,
         skipped,
+        skipped_more,
         hold,
         freed,
         reserve,
@@ -3179,18 +3219,41 @@ fn waiting(db: &Connection, record: &ExecutorRecord, capacity: Reservation) -> R
         &refused,
         capacity,
     )?;
+    let queued: Vec<(String, String)> = later
+        .iter()
+        .map(|later| (later.choice.action.id.clone(), later.choice.owner.clone()))
+        .collect();
+    // The work behind `head`, but for `beside`.
+    let behind = |head: &Choice, beside: Option<&Choice>| -> Vec<Value> {
+        queued
+            .iter()
+            .filter(|(action, owner)| {
+                beside.is_none_or(|beside| beside.action.id != *action || beside.owner != *owner)
+            })
+            .map(|(action, owner)| {
+                json!({"action":action,"owner":owner,"reason":"behind","head":head.action.id})
+            })
+            .collect()
+    };
     let mut waiting = Vec::new();
-    let mut behind = Vec::new();
-    if let Some(head) = choice {
+    let mut after = Vec::new();
+    if let Some(head) = &unverified_head {
+        waiting.push(
+            json!({"action":head.action.id,"owner":head.owner,"reason":"verify",
+                            "profile":head.action.profile}),
+        );
+        after = behind(head, None);
+    }
+    if let Some(head) = &choice {
         let current = current_load(db, &record.id, reserve, freed)?;
         let admission = Admission {
             capacity,
             reserve,
             hold: &hold,
         };
-        if !admission.admits(&head, &current) {
+        if !admission.admits(head, &current) {
             let mut entry = json!({"action":head.action.id,"owner":head.owner});
-            if !admission.beside_hold(&head, &current) {
+            if !admission.beside_hold(head, &current) {
                 entry["reason"] = json!("hold");
                 entry["priority"] = json!(hold.keys().next_back());
             } else if !fits(current.held, head.reservation, capacity) {
@@ -3200,35 +3263,16 @@ fn waiting(db: &Connection, record: &ExecutorRecord, capacity: Reservation) -> R
                 entry["lending"] = json!(head.unlent.unwrap_or("reserve-full"));
             }
             waiting.push(entry);
-            let queued: Vec<(String, String)> = later
-                .iter()
-                .map(|later| (later.choice.action.id.clone(), later.choice.owner.clone()))
-                .collect();
-            let beside = match admission.holding(head.priority) {
-                None => {
-                    let place = |choice: &Choice, load: &Load| admission.place(choice, load);
-                    backfill(db, &record.id, &head, alone, later, &current, place)?
-                }
-                Some(_) => None,
-            };
-            behind = queued
-                .into_iter()
-                .filter(|(action, owner)| {
-                    beside
-                        .as_ref()
-                        .is_none_or(|beside| beside.action.id != *action || beside.owner != *owner)
-                })
-                .map(|(action, owner)| {
-                    json!({"action":action,"owner":owner,"reason":"behind",
-                           "head":head.action.id})
-                })
-                .collect();
+            let beside = beside(db, &record.id, &admission, head, alone, later, &current)?;
+            after = behind(head, beside.as_ref());
         }
     }
+    let total = waiting.len() + skipped.len() + skipped_more + after.len();
     waiting.extend(skipped);
-    waiting.extend(behind);
+    waiting.extend(after);
     waiting.truncate(MAX_WAITING);
-    Ok(waiting)
+    let more = total - waiting.len();
+    Ok((waiting, more))
 }
 
 #[cfg(test)]
@@ -6050,14 +6094,20 @@ mod tests {
 
     /// The `waiting` list `executors` shows for `executor`.
     fn waiting_on(store: &Store, executor: &str) -> Vec<Value> {
+        listed_executor(store, executor)["waiting"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    /// What `executors` shows for `executor`.
+    fn listed_executor(store: &Store, executor: &str) -> Value {
         list(store)
             .unwrap()
             .as_array()
             .unwrap()
             .iter()
             .find(|entry| entry["id"] == executor)
-            .unwrap()["waiting"]
-            .as_array()
             .unwrap()
             .clone()
     }
@@ -6157,7 +6207,7 @@ mod tests {
                 json!({"action":"shard2","owner":"b","reason":"behind","head":"head"})
             ]
         );
-        // At most 32 are listed, the head first.
+        // At most 32 are listed, the head first, and `waiting_more` counts the rest (gate 3 P3-1).
         let (_root, mut store) = reserve_lab((3, 3072));
         estimates(&store.db);
         job_wants(&store, "l-0", "lane", "long", 1.0, (1, 1024));
@@ -6170,6 +6220,40 @@ mod tests {
         let waiting = waiting_on(&store, LOCAL);
         assert_eq!(waiting.len(), MAX_WAITING);
         assert_eq!(waiting[0]["action"], "l-1");
+        assert_eq!(
+            listed_executor(&store, LOCAL)["waiting_more"],
+            41 - MAX_WAITING
+        );
+        // A head whose profile mindy has not verified keeps everything back until it does: the
+        // list names the profile (gate 3 P3-5), and nothing is more.
+        let (_root, store) = lab();
+        register(&store.db, "mindy", 20, 24576);
+        queue(
+            &store.db,
+            Queue {
+                id: "head",
+                owner: "a",
+                profile: "f-2",
+                ..Queue::default()
+            },
+        );
+        wants(&store, "small", "b", 2.0, (1, 1024));
+        store
+            .db
+            .execute(
+                "UPDATE executors SET body=json_set(body,'$.observed.verified',json('[\"f-1\"]'))
+                 WHERE id='mindy'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            waiting_on(&store, "mindy"),
+            [
+                json!({"action":"head","owner":"a","reason":"verify","profile":"f-2"}),
+                json!({"action":"small","owner":"b","reason":"behind","head":"head"})
+            ]
+        );
+        assert_eq!(listed_executor(&store, "mindy")["waiting_more"], 0);
         // A prioritized owner's hold keeps the head back.
         let (_root, mut store) = hold_lab();
         job_of(&store, "prepare", "train", "running", (1, 1), &[]);
