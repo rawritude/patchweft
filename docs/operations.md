@@ -42,18 +42,34 @@ A job queued behind a blocked head still starts beside it (backfill) when all of
 
 - It is admitted on its own terms: it fits, beside the hold and within the reserve or the lent
   reserve.
-- It is of the head's own priority.
-- It is another owner's job, or the head's own owner's while no other owner has queued work of
-  that priority that may run on the executor, whatever that work's dependencies: the claim moves
-  its owner's fair share, and another owner's work could then pass the head. This is how a
-  train's small jobs start beside its own blocked shard.
-- It delays nothing ranked before it at that priority: whichever of the executor's running jobs
-  end first, the head and then each job of its priority ranked ahead of it, in rank order, start
-  just as soon as they would without it.
-- No unverified job of that priority is ranked ahead of it, at most 12 jobs are held on the
-  executor, no hold above the head's priority applies there (a hold lifts wherever its job does
-  not land, and the head would then start at once), and its claim would not move the median a
-  job without history is ranked by.
+- It is of the head's own priority, or of a lower one when the head is prioritized (a lane job
+  beside a train's head). Never of a higher one.
+- Of the head's priority: it is another owner's job, or the head's own owner's while no other
+  owner has queued work of that priority that may run on the executor, whatever that work's
+  dependencies: the claim moves its owner's fair share, and another owner's work could then pass
+  the head. This is how a train's small jobs start beside its own blocked shard.
+- Of a lower priority: its history holds at least two passes, every one under 10 minutes, as for
+  lending, so that work no proof can see (the next train, a requeue, a restarted train) waits for
+  it about 10 minutes; if its history was wrong and it runs past 10 minutes while prioritized work
+  that does not fit is waiting on the executor, it is reclaimed as lent work is (below), so the
+  wait stays about that bound and not the job's timeout; no job of a higher priority than its own that fits now is ranked
+  ahead of it (a train's job that fits never waits for a lane's); and it is among the first 8
+  such jobs the claim tries, which keeps a claim's cost flat however many lane jobs wait.
+- It delays nothing ranked before it: whichever of the executor's running jobs end first, the
+  head and then each job ranked ahead of it, in rank order, start just as soon as they would
+  without it. A lower-priority job must also leave each higher-priority job ranked ahead of it
+  that is not reached in rank order the room it would find without it, as the train's own
+  backfill could start it out of order. And it must leave, in each of those cases, the room a train's
+  queued work that is not ready yet would find without it: the hold for jobs waiting on a running
+  dependency (that dependency's own room counted as freed while it runs here), and the prioritized
+  jobs waiting on a dependency that has not started, each alone and all of them together with the
+  hold.
+- No unverified job is ranked ahead of it, at most 12 jobs are held on the executor, no hold
+  above the head's priority applies there (a hold lifts wherever its job does not land, and the
+  head would then start at once, which no ending of a held job shows the proof), and its claim
+  would not move the median a job without history is ranked by. A hold at the head's own
+  priority never keeps the head back: for a lower-priority job it is demand the proof keeps room
+  for.
 
 The owner test is per executor while fair share is global, so a backfill of the head's own owner's
 job can move that owner behind another owner on a different executor. The guarantee covers the
@@ -107,11 +123,12 @@ never against what the reserve leaves, and its attempt says `"lent": true`. From
 prioritized request nothing more is lent; lane work keeps what the reserve leaves while lent work
 drains, and short work larger than that is again left to other executors.
 
-Lent capacity is borrowed. Once a lent job has run 10 minutes while prioritized work on its
+Lent capacity is borrowed, and so is room a lane job takes beside a train's head through backfill
+(its attempt says `"backfilled": true`). Once such a job has run 10 minutes while prioritized work on its
 executor does not fit, and that work has been runnable as prioritized work for 10 seconds (since
 the latest of its creation, its dependencies' passes and its owner's last priority change; a few
 polls, so an executor with room takes it first and no lane job is stopped for work another
-executor starts at once), the store stops the fewest lent jobs past that bound whose end makes room for it, the
+executor starts at once), the store stops the fewest such jobs past that bound whose end makes room for it, the
 oldest first among as few, and records `attempt.reclaimed` with the action, the
 executor, how long it ran and the work it was stopped for. A lane whose job is reclaimed sees its
 attempt stop and end `interrupted` with reason `reclaimed`: nothing failed and no repair opens.
@@ -141,7 +158,13 @@ queued jobs it may run but does not admit now, each with its action, owner and `
   is taken) or `larger-than-reserve`.
 - `behind`: queued behind the head (`head`) the executor drains for, holds or awaits verification
   of; the one job backfill would start beside the head is not listed.
+- `unproven`: a lane job behind a train's head (`head`) whose history (`history`: `no-history`,
+  `too-few-passes` or `too-long`) does not show it short enough to start beside it.
 - `capacity`: larger than the executor.
+- `share`: a prioritized job larger than what the executor's lane share leaves prioritized work;
+  it runs on another executor.
+- `share-full`: the executor's prioritized head, which fits the executor but not beside the
+  prioritized work already using what the lane share leaves.
 
 Each executor judges with its placement and the profiles it last reported verified or refused; a
 grant narrower than every project and profile can keep more work from it. A job that every
@@ -166,6 +189,73 @@ always keeps some room. An `executor-set` that would lower the capacity to the r
 is refused until the reserve is lowered or cleared. A cgroup limit cannot be refused: while the
 reported limit leaves the reserve no room below it, the reserve is not applied, rather than
 strand other work, and `patchweft executors` shows it with `"applied": false`.
+
+### The lane share
+
+The reserve keeps room for trains; nothing kept room for lanes, and while a train rode they could
+wait for most of the day (#4818: on 11-11, 101 lane jobs queued and none running for 20 minutes).
+`share EXECUTOR --slots N --memory-mb M` keeps part of an executor's capacity for work of owners at
+priority 0 or below, and `--slots 0 --memory-mb 0` clears it. It is operator state in the store,
+read at every claim, and each change is an `executor.share` event; setting or changing it needs no
+restart and no new profile. The default is none, and with none every rule above stands as it is.
+
+With a share on an executor:
+
+- Prioritized work may use only the capacity less the share there. A prioritized job larger than
+  that can never run there: it is skipped there (`share`) and runs on another executor, as a job
+  larger than an executor does.
+- While prioritized work blocks the executor (its head is a prioritized job that is not admitted,
+  verified or not, or a lane head a prioritized owner's hold keeps back), a lane job is admitted
+  into the share whenever what lanes hold there (work lent the reserve aside) and the job fit the
+  share, and the job fits the executor. The first lane job in queue order that fits is taken, so
+  fair share among lanes stands, and never one whose claim would move the median a job without
+  history is ranked by. A lane job the share can hold is drained for: while it does not fit the
+  share's free part, the share takes no other lane job, so a census or prepare sized for it is
+  never starved by small jobs streaming in. A lane job larger than the share never becomes its
+  head, so it never keeps smaller lane work out of the share while a train blocks.
+- When the head is a lane job that does not fit and nothing prioritized blocks, the share takes
+  nothing: the head drains the executor as it always has, so small lane jobs never stream past a
+  large one through the share.
+- Outside the share, everything above stands: the drain, holds, backfill, the reserve, lending and
+  reclaim. Lane work may still use more than the share by those rules.
+
+How they compose on one executor: the reserve and the share never overlap. The reserve is room for
+prioritized work, so it lies within what the share leaves prioritized work; the share is room for
+lanes, so it lies within what the reserve leaves lanes. `share` refuses a share that would not fit
+beside the reserve within the capacity, `reserve` refuses a reserve that would not fit beside the
+share, and `executor-set` refuses a capacity that would not fit them both. Lent work counts against
+the reserve only, never against the share. Backfill's proof (above) judges prioritized work by
+what the share leaves it. Held work is counted by its owner's current priority, so an attempt
+moves between the lanes' and the prioritized sums when its owner's priority changes mid-run; that
+errs conservative, holding more back rather than less, and recovers when the attempt ends.
+
+`share` also refuses a setting that would leave a job with nowhere to run: a job of a profile with
+an action queued or created in the last week, that the executor's grant and placement allow and
+that fits it, that no other executor may run, and that needs more than the share leaves. Another
+executor may run a job when its principal's grant covers the job's profile (and its project, for a
+queued action), its placement allows the job, it does not refuse the profile, the job fits what its
+own share leaves, and it was seen in the last 5 minutes: a host that has not claimed or renewed
+for that long counts as absent, so one host's outage never strands a train's job on another
+through its share. Capacity, placement, grants, sizes and the other hosts change after a share is
+set, so every claim judges it again: while the share would not fit beside the reserve (under a
+lower cgroup limit, say), or would leave no room for a queued prioritized job that only this
+executor may run and that can still run (one behind a failed, canceled or interrupted dependency
+never will), it is not applied and holds nothing back. `patchweft executors` shows the share as
+`share`: `slots`, `memory_mb`, `applied`, `unapplied` (`{"reason":"capacity"}` when the capacity
+alone no longer holds it, `{"reason":"reserve"}` when it does not fit beside the reserve, or
+`{"reason":"strands","action":...}`) while it is not, `held` (what lanes hold there, lent work
+aside) and `leaves` (what prioritized work may use, the reserve within it).
+
+A share that goes unapplied mid-run (a peer goes silent during a train, say) only stops adding:
+lane jobs already in it run until they end, and a train job that now has only this executor left
+waits for them, up to their timeouts. That needs a peer to go silent mid-train, and `executors`
+shows it as `unapplied` with `strands`. This lot does not reclaim them; that is the chief's call.
+
+A share costs trains capacity on that executor even while no lane has work: unlike the reserve,
+it is never lent back. NG's first setting is pw-robin, `share pw-robin --slots 8 --memory-mb
+12800`: with pw-robin at 16 slots and 24576 MiB and no reserve, trains keep 8 slots and 11776 MiB
+there, enough for `vitest-core-3` (6/9216); a train's census (7/12800) is then skipped there and
+runs elsewhere. It stays off until the chief turns it on.
 
 Private working directories prevent accidental workspace sharing, but are not
 a hostile-code sandbox. Native slot and memory declarations do not impose
