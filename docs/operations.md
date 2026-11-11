@@ -106,8 +106,10 @@ prioritized request nothing more is lent; lane work keeps what the reserve leave
 drains, and short work larger than that is again left to other executors.
 
 Lent capacity is borrowed. Once a lent job has run 10 minutes while prioritized work on its
-executor does not fit, the store stops the fewest lent jobs past that bound whose end makes room
-for it, the oldest first among as few, and records `attempt.reclaimed` with the action, the
+executor does not fit, and that work has been runnable for 10 seconds (a few polls, so an
+executor with room takes it first and no lane job is stopped for work another executor starts at
+once), the store stops the fewest lent jobs past that bound whose end makes room for it, the
+oldest first among as few, and records `attempt.reclaimed` with the action, the
 executor, how long it ran and the work it was stopped for. A lane whose job is reclaimed sees its
 attempt stop and end `interrupted` with reason `reclaimed`: nothing failed and no repair opens.
 The job is queued again within the same requeue budget as any interruption, and runs again like

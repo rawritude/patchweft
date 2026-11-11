@@ -1289,9 +1289,11 @@ pub fn claim_for(
         save(&transaction, &record)?;
     }
     // Lent capacity is borrowed (#4204 gate P2-3): prioritized work this executor would run that
-    // does not fit takes it back from lent work that ran past its bound. `reclaim` stops nothing
-    // while the head fits.
-    if let Some(head) = choice.as_ref().filter(|head| head.priority > 0) {
+    // does not fit takes it back from lent work that ran past its bound, once every executor has
+    // had the grace to take it first. `reclaim` stops nothing while the head fits.
+    if let Some(head) = choice.as_ref().filter(|head| head.priority > 0)
+        && now() - runnable_since(&transaction, &head.action)? >= RECLAIM_GRACE_SECONDS
+    {
         reclaim(&transaction, executor, head, &current, admits)?;
     }
     let admitted = match choice {
@@ -1548,6 +1550,31 @@ impl Load {
             freed: self.freed.clone(),
         }
     }
+}
+
+/// How long prioritized work must have been runnable before an executor it does not fit reclaims
+/// lent capacity for it (#4204 gate 2 P2-2). Executors poll about every 2 s, so by then each one
+/// that could run it has been offered it a few times, and one with room has taken it: a lane's
+/// job is never stopped for work another executor starts at once.
+const RECLAIM_GRACE_SECONDS: f64 = 10.0;
+
+/// Since when `action` could have been claimed: its creation, or the end of the last of its
+/// dependencies' passing attempts, whichever is later.
+fn runnable_since(db: &Connection, action: &Action) -> Result<f64> {
+    let mut since = action.created;
+    for dependency in &action.dependencies {
+        let ended: Option<f64> = db
+            .query_row(
+                "SELECT json_extract(t.body,'$.ended') FROM actions a JOIN attempts t
+                 ON t.id=a.attempt WHERE a.id=?",
+                [dependency],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        since = since.max(ended.unwrap_or(since));
+    }
+    Ok(since)
 }
 
 /// Held attempts beyond which a blocked head admits nothing beside it: `backfill` checks every
@@ -6087,6 +6114,64 @@ mod tests {
             waiting_on(&store, "mindy"),
             [json!({"action":"head","owner":"a","reason":"hold","priority":1})]
         );
+    }
+
+    #[test]
+    fn nothing_is_reclaimed_for_a_train_job_another_executor_takes_at_once() {
+        // Gate 2 P2-2 (#4204): mindy holds a job lent past the bound and robin is empty. The
+        // train's prepare was just queued and mindy polls first: within the grace it reclaims
+        // nothing, and robin claims the prepare. Past the grace mindy would have reclaimed.
+        for (queued_ago, reclaimed) in [(0.0, 0), (RECLAIM_GRACE_SECONDS + 1.0, 1)] {
+            let (_root, mut store, _) = lent_on_mindy([LEND_SECONDS + 60.0, 60.0]);
+            register(&store.db, "robin", 4, 4096);
+            wants(&store, "prepare", "train", now() - queued_ago, (1, 1024));
+            assert_eq!(mindy_claims(&mut store, "k1"), None);
+            let case = format!("{queued_ago}");
+            assert_eq!(
+                events(&store.db, "attempt.reclaimed").len(),
+                reclaimed,
+                "{case}"
+            );
+            if reclaimed == 0 {
+                let robin = claim_for(&mut store, "robin", &Scope::all(), &ask("k2", &["f-1"]));
+                assert_eq!(claimed(&robin.unwrap()), Some("prepare"));
+                assert_eq!(state(&store.db, "s-0"), "running");
+            }
+        }
+        // A job queued long ago is runnable only once its dependency passed: the grace runs from
+        // there.
+        for (passed_ago, reclaimed) in [(1.0, 0), (RECLAIM_GRACE_SECONDS + 1.0, 1)] {
+            let (_root, mut store, _) = lent_on_mindy([LEND_SECONDS + 60.0, 60.0]);
+            wants(&store, "prepare", "train", 0.5, (1, 1));
+            hold(&store.db, "prepare-a", Some("robin"), 1, 1);
+            store
+                .db
+                .execute_batch(&format!(
+                    "UPDATE attempts SET action='prepare',state='passed',drained=1,
+                     body=json_set(body,'$.action','prepare','$.ended',{})
+                     WHERE id='prepare-a';
+                     UPDATE actions SET state='passed',attempt='prepare-a' WHERE id='prepare'",
+                    now() - passed_ago
+                ))
+                .unwrap();
+            queue(
+                &store.db,
+                Queue {
+                    id: "shard",
+                    owner: "train",
+                    created: 1.0,
+                    dependencies: &["prepare"],
+                    ..Queue::default()
+                },
+            );
+            assert_eq!(mindy_claims(&mut store, "k1"), None);
+            let case = format!("{passed_ago}");
+            assert_eq!(
+                events(&store.db, "attempt.reclaimed").len(),
+                reclaimed,
+                "{case}"
+            );
+        }
     }
 
     #[test]
