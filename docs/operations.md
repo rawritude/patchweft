@@ -108,9 +108,10 @@ prioritized request nothing more is lent; lane work keeps what the reserve leave
 drains, and short work larger than that is again left to other executors.
 
 Lent capacity is borrowed. Once a lent job has run 10 minutes while prioritized work on its
-executor does not fit, and that work has been runnable for 10 seconds (a few polls, so an
-executor with room takes it first and no lane job is stopped for work another executor starts at
-once), the store stops the fewest lent jobs past that bound whose end makes room for it, the
+executor does not fit, and that work has been runnable as prioritized work for 10 seconds (since
+the latest of its creation, its dependencies' passes and its owner's last priority change; a few
+polls, so an executor with room takes it first and no lane job is stopped for work another
+executor starts at once), the store stops the fewest lent jobs past that bound whose end makes room for it, the
 oldest first among as few, and records `attempt.reclaimed` with the action, the
 executor, how long it ran and the work it was stopped for. A lane whose job is reclaimed sees its
 attempt stop and end `interrupted` with reason `reclaimed`: nothing failed and no repair opens.
@@ -407,7 +408,8 @@ past its retention, and neither a dependency of a live action nor a reused resul
 ### Cutover of the lent reserve (lumenloop-ng#4204)
 
 The change adds an optional `lent` key to attempt bodies, read as false where it is missing, and
-two indexes on `attempts` that the first open after the upgrade builds. No table, queue format
+two indexes on `attempts` and a small one on `events` (priority changes only) that the first open
+after the upgrade builds. No table, queue format
 or row changes. The reserve itself is operator state in the store, set with `patchweft reserve`
 and recorded as an `executor.reserve` event; nothing in code or configuration sets it. In-flight
 runs cannot cross the swap: `worker` refuses to start while the previous binary's attempts are

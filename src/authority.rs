@@ -99,7 +99,9 @@ pub fn prepare(db: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS attempts_held ON attempts(drained, state);
          CREATE INDEX IF NOT EXISTS attempts_claim_key ON attempts(json_extract(body,'$.claim_key'));
          CREATE INDEX IF NOT EXISTS attempts_created ON attempts(json_extract(body,'$.created'));
-         CREATE INDEX IF NOT EXISTS attempts_ended ON attempts(json_extract(body,'$.ended'));",
+         CREATE INDEX IF NOT EXISTS attempts_ended ON attempts(json_extract(body,'$.ended'));
+         CREATE INDEX IF NOT EXISTS events_priority ON events(subject, time)
+         WHERE kind='owner.priority';",
     )?;
     db.execute(
         "INSERT OR IGNORE INTO executors VALUES (?,?)",
@@ -1292,7 +1294,7 @@ pub fn claim_for(
     // does not fit takes it back from lent work that ran past its bound, once every executor has
     // had the grace to take it first. `reclaim` stops nothing while the head fits.
     if let Some(head) = choice.as_ref().filter(|head| head.priority > 0)
-        && now() - runnable_since(&transaction, &head.action)? >= RECLAIM_GRACE_SECONDS
+        && now() - runnable_since(&transaction, &head.action, &head.owner)? >= RECLAIM_GRACE_SECONDS
     {
         reclaim(&transaction, executor, head, &current, admits)?;
     }
@@ -1576,10 +1578,17 @@ impl Load {
 /// job is never stopped for work another executor starts at once.
 const RECLAIM_GRACE_SECONDS: f64 = 10.0;
 
-/// Since when `action` could have been claimed: its creation, or the end of the last of its
-/// dependencies' passing attempts, whichever is later.
-fn runnable_since(db: &Connection, action: &Action) -> Result<f64> {
-    let mut since = action.created;
+/// Since when `action` could have been claimed as `owner`'s work at its priority: the latest of
+/// its creation, the end of each of its dependencies' passing attempts, and the owner's last
+/// priority change, as an owner lifted to a train's priority by hand gives its old queued work a
+/// new head (#4204 gate 3 P3-3).
+fn runnable_since(db: &Connection, action: &Action, owner: &str) -> Result<f64> {
+    let lifted: Option<f64> = db.query_row(
+        "SELECT MAX(time) FROM events WHERE kind='owner.priority' AND subject=?",
+        [owner],
+        |r| r.get(0),
+    )?;
+    let mut since = action.created.max(lifted.unwrap_or(action.created));
     for dependency in &action.dependencies {
         let ended: Option<f64> = db
             .query_row(
@@ -5763,6 +5772,12 @@ mod tests {
                 ),
                 "attempts_created",
             ),
+            (
+                "SELECT MAX(time) FROM events WHERE kind='owner.priority' AND subject=?1
+                 AND ?2=?2"
+                    .into(),
+                "events_priority",
+            ),
         ] {
             crate::worker::set_priority(&store, "train", 1).unwrap();
             let plan: String = store
@@ -5785,6 +5800,7 @@ mod tests {
         register(&store.db, "mindy", 4, 4096);
         set_reserve(&mut store, "mindy", need((2, 2048))).unwrap();
         crate::worker::set_priority(&store, "train", 1).unwrap();
+        priority_set_ago(&store, "train", 3600.0);
         estimates(&store.db);
         job_wants(&store, "l-0", "lane", "long", 1.0, (1, 1024));
         job_wants(&store, "l-1", "lane", "long", 2.0, (1, 1024));
@@ -5817,6 +5833,17 @@ mod tests {
                 .unwrap();
         }
         (root, store, claims)
+    }
+
+    /// Dates `owner`'s priority changes `seconds` ago.
+    fn priority_set_ago(store: &Store, owner: &str, seconds: f64) {
+        store
+            .db
+            .execute(
+                "UPDATE events SET time=? WHERE kind='owner.priority' AND subject=?",
+                params![now() - seconds, owner],
+            )
+            .unwrap();
     }
 
     /// The report of a supervisor that ended attempt `claim` as reclaimed, drained.
@@ -5939,6 +5966,7 @@ mod tests {
         register(&store.db, "mindy", 6, 6144);
         set_reserve(&mut store, "mindy", need((3, 3072))).unwrap();
         crate::worker::set_priority(&store, "train", 1).unwrap();
+        priority_set_ago(&store, "train", 3600.0);
         estimates(&store.db);
         for index in 0..3 {
             let id = format!("l-{index}");
@@ -5973,6 +6001,7 @@ mod tests {
         register(&store.db, "mindy", 4, 4096);
         set_reserve(&mut store, "mindy", need((3, 3072))).unwrap();
         crate::worker::set_priority(&store, "train", 1).unwrap();
+        priority_set_ago(&store, "train", 3600.0);
         estimates(&store.db);
         job_wants(&store, "wide", "lane", "short", 1.0, (2, 2048));
         let wide = grant(&mut store, "k1");
@@ -6276,6 +6305,69 @@ mod tests {
             let pools = |load: &Load| (load.held, load.unprioritized, load.lent);
             assert_ne!(pools(&with), pools(&load), "{priority} {lent}");
             assert_eq!(pools(&back), pools(&load), "{priority} {lent}");
+        }
+    }
+
+    #[test]
+    fn a_lane_lifted_to_a_trains_priority_gets_the_grace_before_any_reclaim() {
+        // Gate 3 P3-3 (#4204): the chief lifts a lane to train priority by hand. Its job queued an
+        // hour ago becomes prioritized work at the lift: mindy, full of lent work past the bound,
+        // reclaims nothing within the grace, and an empty robin takes the job.
+        for (lifted_ago, reclaimed) in [(0.0, 0), (RECLAIM_GRACE_SECONDS + 1.0, 1)] {
+            let (_root, mut store, _) = lent_on_mindy([LEND_SECONDS + 60.0, 60.0]);
+            register(&store.db, "robin", 4, 4096);
+            wants(&store, "lifted", "chief-lane", now() - 3600.0, (1, 1024));
+            crate::worker::set_priority(&store, "chief-lane", 1).unwrap();
+            priority_set_ago(&store, "chief-lane", lifted_ago);
+            assert_eq!(mindy_claims(&mut store, "k1"), None);
+            let case = format!("{lifted_ago}");
+            assert_eq!(
+                events(&store.db, "attempt.reclaimed").len(),
+                reclaimed,
+                "{case}"
+            );
+            if reclaimed == 0 {
+                let robin = claim_for(&mut store, "robin", &Scope::all(), &ask("k2", &["f-1"]));
+                assert_eq!(claimed(&robin.unwrap()), Some("lifted"));
+            }
+        }
+    }
+
+    #[test]
+    fn reclaim_never_takes_an_old_attempt_of_a_job_now_run_by_another() {
+        // Gate 3 P3-2: s-0's lent attempt lapsed and still awaits its drain on mindy, while its job
+        // was queued again and claimed on robin, which runs or stops it now. Stopping the old
+        // attempt is impossible and its room comes only with an operator's drain: s-1 is reclaimed
+        // for the train instead, and the old attempt does not count as ending.
+        for robin_state in ["running", "stopping"] {
+            let (_root, mut store, claims) =
+                lent_on_mindy([LEND_SECONDS + 120.0, LEND_SECONDS + 60.0]);
+            hold(&store.db, "robin-a", Some("robin"), 1, 1024);
+            store
+                .db
+                .execute(
+                    "UPDATE attempts SET state='interrupted' WHERE id=?",
+                    [&claims["s-0"].attempt.id],
+                )
+                .unwrap();
+            store
+                .db
+                .execute(
+                    "UPDATE actions SET state=?,attempt='robin-a' WHERE id='s-0'",
+                    [robin_state],
+                )
+                .unwrap();
+            wants(&store, "prepare", "train", 9.0, (1, 1024));
+            assert_eq!(mindy_claims(&mut store, "k1"), None, "{robin_state}");
+            let reclaimed: Vec<String> = events(&store.db, "attempt.reclaimed")
+                .into_iter()
+                .map(|(attempt, _)| attempt)
+                .collect();
+            assert_eq!(
+                reclaimed,
+                [claims["s-1"].attempt.id.clone()],
+                "{robin_state}"
+            );
         }
     }
 
