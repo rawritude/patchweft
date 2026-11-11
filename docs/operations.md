@@ -198,31 +198,41 @@ With a share on an executor:
 - Prioritized work may use only the capacity less the share there. A prioritized job larger than
   that can never run there: it is skipped there (`share`) and runs on another executor, as a job
   larger than an executor does.
-- A lane job is admitted into the share whenever what lanes hold there (work lent the reserve
-  aside) and the job fit the share, and the job fits the executor, whatever a prioritized head
-  drains or holds for. The first lane job in queue order that fits is taken, so fair share among
-  lanes stands. A lane job larger than the share never fits it, so it never keeps smaller lane
-  work out of it; it is left to the rules above.
+- While prioritized work blocks the executor (its head is a prioritized job that is not admitted,
+  verified or not, or a lane head a prioritized owner's hold keeps back), a lane job is admitted
+  into the share whenever what lanes hold there (work lent the reserve aside) and the job fit the
+  share, and the job fits the executor. The first lane job in queue order that fits is taken, so
+  fair share among lanes stands, and never one whose claim would move the median a job without
+  history is ranked by. A lane job larger than the share never fits it, so it never keeps smaller
+  lane work out of the share while a train blocks.
+- When the head is a lane job that does not fit and nothing prioritized blocks, the share takes
+  nothing: the head drains the executor as it always has, so small lane jobs never stream past a
+  large one through the share.
 - Outside the share, everything above stands: the drain, holds, backfill, the reserve, lending and
   reclaim. Lane work may still use more than the share by those rules.
 
-How they compose on one executor: the reserve and the share never overlap. The share sits inside
-what the reserve leaves to lanes, and the reserve inside what the share leaves to prioritized work:
-`share` refuses a share that would not fit beside the reserve within the capacity, `reserve`
-refuses a reserve that would not fit beside the share, and `executor-set` refuses a capacity that
-would not fit them both. Lent work counts against the reserve only, never against the share.
-Backfill's proof (above) judges prioritized work by what the share leaves it.
+How they compose on one executor: the reserve and the share never overlap. The reserve is room for
+prioritized work, so it lies within what the share leaves prioritized work; the share is room for
+lanes, so it lies within what the reserve leaves lanes. `share` refuses a share that would not fit
+beside the reserve within the capacity, `reserve` refuses a reserve that would not fit beside the
+share, and `executor-set` refuses a capacity that would not fit them both. Lent work counts against
+the reserve only, never against the share. Backfill's proof (above) judges prioritized work by
+what the share leaves it. Held work is counted by its owner's current priority, so an attempt
+moves between the lanes' and the prioritized sums when its owner's priority changes mid-run; that
+errs conservative, holding more back rather than less, and recovers when the attempt ends.
 
 `share` also refuses a setting that would leave a job with nowhere to run: a job of a profile with
-an action queued or created in the last week, that the executor's placement allows and that fits
-it, that no other executor may run, and that needs more than the share leaves. Another executor
-may run a job when its placement allows it, it does not refuse the profile, the job fits what its
+an action queued or created in the last week, that the executor's grant and placement allow and
+that fits it, that no other executor may run, and that needs more than the share leaves. Another
+executor may run a job when its principal's grant covers the job's profile (and its project, for a
+queued action), its placement allows the job, it does not refuse the profile, the job fits what its
 own share leaves, and it was seen in the last 5 minutes: a host that has not claimed or renewed
 for that long counts as absent, so one host's outage never strands a train's job on another
-through its share. Capacity, placement, sizes and the other hosts change after a share is set, so
-every claim judges it again: while the share would not fit beside the reserve (under a lower
-cgroup limit, say), or would leave a queued prioritized job that only this executor may run no
-room, it is not applied and holds nothing back. `patchweft executors` shows the share as
+through its share. Capacity, placement, grants, sizes and the other hosts change after a share is
+set, so every claim judges it again: while the share would not fit beside the reserve (under a
+lower cgroup limit, say), or would leave no room for a queued prioritized job that only this
+executor may run and that can still run (one behind a failed, canceled or interrupted dependency
+never will), it is not applied and holds nothing back. `patchweft executors` shows the share as
 `share`: `slots`, `memory_mb`, `applied`, `unapplied` (`{"reason":"reserve"}` or
 `{"reason":"strands","action":...}`) while it is not, `held` (what lanes hold there, lent work
 aside) and `leaves` (what prioritized work may use, the reserve within it).

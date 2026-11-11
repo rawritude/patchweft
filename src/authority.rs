@@ -491,7 +491,7 @@ pub fn select(
         .collect();
     let priorities = owner_priorities(db)?;
     let reserve = applied(reserve(db, &record.id)?, capacity);
-    let share = share_state(db, record, capacity, reserve)?.applied;
+    let share = share_state(db, record, (capacity, scope), reserve)?.applied;
     // What a share leaves prioritized work: a prioritized job larger can never run here.
     let leaves = share.map(|share| unreserved(capacity, share));
     let lend_block = match reserve {
@@ -1314,6 +1314,7 @@ pub fn claim_for(
     let refused = request.refused.keys().cloned().collect();
     let Selection {
         choice,
+        unverified_head,
         later,
         alone,
         unverified,
@@ -1367,9 +1368,14 @@ pub fn claim_for(
     {
         reclaim(&transaction, executor, head, &current, admits)?;
     }
-    // The lane share (#4818): the first lane job in order that fits its free part, whatever the
-    // head drains or holds for, when nothing else is admitted.
-    let shared = in_share(&admission, choice.as_ref(), &later, &current);
+    // The lane share (#4818): the first lane job in order that fits its free part, while
+    // prioritized work blocks this executor, when nothing else is admitted.
+    let shared = in_share(
+        &admission,
+        (choice.as_ref(), unverified_head.as_ref()),
+        &later,
+        &current,
+    );
     let admitted = match choice {
         Some(choice) if admits(&choice, &current) => Some(choice),
         Some(head) => beside(
@@ -1840,21 +1846,38 @@ fn reclaim(
     Ok(())
 }
 
-/// The first verified lane job, the head then the rest in order, that fits the lane share's free
-/// part (`Admission::in_share`): so fair share among lanes stands in the share. A lane job larger
-/// than the share's room never fits it, so it never keeps smaller lane work out of the share; it
-/// is left to the normal rules (#4818 review, B3).
+/// The lane job the share starts next, while prioritized work blocks this executor: a prioritized
+/// head (verified or not) that is not admitted, or a lane head a prioritized owner's hold keeps
+/// back. The share gives lanes room the train cannot use; a lane head that merely does not fit
+/// drains the executor as it always has, so a large lane job is never starved by small ones
+/// streaming into the share (#4818 in-lane adversary P2-2). Then it is the first lane job, the
+/// head then the rest in order, that fits the share's free part (`Admission::in_share`), so fair
+/// share among lanes stands; a lane job larger than the share's room never fits it, so it keeps
+/// no smaller lane work out (#4818 review, B3). Like backfill, it never takes a job whose claim
+/// would move the median a job without history ranks by (`Later::beside`): that could reorder the
+/// train.
 fn in_share(
     admission: &Admission,
-    head: Option<&Choice>,
+    (head, unverified_head): (Option<&Choice>, Option<&Choice>),
     later: &[Later],
     current: &Load,
 ) -> Option<Choice> {
+    let blocking = match (head, unverified_head) {
+        (Some(head), _) => {
+            !admission.admits(head, current)
+                && (head.priority > 0 || !admission.beside_hold(head, current))
+        }
+        (None, Some(head)) => head.priority > 0,
+        (None, None) => false,
+    };
+    if !blocking {
+        return None;
+    }
     head.into_iter()
         .chain(
             later
                 .iter()
-                .filter(|later| later.verified)
+                .filter(|later| later.beside)
                 .map(|later| &later.choice),
         )
         .find(|choice| admission.in_share(choice, current))
@@ -3406,9 +3429,44 @@ const SILENT_SECONDS: f64 = 300.0;
 /// used in the last week is one lanes and trains still run.
 const SHARE_PROFILE_SECONDS: f64 = 7.0 * 86400.0;
 
-/// The other executors that may run work now: seen within `SILENT_SECONDS`, each with what its
-/// configured share leaves prioritized work (`unreserved` of its effective capacity).
-fn others(db: &Connection, executor: &str) -> Result<Vec<(ExecutorRecord, Reservation)>> {
+/// The projects and profiles `executor` may claim: everything for `local`, which claims in-process,
+/// and its principal's grant for a remote executor, as the API builds its scope (`api::executor`).
+/// A remote executor without a principal can claim nothing.
+fn grant(db: &Connection, executor: &str) -> Result<Option<Scope>> {
+    if executor == LOCAL {
+        return Ok(Some(Scope::all()));
+    }
+    if !table_exists(db, "api_principals")? {
+        return Ok(None);
+    }
+    let body: Option<String> = db
+        .query_row(
+            "SELECT body FROM api_principals WHERE id=?",
+            [executor],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(body
+        .map(|body| serde_json::from_str::<api::Principal>(&body))
+        .transpose()?
+        .map(|principal| Scope {
+            projects: Some(principal.projects),
+            profiles: Some(principal.profiles),
+        }))
+}
+
+/// Another executor that may run work now, with its grant and what its share leaves prioritized
+/// work.
+struct Other {
+    record: ExecutorRecord,
+    scope: Scope,
+    room: Reservation,
+}
+
+/// The other executors that may run work now: seen within `SILENT_SECONDS` and holding a grant,
+/// each with that grant and what its configured share leaves prioritized work (`unreserved` of its
+/// effective capacity).
+fn others(db: &Connection, executor: &str) -> Result<Vec<Other>> {
     let records: Vec<ExecutorRecord> = {
         let mut stmt = db.prepare("SELECT body FROM executors WHERE id<>? ORDER BY id")?;
         stmt.query_map([executor], |r| r.get::<_, String>(0))?
@@ -3432,33 +3490,57 @@ fn others(db: &Connection, executor: &str) -> Result<Vec<(ExecutorRecord, Reserv
             Some(share) => unreserved(capacity, share),
             None => capacity,
         };
-        others.push((record, room));
+        let Some(scope) = grant(db, &record.id)? else {
+            continue;
+        };
+        others.push(Other {
+            record,
+            scope,
+            room,
+        });
     }
     Ok(others)
 }
 
-/// Whether a prioritized job of `profile` named `job`, reserving `wanted`, may run on one of
-/// `others`: its placement allows the job, it does not refuse the profile, and the job fits what
+/// Whether a prioritized job of `profile` named `job` in `project` (when known), reserving
+/// `wanted`, may run on one of `others`: its grant covers the profile and project (#4818 in-lane
+/// adversary P1-1), its placement allows the job, it does not refuse the profile, and the job fits
+/// what
 /// its share leaves prioritized work.
 fn runs_elsewhere(
-    others: &[(ExecutorRecord, Reservation)],
-    profile: &str,
+    others: &[Other],
+    (profile, project): (&str, Option<&str>),
     job: &str,
     wanted: Reservation,
 ) -> bool {
-    others.iter().any(|(record, room)| {
-        record.placement.permits(job)
-            && !record.observed.refused.contains_key(profile)
-            && !record.observed.refused.contains_key(REFUSE_ALL)
+    others.iter().any(|other| {
+        other.scope.allows_profile(profile)
+            && project.is_none_or(|project| other.scope.allows_project(project))
+            && other.record.placement.permits(job)
+            && !other.record.observed.refused.contains_key(profile)
+            && !other.record.observed.refused.contains_key(REFUSE_ALL)
             && fits(
                 Reservation {
                     slots: 0,
                     memory_mb: 0,
                 },
                 wanted,
-                *room,
+                other.room,
             )
     })
+}
+
+/// Whether `action` can still run: none of its dependencies failed, was canceled or ended
+/// interrupted. A queued action behind one that did stays queued while it is wanted, and must not
+/// keep a share unapplied (#4818 in-lane adversary P2-3).
+fn runnable(db: &Connection, action: &Action) -> Result<bool> {
+    for dependency in &action.dependencies {
+        let state = engine::action_state(db, dependency)?;
+        if ["failed", "canceled", "interrupted"].contains(&state.as_str()) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// A share as a claim applies it: configured, and why it is not applied when it is not.
@@ -3470,15 +3552,16 @@ struct ShareState {
 
 /// Whether the lane share configured on `record` applies at this claim (#4818 review, B1, B4), as
 /// a reserve is applied: it must fit beside the reserve within the capacity (`reserve`), and what
-/// it leaves prioritized work must hold every queued prioritized job that only this executor may
-/// run (`strands`, with the action): a job its placement allows, that it does not refuse and that
-/// fits its capacity, and that no other executor seen lately may run (`runs_elsewhere`). Capacity,
-/// placement, sizes and other executors change after `share` is set, so the check is made at
-/// every claim; while it fails the share holds nothing back.
+/// it leaves prioritized work must hold every queued prioritized job that can still run
+/// (`runnable`) and only this executor may run (`strands`, with the action): a job its grant
+/// (`scope`) and placement allow, that it does not refuse and that fits its capacity, and that no
+/// other executor seen lately may run (`runs_elsewhere`). Capacity, placement, grants, sizes and
+/// other executors change after `share` is set, so the check is made at every claim; while it
+/// fails the share holds nothing back.
 fn share_state(
     db: &Connection,
     record: &ExecutorRecord,
-    capacity: Reservation,
+    (capacity, scope): (Reservation, &Scope),
     reserve: Option<Reservation>,
 ) -> Result<ShareState> {
     let Some(configured) = share(db, &record.id)? else {
@@ -3519,13 +3602,23 @@ fn share_state(
             if !record.placement.permits(&action.job)
                 || refused.contains_key(&action.profile)
                 || refused.contains_key(REFUSE_ALL)
+                || !scope.allows_profile(&action.profile)
             {
+                continue;
+            }
+            let project = project(db, &action.revision)?;
+            if !scope.allows_project(&project) || !runnable(db, &action)? {
                 continue;
             }
             let (wanted, _) = budget(db, &mut profiles, &action)?;
             if fits(nothing, wanted, capacity)
                 && !fits(nothing, wanted, leaves)
-                && !runs_elsewhere(&others, &action.profile, &action.job, wanted)
+                && !runs_elsewhere(
+                    &others,
+                    (&action.profile, Some(&project)),
+                    &action.job,
+                    wanted,
+                )
             {
                 return Ok(unapplied(json!({"reason":"strands","action":action.id})));
             }
@@ -3601,7 +3694,9 @@ pub fn set_share(store: &mut Store, executor: &str, wanted: Reservation) -> Resu
                             size,
                             leaves
                         )
-                        || runs_elsewhere(&others, &profile.id, &job.name, size),
+                        || !grant(&transaction, executor)?
+                            .is_some_and(|scope| scope.allows_profile(&profile.id))
+                        || runs_elsewhere(&others, (&profile.id, None), &job.name, size),
                     "a share of {} slots and {} MiB would leave {}'s {} ({} slots, {} MiB) nowhere \
                      to run: only {executor} may run it",
                     wanted.slots,
@@ -3695,7 +3790,11 @@ fn view(db: &Connection, record: &ExecutorRecord) -> Result<Value> {
     let share = match effective {
         Some(capacity) => {
             let applied_reserve = applied(crate::authority::reserve(db, &record.id)?, capacity);
-            let state = share_state(db, record, capacity, applied_reserve)?;
+            let scope = grant(db, &record.id)?.unwrap_or(Scope {
+                projects: Some(BTreeSet::new()),
+                profiles: Some(BTreeSet::new()),
+            });
+            let state = share_state(db, record, (capacity, &scope), applied_reserve)?;
             match state.configured {
                 Some(configured) => {
                     let lanes = held_unprioritized(db, &record.id)?;
@@ -3807,7 +3906,12 @@ fn waiting(
         unready: &unready,
     };
     // The one job the next claim starts in the lane share, if any.
-    let shared = in_share(&admission, choice.as_ref(), &later, &current);
+    let shared = in_share(
+        &admission,
+        (choice.as_ref(), unverified_head.as_ref()),
+        &later,
+        &current,
+    );
     if let Some(head) = &unverified_head {
         waiting.push(
             json!({"action":head.action.id,"owner":head.owner,"reason":"verify",
@@ -5417,6 +5521,25 @@ mod tests {
         crate::store::insert(&store.db, "profiles", id, &profile).unwrap();
     }
 
+    /// Grants remote `executor` the lab's projects and `profiles`, as `grant` reads a principal.
+    fn granted(store: &Store, executor: &str, profiles: &[&str]) {
+        store
+            .db
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS api_principals (id TEXT PRIMARY KEY, body TEXT NOT NULL)",
+            )
+            .unwrap();
+        let principal = json!({"id":executor,"projects":["p-a","p-b"],"profiles":profiles,
+            "roles":["read","execute"]});
+        store
+            .db
+            .execute(
+                "INSERT INTO api_principals VALUES (?,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body",
+                params![executor, principal.to_string()],
+            )
+            .unwrap();
+    }
+
     /// Marks `executor` seen `ago` seconds ago, as its coordinator's last claim or renewal does.
     fn seen_ago(store: &Store, executor: &str, ago: f64) {
         store
@@ -5437,6 +5560,7 @@ mod tests {
         register(&store.db, "mauve", 20, 26624);
         for executor in ["pw-robin", "mauve"] {
             seen_ago(&store, executor, 1.0);
+            granted(&store, executor, &["f-1", "f-2", "f-3", "ng"]);
         }
         sized_profile(
             &store,
@@ -5537,24 +5661,31 @@ mod tests {
         // Set while mauve could run it, the share is not applied at a claim once mauve cannot:
         // its placement changed, it refuses the profile, or it has not been seen for five minutes. pw-robin then runs the
         // census, and says why the share holds nothing back.
-        for change in ["placement", "silent", "refused"] {
+        for change in ["placement", "silent", "refused", "refuses all", "grant"] {
             let (_root, mut store) = robin_and_mauve();
             set_share(&mut store, "pw-robin", need((8, 12800))).unwrap();
-            if change == "placement" {
-                let mut mauve = load(&store.db, "mauve").unwrap().unwrap();
-                mauve.placement.deny = ["census".to_owned()].into_iter().collect();
-                save(&store.db, &mauve).unwrap();
-            } else if change == "silent" {
-                seen_ago(&store, "mauve", SILENT_SECONDS + 1.0);
-            } else {
+            let refuse = |reason: &str| {
                 store
                     .db
                     .execute(
-                        "UPDATE executors SET body=json_set(body,'$.observed.refused',
-                         json('{\"ng\":\"tool drift\"}')) WHERE id='mauve'",
-                        [],
+                        "UPDATE executors SET body=json_set(body,'$.observed.refused',json(?))
+                         WHERE id='mauve'",
+                        [reason],
                     )
                     .unwrap();
+            };
+            match change {
+                "placement" => {
+                    let mut mauve = load(&store.db, "mauve").unwrap().unwrap();
+                    mauve.placement.deny = ["census".to_owned()].into_iter().collect();
+                    save(&store.db, &mauve).unwrap();
+                }
+                "silent" => seen_ago(&store, "mauve", SILENT_SECONDS + 1.0),
+                "refused" => refuse(r#"{"ng":"tool drift"}"#),
+                "refuses all" => refuse(r#"{"*":"disk full"}"#),
+                // In-lane adversary P1-1: mauve's grant does not cover NG's profile, so it can
+                // never claim the census.
+                _ => granted(&store, "mauve", &["f-1"]),
             }
             ng_wants(&store, "census", "train", "census", 1.0);
             assert_eq!(
@@ -5564,6 +5695,99 @@ mod tests {
             );
             assert_eq!(claims_on(&mut store, "pw-robin"), ["census"], "{change}");
         }
+    }
+
+    #[test]
+    fn a_share_counts_only_train_work_its_own_host_could_run_and_that_can_still_run() {
+        // Only pw-robin may run the census (mauve's placement denies it), yet the share applies:
+        // pw-robin's own grant does not cover NG's profile, or the census waits on a dependency
+        // that failed and will never run (in-lane adversary P2-3), or a train job is larger than
+        // pw-robin itself.
+        for case in ["own grant", "dead", "too large"] {
+            let (_root, mut store) = robin_and_mauve();
+            set_share(&mut store, "pw-robin", need((8, 12800))).unwrap();
+            let mut mauve = load(&store.db, "mauve").unwrap().unwrap();
+            mauve.placement.deny = ["census".to_owned(), "huge".to_owned()]
+                .into_iter()
+                .collect();
+            save(&store.db, &mauve).unwrap();
+            match case {
+                "own grant" => {
+                    granted(&store, "pw-robin", &["f-1"]);
+                    ng_wants(&store, "census", "train", "census", 1.0);
+                }
+                "dead" => {
+                    ng_wants(&store, "prep", "train", "lint", 0.5);
+                    store
+                        .db
+                        .execute("UPDATE actions SET state='failed' WHERE id='prep'", [])
+                        .unwrap();
+                    queue(
+                        &store.db,
+                        Queue {
+                            id: "census",
+                            owner: "train",
+                            profile: "ng",
+                            job: "census",
+                            created: 1.0,
+                            reservation: Some((7, 12800)),
+                            dependencies: &["prep"],
+                            ..Queue::default()
+                        },
+                    );
+                }
+                _ => {
+                    queue(
+                        &store.db,
+                        Queue {
+                            id: "huge",
+                            owner: "train",
+                            profile: "ng",
+                            job: "huge",
+                            reservation: Some((17, 12800)),
+                            ..Queue::default()
+                        },
+                    );
+                }
+            }
+            let share = &listed_executor(&store, "pw-robin")["share"];
+            assert_eq!(share["applied"], true, "{case}: {share}");
+        }
+    }
+
+    #[test]
+    fn without_a_train_in_the_way_a_large_lane_head_drains_the_executor_as_before() {
+        // In-lane adversary P2-2: pw-robin keeps 8/12800 for lanes and runs four 2-slot lane
+        // jobs. A 12-slot lane job is next, with small lane jobs behind it. No prioritized work
+        // blocks pw-robin, so the share takes nothing: the large job drains pw-robin and starts
+        // once two attempts end, before any small job, as with no share.
+        let (_root, mut store) = robin_and_mauve();
+        set_share(&mut store, "pw-robin", need((8, 12800))).unwrap();
+        for index in 0..4 {
+            wants(
+                &store,
+                &format!("run-{index}"),
+                "lane",
+                index as f64,
+                (2, 2048),
+            );
+        }
+        assert_eq!(claims_on(&mut store, "pw-robin").len(), 4);
+        wants(&store, "big", "lane", 10.0, (12, 4096));
+        for index in 0..10 {
+            wants(
+                &store,
+                &format!("small-{index}"),
+                "lane",
+                11.0 + index as f64,
+                (2, 2048),
+            );
+        }
+        assert_eq!(claims_on(&mut store, "pw-robin"), Vec::<String>::new());
+        ends(&store, &attempt_of(&store.db, "run-0"));
+        assert_eq!(claims_on(&mut store, "pw-robin"), Vec::<String>::new());
+        ends(&store, &attempt_of(&store.db, "run-1"));
+        assert_eq!(claims_on(&mut store, "pw-robin"), ["big"]);
     }
 
     #[test]
@@ -5634,8 +5858,8 @@ mod tests {
         // #4818 invariants, over seeded random queues, ends and claims on pw-robin (16/24576)
         // with its 8/12800 share, alone or beside a 4/4096 reserve: never over the capacity;
         // prioritized work never beyond what the share leaves; lent work never beyond the
-        // reserve; and a claim that admits nothing leaves no lane job that fits the share's free
-        // part.
+        // reserve; and a claim that admits nothing beside a train's head leaves no lane job that
+        // fits the share's free part.
         let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
         let mut next = |bound: u64| {
             seed ^= seed << 13;
@@ -5701,7 +5925,19 @@ mod tests {
                             let lent = held_lent(&store.db, "pw-robin").unwrap();
                             assert!(fits(need((0, 0)), lent, reserve), "{case}");
                         }
-                        if claim.claim.is_none() {
+                        let train_head = head_on(&store, "pw-robin").is_some_and(|head| {
+                            store
+                                .db
+                                .query_row(
+                                    "SELECT COUNT(*) FROM interests WHERE action=? AND owner='train'
+                                     AND active=1",
+                                    [&head],
+                                    |r| r.get::<_, i64>(0),
+                                )
+                                .unwrap()
+                                > 0
+                        });
+                        if claim.claim.is_none() && train_head {
                             let mut stmt = store
                                 .db
                                 .prepare(
