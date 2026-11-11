@@ -289,6 +289,10 @@ pub struct Selection {
     /// whether or not its claim would move the median: only a job with no history at all is held
     /// up by it, and only while it is queued.
     pub later: Vec<Choice>,
+    /// Whether the head's owner is the only one with work of the head's priority for this
+    /// executor, verified or not: only then may its own job go beside its blocked head
+    /// (`backfill`), as its claim moves its fair share and nobody is there to pass the head.
+    pub alone: bool,
     /// Profiles of admissible work the executor has not verified (at most 32).
     pub unverified: Vec<String>,
     /// Capacity held for prioritized work this executor could run once a running dependency
@@ -492,8 +496,14 @@ pub fn select(
         .next()
         .filter(|(trusted, _)| *trusted)
         .map(|(_, choice)| choice);
+    let rest: Vec<(bool, Choice)> = order.collect();
+    let alone = choice.as_ref().is_some_and(|head| {
+        rest.iter()
+            .all(|(_, other)| other.priority != head.priority || other.owner == head.owner)
+    });
     let later = match choice {
-        Some(_) => order
+        Some(_) => rest
+            .into_iter()
             .filter(|(trusted, choice)| {
                 *trusted
                     && !(estimated.contains(&choice.action.id)
@@ -510,6 +520,7 @@ pub fn select(
     Ok(Selection {
         choice,
         later,
+        alone,
         unverified,
         hold,
         freed,
@@ -1046,6 +1057,7 @@ pub fn claim_for(
     let Selection {
         choice,
         later,
+        alone,
         unverified,
         hold,
         freed,
@@ -1161,7 +1173,7 @@ pub fn claim_for(
         // land, and the head would then start at once.
         Some(head) if holding(head.priority).is_none() => {
             let admissible = later.into_iter().filter(|choice| admits(choice, &current));
-            backfill(&transaction, executor, &head, admissible, admits)?
+            backfill(&transaction, executor, &head, alone, admissible, admits)?
         }
         _ => None,
     };
@@ -1270,19 +1282,23 @@ const MAX_BACKFILL_HELD: usize = 12;
 /// that would not have delayed it waited). The first in order that is of the head's own priority,
 /// so it never goes ahead of higher work queued behind the head (a lane job beside a train's head
 /// would take the room the train's next job fits in); another owner's, so its claim moves only
-/// that owner's fair share and the head stays the head; and that never delays the head: whichever
-/// of the attempts held here end first, if their end would admit the head, it still does with this
-/// choice held too, so the head starts at the same release as without it. It runs only while no
-/// hold above the head applies, so the head's hold check reads no freed room.
+/// that owner's fair share and the head stays the head, or the head's own owner's when it is
+/// `alone` at that priority here (`Selection::alone`), so no other owner's work can pass the head
+/// as its fair share moves (#4204, train 358: mauve kept 8 slots and 8 GiB idle for 23 minutes
+/// while the train's small jobs waited behind its own 9 GiB group); and that never delays the
+/// head: whichever of the attempts held here end first, if their end would admit the head, it
+/// still does with this choice held too, so the head starts at the same release as without it. It
+/// runs only while no hold above the head applies, so the head's hold check reads no freed room.
 fn backfill(
     db: &Connection,
     executor: &str,
     head: &Choice,
+    alone: bool,
     admissible: impl Iterator<Item = Choice>,
     admits: impl Fn(&Choice, &Load) -> bool,
 ) -> Result<Option<Choice>> {
     let mut beside = admissible
-        .filter(|choice| choice.priority == head.priority && choice.owner != head.owner)
+        .filter(|choice| choice.priority == head.priority && (alone || choice.owner != head.owner))
         .peekable();
     if beside.peek().is_none() {
         return Ok(None);
@@ -4395,16 +4411,77 @@ mod tests {
     }
 
     #[test]
-    fn the_heads_own_owner_is_never_backfilled_beside_it() {
+    fn the_heads_own_owner_is_not_backfilled_beside_it_while_another_owner_has_work_there() {
         // Its small job would not delay the head, but its claim would update the owner's fair
-        // share and put other owners' work ahead of the head.
+        // share and put the other owner's work ahead of the head.
         let (_root, mut store) = mindy_running(&[(6, 9216), (6, 9216)]);
         wants(&store, "head", "a", 1.0, (6, 9216));
         wants(&store, "a-small", "a", 2.0, (1, 1024));
-        assert_eq!(mindy_claims(&mut store, "k1"), None);
         wants(&store, "b-small", "b", 3.0, (1, 1024));
-        assert_eq!(mindy_claims(&mut store, "k2").as_deref(), Some("b-small"));
+        assert_eq!(mindy_claims(&mut store, "k1").as_deref(), Some("b-small"));
         assert_eq!(state(&store.db, "a-small"), "queued");
+        // b's job is running, no longer queued: a is alone again, and its own goes beside.
+        assert_eq!(mindy_claims(&mut store, "k2").as_deref(), Some("a-small"));
+    }
+
+    #[test]
+    fn another_owners_work_that_cannot_go_beside_still_keeps_the_heads_own_owner_back() {
+        // b's job is queued here and would delay the head, so it is not admitted; it could still
+        // pass the head once a's fair share moved, so a's own small job waits too.
+        let (_root, mut store) = mindy_running(&[(6, 9216), (6, 9216)]);
+        wants(&store, "head", "a", 1.0, (6, 9216));
+        wants(&store, "a-small", "a", 2.0, (1, 1024));
+        wants(&store, "b-wide", "b", 3.0, (6, 9216));
+        assert_eq!(mindy_claims(&mut store, "k1"), None);
+        assert_eq!(state(&store.db, "a-small"), "queued");
+        // So does work of b's that this executor has not verified.
+        let (_root, mut store) = mindy_running(&[(6, 9216), (6, 9216)]);
+        wants(&store, "head", "a", 1.0, (6, 9216));
+        wants(&store, "a-small", "a", 2.0, (1, 1024));
+        queue(
+            &store.db,
+            Queue {
+                id: "b-other",
+                owner: "b",
+                profile: "f-2",
+                created: 3.0,
+                reservation: Some((1, 1024)),
+                ..Queue::default()
+            },
+        );
+        assert_eq!(mindy_claims(&mut store, "k1"), None);
+        assert_eq!(state(&store.db, "a-small"), "queued");
+    }
+
+    #[test]
+    fn an_owner_alone_at_its_priority_has_its_own_job_admitted_beside_its_blocked_head() {
+        // Train 358 (#4204): mauve ran two of the train's 9216 MiB shards and kept 8 slots and
+        // 8192 MiB idle for 23 minutes, as the train's next 9216 MiB group was the head and its
+        // smaller jobs waited behind it. The 8192 MiB job fits now, and the head still starts
+        // when either shard ends; a 2048 MiB job beside both would leave the head 2048 MiB short.
+        let (_root, mut store) = lab();
+        register(&store.db, "mauve", 20, 26624);
+        hold(&store.db, "run-0", Some("mauve"), 6, 9216);
+        hold(&store.db, "run-1", Some("mauve"), 6, 9216);
+        crate::worker::set_priority(&store, "train", 1).unwrap();
+        wants(&store, "group", "train", 1.0, (6, 9216));
+        wants(&store, "smokes", "train", 2.0, (4, 8192));
+        wants(&store, "backup", "train", 3.0, (2, 2048));
+        // A lane's job is of another priority: it never goes beside a train's head, and it does
+        // not make the train any less alone at its own.
+        wants(&store, "lane-lint", "lane", 4.0, (1, 1024));
+        let claims = |store: &mut Store, key: &str| {
+            claim_for(store, "mauve", &Scope::all(), &ask(key, &["f-1"]))
+                .unwrap()
+                .claim
+                .map(|claim| claim.action.id)
+        };
+        assert_eq!(claims(&mut store, "k1").as_deref(), Some("smokes"));
+        assert_eq!(claims(&mut store, "k2"), None);
+        assert_eq!(state(&store.db, "backup"), "queued");
+        assert_eq!(state(&store.db, "lane-lint"), "queued");
+        ends(&store, "run-0");
+        assert_eq!(claims(&mut store, "k3").as_deref(), Some("group"));
     }
 
     #[test]
@@ -4476,18 +4553,25 @@ mod tests {
     }
 
     #[test]
-    fn a_trains_blocked_head_is_not_delayed_and_its_own_jobs_wait_behind_it() {
+    fn a_trains_blocked_head_is_not_delayed_by_its_own_job_nor_by_a_lanes() {
         // The shard starts once either attempt ends. The lane's job is of a lower priority, so it
-        // never goes beside the train's head, and the train's own lint keeps its place behind it.
+        // never goes beside the train's head. The train's own job does only if the shard still
+        // starts as soon: its 4608 MiB job would leave the shard 1536 MiB short once the smaller
+        // attempt ends, and its lint would not.
         let (_root, mut store) = mindy_running(&[(6, 12288), (6, 6144)]);
         crate::worker::set_priority(&store, "train", 1).unwrap();
         wants(&store, "shard", "train", 1.0, (6, 9216));
-        wants(&store, "lint", "train", 2.0, (1, 1024));
+        wants(&store, "wide", "train", 2.0, (4, 4608));
         wants(&store, "lane", "lane", 3.0, (4, 4608));
         assert_eq!(mindy_claims(&mut store, "k1"), None);
+        wants(&store, "lint", "train", 4.0, (1, 1024));
+        assert_eq!(mindy_claims(&mut store, "k2").as_deref(), Some("lint"));
+        assert_eq!(mindy_claims(&mut store, "k3"), None);
         ends(&store, "run-1");
         let order = mindy_claims_all(&mut store);
-        assert_eq!(order, ["shard", "lint"]);
+        assert_eq!(order, ["shard"]);
+        assert_eq!(state(&store.db, "wide"), "queued");
+        assert_eq!(state(&store.db, "lane"), "queued");
     }
 
     #[test]
@@ -4500,9 +4584,13 @@ mod tests {
         wants(&store, "shard", "train", 1.0, (6, 9216));
         wants(&store, "tlint", "train", 2.0, (2, 2048));
         wants(&store, "lane", "lane", 3.0, (4, 4608));
-        assert_eq!(mindy_claims(&mut store, "k1"), None);
+        // The train's own lint, alone at its priority here, goes beside its shard: it never
+        // delays it. The lane's job still waits.
+        assert_eq!(mindy_claims(&mut store, "k1").as_deref(), Some("tlint"));
+        assert_eq!(mindy_claims(&mut store, "k2"), None);
+        assert_eq!(state(&store.db, "lane"), "queued");
         ends(&store, "run-0");
-        assert_eq!(mindy_claims_all(&mut store), ["shard", "tlint"]);
+        assert_eq!(mindy_claims_all(&mut store), ["shard"]);
         // A lane's head goes the same way: a job of a priority below it waits too.
         let (_root, mut store) = mindy_running(&[(6, 9216), (6, 9216)]);
         crate::worker::set_priority(&store, "batch", -1).unwrap();

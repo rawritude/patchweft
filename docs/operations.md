@@ -38,7 +38,10 @@ Without history every rank is 0 and the oldest goes first. An executor drains fo
 head that does not fit yet keeps smaller jobs back until it does, and ranking makes a long job
 the head more often. Another owner's job of the head's own priority that is admitted on its own
 terms (it fits, beside the hold and within the reserve) still starts beside the head if, whichever of the executor's running
-jobs end first, the head would start just as soon (backfill). None does with more than 12 jobs
+jobs end first, the head would start just as soon (backfill). The head's own owner's job does too,
+but only while no other owner has work of that priority for the executor: its claim moves its
+owner's fair share, and another owner's work could then pass the head. A train's small jobs so
+start beside its own blocked shard. None does with more than 12 jobs
 held there, while a hold above the head's priority applies there (a hold lifts wherever its job
 does not land, and the head would then start at once), or when its claim would move the median
 a job without history is ranked by. The guarantee covers the head and the holds at the time of
