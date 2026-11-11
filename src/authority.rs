@@ -3659,6 +3659,9 @@ fn share_state(
         slots: 0,
         memory_mb: 0,
     };
+    if !fits(nothing, configured, capacity) {
+        return Ok(unapplied(json!({"reason":"capacity"})));
+    }
     if !fits(nothing, configured, lanes) {
         return Ok(unapplied(json!({"reason":"reserve"})));
     }
@@ -5746,6 +5749,7 @@ mod tests {
             "refuses all",
             "grant",
             "project",
+            "small",
         ] {
             let (_root, mut store) = robin_and_mauve();
             set_share(&mut store, "pw-robin", need((8, 12800))).unwrap();
@@ -5771,6 +5775,12 @@ mod tests {
                 // In-lane adversary P1-1: mauve's grant does not cover NG's profile, or the
                 // census's project, so it can never claim the census.
                 "grant" => granted(&store, "mauve", &["f-1"]),
+                // mauve is too small for the census (#4818 gate P3-1).
+                "small" => {
+                    let mut mauve = load(&store.db, "mauve").unwrap().unwrap();
+                    mauve.memory_mb = Some(8192);
+                    save(&store.db, &mauve).unwrap();
+                }
                 _ => {
                     let principal = json!({"id":"mauve","projects":["p-b"],
                         "profiles":["f-1","ng"],"roles":["read","execute"]});
@@ -6274,6 +6284,32 @@ mod tests {
     }
 
     #[test]
+    fn the_share_never_admits_lane_work_beyond_the_executor() {
+        // #4818 gate P3-1: an 8/8192 executor keeps 2/2048 in reserve and a 4/4096 share. The
+        // train uses all 4/4096 the share leaves it, and a job lent the reserve holds 2/2048. A
+        // 4/4096 lane job fits the share, which lanes do not hold, but not the executor: it waits.
+        let (_root, mut store) = robin_and_mauve();
+        register(&store.db, "x8", 8, 8192);
+        seen_ago(&store, "x8", 1.0);
+        set_reserve(&mut store, "x8", need((2, 2048))).unwrap();
+        set_share(&mut store, "x8", need((4, 4096))).unwrap();
+        wants(&store, "t-run", "train", 0.5, (4, 4096));
+        assert_eq!(claims_on(&mut store, "x8"), ["t-run"]);
+        hold(&store.db, "lent-run", Some("x8"), 2, 2048);
+        store
+            .db
+            .execute(
+                "UPDATE attempts SET body=json_set(body,'$.lent',json('true')) WHERE id='lent-run'",
+                [],
+            )
+            .unwrap();
+        wants(&store, "t-next", "train", 1.0, (1, 1024));
+        wants(&store, "lint", "lane", 2.0, (4, 4096));
+        assert_eq!(claims_on(&mut store, "x8"), Vec::<String>::new());
+        assert_eq!(held(&store.db, "x8").unwrap(), need((6, 6144)));
+    }
+
+    #[test]
     fn a_share_fits_beside_the_reserve_within_the_capacity() {
         // #4818 review B4: share and reserve together never exceed the capacity, whichever is set
         // last, and an executor-set that would shrink the capacity under them is refused.
@@ -6307,6 +6343,20 @@ mod tests {
         assert_eq!(
             listed_executor(&store, "pw-robin")["share"]["unapplied"],
             json!({"reason":"reserve"})
+        );
+        // With no reserve, a cgroup limit below the share itself is named so (#4818 gate P3-4).
+        set_reserve(&mut store, "pw-robin", need((0, 0))).unwrap();
+        store
+            .db
+            .execute(
+                "UPDATE executors SET body=json_set(body,'$.observed.memory_limit_mb',12000)
+                 WHERE id='pw-robin'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            listed_executor(&store, "pw-robin")["share"]["unapplied"],
+            json!({"reason":"capacity"})
         );
         // Cleared, it is gone.
         set_share(&mut store, "pw-robin", need((0, 0))).unwrap();
@@ -6946,6 +6996,51 @@ mod tests {
     }
 
     #[test]
+    fn a_lane_job_beside_a_trains_head_leaves_room_for_each_unready_job_alone() {
+        // #4818 gate P3-1: as above with two unready jobs of 9: once the train's attempt ends the
+        // two never fit together (18 > 16), but the head and either one does (15), and not beside
+        // the 3-slot lane job (18): it waits for each one alone.
+        let (_root, mut store) = robin_and_mauve();
+        for job in ["test", "prep"] {
+            history(&store.db, "f-1", job, &[60.0, 60.0]);
+        }
+        let mut robin = load(&store.db, "pw-robin").unwrap().unwrap();
+        robin.placement.deny = ["prep".to_owned()].into_iter().collect();
+        save(&store.db, &robin).unwrap();
+        wants(&store, "x", "train", 0.5, (13, 1024));
+        assert_eq!(claims_on(&mut store, "pw-robin"), ["x"]);
+        wants(&store, "head", "train", 1.0, (6, 1024));
+        for index in 0..2 {
+            let prep = format!("prep-{index}");
+            queue(
+                &store.db,
+                Queue {
+                    id: &prep,
+                    owner: "train",
+                    job: "prep",
+                    created: 2.0,
+                    reservation: Some((1, 512)),
+                    ..Queue::default()
+                },
+            );
+            queue(
+                &store.db,
+                Queue {
+                    id: &format!("later-{index}"),
+                    owner: "train",
+                    created: 2.0,
+                    reservation: Some((9, 1024)),
+                    dependencies: &[prep.as_str()],
+                    ..Queue::default()
+                },
+            );
+        }
+        wants(&store, "short", "lane", 3.0, (3, 1024));
+        let claims = claim_for(&mut store, "pw-robin", &Scope::all(), &ask("k", &["f-1"]));
+        assert_eq!(claimed(&claims.unwrap()), None);
+    }
+
+    #[test]
     fn a_train_job_beside_a_higher_trains_head_counts_only_higher_work_not_ready() {
         // Train 2's head waits on mindy; train 1's 2/4096 job fits now and delays no job of train
         // 2. Train 1's own job behind a dependency not started would lose its room to it, but a
@@ -7007,6 +7102,37 @@ mod tests {
         assert_eq!(mindy_claims(&mut store, "k1"), None);
         ends(&store, "run-2");
         assert_eq!(mindy_claims(&mut store, "k2").as_deref(), Some("t2"));
+    }
+
+    #[test]
+    fn backfill_across_priorities_protects_only_higher_work_and_marks_only_itself() {
+        // As above, with the 10/512 job a lane's: the proof keeps room only for work of a higher
+        // priority than the candidate's, so the 1/1024 lane job goes beside the train's head
+        // though an earlier lane job could have used the slot, and its attempt is marked
+        // reclaimable. A lane's job backfilled beside a lane's head is not.
+        let (_root, mut store) = mindy_running(&[(5, 9216), (5, 9216), (2, 2048)]);
+        history(&store.db, "f-1", "test", &[60.0, 60.0]);
+        crate::worker::set_priority(&store, "train", 1).unwrap();
+        wants(&store, "head", "train", 1.0, (1, 9216));
+        wants(&store, "wide", "lane-a", 2.0, (10, 512));
+        wants(&store, "lane", "lane-b", 3.0, (1, 1024));
+        assert_eq!(mindy_claims(&mut store, "k1").as_deref(), Some("lane"));
+        assert!(
+            store
+                .attempt(&attempt_of(&store.db, "lane"))
+                .unwrap()
+                .backfilled
+        );
+        let (_root, mut store) = mindy_running(&[(6, 9216), (6, 9216)]);
+        wants(&store, "head", "a", 1.0, (6, 9216));
+        wants(&store, "shard", "b", 2.0, (4, 4608));
+        assert_eq!(mindy_claims(&mut store, "k1").as_deref(), Some("shard"));
+        assert!(
+            !store
+                .attempt(&attempt_of(&store.db, "shard"))
+                .unwrap()
+                .backfilled
+        );
     }
 
     #[test]
@@ -7337,6 +7463,135 @@ mod tests {
                 Some(claimed),
                 "{case}"
             );
+        }
+    }
+
+    /// The no-share regression cell (#4818 gate P3-5): seeded random queues of a train (1), three
+    /// lanes (0) and a batch owner (-1), with train dependency chains, claimed and ended on mindy
+    /// (20/24576 with an 8/9216 reserve) and robin (16/16384). No job has history, so backfill
+    /// across priorities never fires: every claim must be the one v28 (8dbd26c) made.
+    fn no_share_trace(seed: u64) -> String {
+        let (_root, mut store) = lab();
+        register(&store.db, "mindy", 20, 24576);
+        register(&store.db, "robin", 16, 16384);
+        set_reserve(&mut store, "mindy", need((8, 9216))).unwrap();
+        crate::worker::set_priority(&store, "train", 1).unwrap();
+        crate::worker::set_priority(&store, "batch", -1).unwrap();
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut next = |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        let owners = ["train", "lane-a", "lane-b", "lane-c", "batch"];
+        let sizes = [(1, 1024), (2, 2048), (4, 4096), (6, 9216), (8, 12288)];
+        let mut trains: Vec<String> = Vec::new();
+        let mut trace = Vec::new();
+        for step in 0..60 {
+            match next(4) {
+                0 | 1 => {
+                    let id = format!("j{step}");
+                    let owner = owners[next(5) as usize];
+                    let size = sizes[next(5) as usize];
+                    let dependency = (owner == "train" && !trains.is_empty() && next(2) == 0)
+                        .then(|| trains[next(trains.len() as u64) as usize].clone());
+                    let dependencies: Vec<&str> = dependency.iter().map(String::as_str).collect();
+                    queue(
+                        &store.db,
+                        Queue {
+                            id: &id,
+                            owner,
+                            created: step as f64,
+                            reservation: Some(size),
+                            dependencies: &dependencies,
+                            ..Queue::default()
+                        },
+                    );
+                    if owner == "train" {
+                        trains.push(id);
+                    }
+                }
+                2 => {
+                    let oldest: Option<(String, String)> = store
+                        .db
+                        .query_row(
+                            "SELECT id, action FROM attempts WHERE drained=0 ORDER BY rowid LIMIT 1",
+                            [],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        .optional()
+                        .unwrap();
+                    if let Some((attempt, action)) = oldest {
+                        store
+                            .db
+                            .execute(
+                                "UPDATE attempts SET drained=1, state='passed',
+                                 body=json_set(body,'$.result',json('{\"artifacts\":{}}'))
+                                 WHERE id=?",
+                                [&attempt],
+                            )
+                            .unwrap();
+                        store
+                            .db
+                            .execute("UPDATE actions SET state='passed' WHERE id=?", [&action])
+                            .unwrap();
+                    }
+                }
+                _ => {
+                    for executor in ["mindy", "robin"] {
+                        let key = format!("{executor}-{step}");
+                        let response =
+                            claim_for(&mut store, executor, &Scope::all(), &ask(&key, &["f-1"]))
+                                .unwrap();
+                        let claimed = response.claim.map_or("-".into(), |claim| claim.action.id);
+                        trace.push(format!("{executor}:{claimed}"));
+                    }
+                }
+            }
+        }
+        trace.join(" ")
+    }
+
+    #[test]
+    fn with_no_share_and_no_history_every_claim_is_v28s() {
+        // #4818 gate P3-5: the traces 8dbd26c gave for these seeds, recorded with the same cell.
+        let v28: [(u64, &str); 8] = [
+            (
+                1,
+                "mindy:j1 robin:j0 mindy:- robin:- mindy:j6 robin:- mindy:- robin:- mindy:j10 robin:j11 mindy:j17 robin:j25 mindy:j16 robin:j14 mindy:j28 robin:j22 mindy:j35 robin:j24 mindy:j31 robin:j46 mindy:- robin:- mindy:- robin:j29 mindy:- robin:- mindy:j52 robin:- mindy:- robin:-",
+            ),
+            (
+                2,
+                "mindy:- robin:- mindy:j2 robin:j3 mindy:j8 robin:j1 mindy:j17 robin:j13 mindy:j18 robin:j21 mindy:j30 robin:- mindy:j19 robin:j31 mindy:j32 robin:- mindy:j25 robin:j46 mindy:j35 robin:j22 mindy:j44 robin:j39 mindy:j55 robin:j56",
+            ),
+            (
+                3,
+                "mindy:- robin:- mindy:j4 robin:j7 mindy:j1 robin:j5 mindy:j2 robin:- mindy:j13 robin:- mindy:j17 robin:j14 mindy:j24 robin:- mindy:- robin:- mindy:j25 robin:- mindy:j36 robin:j38 mindy:j15 robin:- mindy:- robin:- mindy:- robin:- mindy:j29 robin:-",
+            ),
+            (
+                4,
+                "mindy:j4 robin:j0 mindy:j3 robin:j5 mindy:j11 robin:j8 mindy:j17 robin:j2 mindy:- robin:j19 mindy:j15 robin:- mindy:j20 robin:- mindy:- robin:- mindy:j29 robin:j25 mindy:j38 robin:j39 mindy:- robin:- mindy:- robin:- mindy:- robin:- mindy:- robin:- mindy:j47 robin:- mindy:- robin:- mindy:- robin:- mindy:j53 robin:j58",
+            ),
+            (
+                5,
+                "mindy:j0 robin:j1 mindy:j3 robin:j4 mindy:j10 robin:j12 mindy:j9 robin:j13 mindy:j15 robin:j11 mindy:j27 robin:- mindy:j34 robin:j24 mindy:j17 robin:j30 mindy:j43 robin:j44 mindy:j42 robin:j22 mindy:j50 robin:- mindy:j32 robin:- mindy:j53 robin:-",
+            ),
+            (
+                6,
+                "mindy:- robin:- mindy:- robin:- mindy:j2 robin:- mindy:j4 robin:j6 mindy:j8 robin:- mindy:j12 robin:- mindy:j15 robin:- mindy:j23 robin:j18 mindy:j34 robin:j33 mindy:j37 robin:j17 mindy:j21 robin:- mindy:j42 robin:- mindy:j24 robin:- mindy:j48 robin:j46 mindy:j55 robin:j50 mindy:j35 robin:j57",
+            ),
+            (
+                7,
+                "mindy:- robin:- mindy:- robin:- mindy:- robin:- mindy:j4 robin:j5 mindy:j7 robin:- mindy:j9 robin:j10 mindy:j18 robin:j15 mindy:j20 robin:j19 mindy:j27 robin:j24 mindy:j26 robin:j16 mindy:- robin:- mindy:- robin:- mindy:j35 robin:- mindy:- robin:- mindy:- robin:- mindy:- robin:- mindy:j48 robin:- mindy:- robin:- mindy:- robin:-",
+            ),
+            (
+                8,
+                "mindy:j0 robin:- mindy:j4 robin:- mindy:j8 robin:j7 mindy:j16 robin:j19 mindy:j33 robin:j17 mindy:j40 robin:j10 mindy:j48 robin:- mindy:j11 robin:j51 mindy:- robin:-",
+            ),
+        ];
+        for (seed, trace) in v28 {
+            assert_eq!(no_share_trace(seed), trace, "seed {seed}");
         }
     }
 

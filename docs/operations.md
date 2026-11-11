@@ -241,9 +241,15 @@ set, so every claim judges it again: while the share would not fit beside the re
 lower cgroup limit, say), or would leave no room for a queued prioritized job that only this
 executor may run and that can still run (one behind a failed, canceled or interrupted dependency
 never will), it is not applied and holds nothing back. `patchweft executors` shows the share as
-`share`: `slots`, `memory_mb`, `applied`, `unapplied` (`{"reason":"reserve"}` or
+`share`: `slots`, `memory_mb`, `applied`, `unapplied` (`{"reason":"capacity"}` when the capacity
+alone no longer holds it, `{"reason":"reserve"}` when it does not fit beside the reserve, or
 `{"reason":"strands","action":...}`) while it is not, `held` (what lanes hold there, lent work
 aside) and `leaves` (what prioritized work may use, the reserve within it).
+
+A share that goes unapplied mid-run (a peer goes silent during a train, say) only stops adding:
+lane jobs already in it run until they end, and a train job that now has only this executor left
+waits for them, up to their timeouts. That needs a peer to go silent mid-train, and `executors`
+shows it as `unapplied` with `strands`. This lot does not reclaim them; that is the chief's call.
 
 A share costs trains capacity on that executor even while no lane has work: unlike the reserve,
 it is never lent back. NG's first setting is pw-robin, `share pw-robin --slots 8 --memory-mb
