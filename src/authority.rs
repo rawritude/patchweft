@@ -249,15 +249,17 @@ fn held_where(db: &Connection, executor: &str, condition: &str) -> Result<Reserv
     )?)
 }
 
-/// A job the reserve is lent to is expected to end within this many seconds: a train that arrives
-/// while capacity is lent waits about that long for it at most (chief, #4204, 2026-11-11).
+/// A job the reserve is lent to has ended within this many seconds every time it is remembered to
+/// have passed (`Durations::longest`): a train that arrives while capacity is lent waits about that
+/// long for it, unless the lent job hangs; then it waits for the job's timeout, as nothing
+/// preempts it (chief, #4204, 2026-11-11).
 pub const LEND_SECONDS: f64 = 600.0;
 
 /// Whether an applied reserve is lent: no owner above priority 0 wants any action that is queued,
 /// running or stopping, on any executor (no train rides). A reserve kept while nobody it is for has
-/// work only idles its executor. While it is lent, work without priority expected to end within
-/// `LEND_SECONDS` may take it once what the reserve leaves is full; from the first prioritized
-/// request nothing more is lent, and what was lent ends within about `LEND_SECONDS`.
+/// work only idles its executor. While it is lent, work without priority whose every remembered
+/// pass ended within `LEND_SECONDS` may take it once what the reserve leaves is full; from the
+/// first prioritized request nothing more is lent, and what was lent runs until it ends.
 fn reserve_lent(db: &Connection) -> Result<bool> {
     if !table_exists(db, "owner_priorities")? {
         return Ok(true);
@@ -332,9 +334,9 @@ pub struct Choice {
     pub reservation: Reservation,
     pub timeout_seconds: u64,
     /// Work of priority 0 or below that may be lent the reserve now: the executor's reserve is
-    /// applied and lent (`reserve_lent`), and the job is expected to end within `LEND_SECONDS`. A
-    /// job with no estimate never is. It takes the reserve only when what the reserve leaves has no
-    /// room for it (`Load::lends`).
+    /// applied and lent (`reserve_lent`), and every remembered pass of the job ended within
+    /// `LEND_SECONDS` (`Durations::longest`). A job with none never is. It takes the reserve only
+    /// when what the reserve leaves has no room for it (`Load::lends`).
     pub lent: bool,
 }
 
@@ -348,8 +350,9 @@ pub struct Selection {
     /// up by it, and only while it is queued.
     pub later: Vec<Choice>,
     /// Whether the head's owner is the only one with work of the head's priority for this
-    /// executor, verified or not: only then may its own job go beside its blocked head
-    /// (`backfill`), as its claim moves its fair share and nobody is there to pass the head.
+    /// executor, queued or waiting only on a running dependency, verified or not: only then may its
+    /// own job go beside its blocked head (`backfill`), as its claim moves its fair share and
+    /// nobody is there to pass the head.
     pub alone: bool,
     /// Profiles of admissible work the executor has not verified (at most 32).
     pub unverified: Vec<String>,
@@ -404,6 +407,8 @@ pub fn select(
     let mut choices = Vec::new();
     let mut hold: BTreeMap<i64, Reservation> = BTreeMap::new();
     let mut waited_on = BTreeMap::new();
+    // The owners, with their priorities, of jobs here that wait only on a running dependency.
+    let mut waiting: Vec<(i64, String)> = Vec::new();
     for (action, rank) in queued.into_iter().zip(ranks) {
         if !scope.allows_profile(&action.profile)
             || refused.contains(&action.profile)
@@ -424,16 +429,43 @@ pub fn select(
         if reservation.slots > capacity.slots || reservation.memory_mb > capacity.memory_mb {
             continue;
         }
+        let mut stmt =
+            db.prepare("SELECT DISTINCT owner FROM interests WHERE action=? AND active=1")?;
+        let owners: Vec<String> = stmt
+            .query_map([&action.id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        // Work of an owner at priority 0 or below that what the reserve leaves can never fit must
+        // not idle the executor behind it either, unless it may be lent the reserve and fits that;
+        // an owner above 0 may still run the same action in the reserve.
+        let lent = lending
+            && durations
+                .longest(&action)
+                .is_some_and(|seconds| seconds < LEND_SECONDS);
+        let beyond = |room: Reservation| {
+            reservation.slots > room.slots || reservation.memory_mb > room.memory_mb
+        };
+        let beyond_reserve = |priority: i64| {
+            priority <= 0
+                && reserve.is_some_and(|reserve| {
+                    beyond(unreserved(capacity, reserve)) && !(lent && !beyond(reserve))
+                })
+        };
         if !eligible {
+            // An owner whose job here waits only on a running dependency has work here too: once
+            // the dependency passes, that job may pass a head whose own owner's fair share a
+            // backfill moved (`Selection::alone`, #4204 in-lane adversary P1). Not an owner that
+            // could never run it here.
+            for owner in &owners {
+                let priority = priorities.get(owner).copied().unwrap_or(0);
+                if !beyond_reserve(priority) {
+                    waiting.push((priority, owner.clone()));
+                }
+            }
             // The train-first hold (chief, #4204): a prioritized owner's job waiting only on a
             // running dependency keeps the capacity it will need from lower-priority owners.
-            let mut stmt =
-                db.prepare("SELECT DISTINCT owner FROM interests WHERE action=? AND active=1")?;
-            let priority = stmt
-                .query_map([&action.id], |r| r.get::<_, String>(0))?
-                .map(|owner| Ok(priorities.get(&owner?).copied().unwrap_or(0)))
-                .collect::<Result<Vec<i64>>>()?
-                .into_iter()
+            let priority = owners
+                .iter()
+                .map(|owner| priorities.get(owner).copied().unwrap_or(0))
                 .max()
                 .unwrap_or(0);
             if priority > 0 {
@@ -483,27 +515,6 @@ pub fn select(
             continue;
         }
         let trusted = verified.contains(&action.profile);
-        let mut stmt =
-            db.prepare("SELECT DISTINCT owner FROM interests WHERE action=? AND active=1")?;
-        let owners: Vec<String> = stmt
-            .query_map([&action.id], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        // Work of an owner at priority 0 or below that what the reserve leaves can never fit must
-        // not idle the executor behind it either, unless it may be lent the reserve and fits that;
-        // an owner above 0 may still run the same action in the reserve.
-        let lent = lending
-            && durations
-                .expected(&action)
-                .is_some_and(|seconds| seconds < LEND_SECONDS);
-        let beyond = |room: Reservation| {
-            reservation.slots > room.slots || reservation.memory_mb > room.memory_mb
-        };
-        let beyond_reserve = |priority: i64| {
-            priority <= 0
-                && reserve.is_some_and(|reserve| {
-                    beyond(unreserved(capacity, reserve)) && !(lent && !beyond(reserve))
-                })
-        };
         // Only work some owner may run here asks for its profile to be verified, as work this
         // executor can never fit does not.
         let runnable = owners.is_empty()
@@ -566,6 +577,9 @@ pub fn select(
     let alone = choice.as_ref().is_some_and(|head| {
         rest.iter()
             .all(|(_, other)| other.priority != head.priority || other.owner == head.owner)
+            && waiting
+                .iter()
+                .all(|(priority, owner)| *priority != head.priority || *owner == head.owner)
     });
     let later = match choice {
         Some(_) => rest
@@ -895,8 +909,17 @@ impl Lineages {
 #[derive(Default)]
 struct Durations {
     lineages: Lineages,
-    by_key: BTreeMap<(String, String), f64>,
-    by_lineage: BTreeMap<(String, String, String), f64>,
+    by_key: BTreeMap<(String, String), Estimate>,
+    by_lineage: BTreeMap<(String, String, String), Estimate>,
+}
+
+/// One `job_estimates` row as a selection reads it.
+#[derive(Clone, Copy)]
+struct Estimate {
+    /// The median of its samples: what ranking expects.
+    median: f64,
+    /// The longest of them: what lending the reserve is bounded by.
+    longest: f64,
 }
 
 impl Durations {
@@ -931,15 +954,31 @@ impl Durations {
                 .into_iter()
                 .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
                 .collect();
-            if let Some(median) = median(samples) {
-                durations.by_key.insert((profile, job.clone()), median);
-                durations.by_lineage.insert((project, lineage, job), median);
+            let longest = samples.iter().copied().reduce(f64::max);
+            if let (Some(median), Some(longest)) = (median(samples), longest) {
+                let estimate = Estimate { median, longest };
+                durations.by_key.insert((profile, job.clone()), estimate);
+                durations
+                    .by_lineage
+                    .insert((project, lineage, job), estimate);
             }
         }
         Ok(durations)
     }
 
     fn expected(&self, action: &Action) -> Option<f64> {
+        self.estimate(action).map(|estimate| estimate.median)
+    }
+
+    /// The longest remembered pass of the samples `expected` takes its median of: a job is lent
+    /// the reserve only if every one ended within `LEND_SECONDS`, so a job with some quick and
+    /// some long passes is not (#4204 in-lane adversary P2).
+    fn longest(&self, action: &Action) -> Option<f64> {
+        self.estimate(action).map(|estimate| estimate.longest)
+    }
+
+    /// The row of the action's own profile and job, else the newest of its lineage's.
+    fn estimate(&self, action: &Action) -> Option<Estimate> {
         let (project, lineage) = self.lineages.of(action);
         self.by_key
             .get(&(action.profile.clone(), action.job.clone()))
@@ -1399,7 +1438,9 @@ const MAX_BACKFILL_HELD: usize = 12;
 /// still does with this choice held too, so the head starts at the same release as without it.
 /// The choice is held there where its claim now puts it (`lends`): work lent the reserve stays
 /// lent, beside the head's share rather than in it, whatever ends first. It runs only while no
-/// hold above the head applies, so the head's hold check reads no freed room.
+/// hold above the head applies, so the head's hold check reads no freed room. `alone` is judged
+/// per executor while fair share is global, so the head's own owner's job backfilled here can move
+/// that owner behind another owner on a different executor.
 fn backfill(
     db: &Connection,
     executor: &str,
@@ -4624,6 +4665,91 @@ mod tests {
         assert_eq!(claims(&mut store, "k3").as_deref(), Some("group"));
     }
 
+    /// mindy runs run-0 and run-1 (6/9216 each); a's head (6/9216) waits for either. a was served
+    /// before b, whose 6/9216 job waits only on its dependency, running as run-0. With `small`, a
+    /// also has a 1/1024 job queued.
+    fn a_job_waits_on_a_dependency_beside_a_blocked_head(
+        small: bool,
+    ) -> (tempfile::TempDir, Store) {
+        let (root, store) = mindy_running(&[(6, 9216), (6, 9216)]);
+        store
+            .db
+            .execute_batch("INSERT INTO dispatches VALUES ('a',100.0),('b',200.0)")
+            .unwrap();
+        wants(&store, "head", "a", 1.0, (6, 9216));
+        if small {
+            wants(&store, "a-small", "a", 2.0, (1, 1024));
+        }
+        wants(&store, "dep", "b", 0.5, (1, 512));
+        store
+            .db
+            .execute(
+                "UPDATE actions SET state='running',attempt='run-0' WHERE id='dep'",
+                [],
+            )
+            .unwrap();
+        queue(
+            &store.db,
+            Queue {
+                id: "b-job",
+                owner: "b",
+                created: 3.0,
+                reservation: Some((6, 9216)),
+                dependencies: &["dep"],
+                ..Queue::default()
+            },
+        );
+        (root, store)
+    }
+
+    /// The dependency's attempt, run-0, ends and the dependency passes.
+    fn the_dependency_passes(store: &Store) {
+        ends(store, "run-0");
+        store
+            .db
+            .execute("UPDATE actions SET state='passed' WHERE id='dep'", [])
+            .unwrap();
+    }
+
+    #[test]
+    fn an_owner_whose_job_waits_on_a_running_dependency_keeps_the_heads_own_owner_back() {
+        // In-lane adversary P1 (#4204): b's job was not queued yet, so a looked alone and a-small
+        // went beside a's head; a's fair share moved, and once the dependency passed b's job sorted
+        // ahead of the head and took its room. b has work here while its job waits only on a
+        // running dependency: a-small waits, and the head starts when run-0 ends, as it does
+        // without a-small.
+        for small in [false, true] {
+            let (_root, mut store) = a_job_waits_on_a_dependency_beside_a_blocked_head(small);
+            assert_eq!(mindy_claims(&mut store, "k1"), None, "{small}");
+            the_dependency_passes(&store);
+            assert_eq!(
+                mindy_claims(&mut store, "k2").as_deref(),
+                Some("head"),
+                "{small}"
+            );
+        }
+        // A job of a lower priority waiting so never keeps a train's own job back: lanes do not
+        // pass a train's head.
+        let (_root, mut store) = a_job_waits_on_a_dependency_beside_a_blocked_head(false);
+        crate::worker::set_priority(&store, "a", 1).unwrap();
+        wants(&store, "a-small", "a", 2.0, (1, 1024));
+        assert_eq!(mindy_claims(&mut store, "k1").as_deref(), Some("a-small"));
+        // Nor does a job that could never run here: mindy keeps 2/2048, and b's 19-slot job is
+        // larger than what that leaves, so it is left to other executors and passes no head here.
+        let (_root, mut store) = a_job_waits_on_a_dependency_beside_a_blocked_head(true);
+        set_reserve(&mut store, "mindy", need((2, 2048))).unwrap();
+        store
+            .db
+            .execute(
+                "UPDATE actions SET body=json_set(body,'$.reservation.slots',19) WHERE id='b-job'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(mindy_claims(&mut store, "k1").as_deref(), Some("a-small"));
+        the_dependency_passes(&store);
+        assert_eq!(mindy_claims(&mut store, "k2").as_deref(), Some("head"));
+    }
+
     #[test]
     fn nothing_unverified_is_admitted_beside_a_head() {
         // An unverified head admits nothing until it is judged, beside it or otherwise.
@@ -4890,18 +5016,22 @@ mod tests {
     }
 
     #[test]
-    fn work_without_an_estimate_or_not_expected_to_end_within_the_bound_is_never_lent() {
-        // A job without history could run for its whole timeout, and one expected to take the
-        // bound does not end within it: neither takes the reserve. Just below the bound it does.
+    fn work_not_remembered_to_end_within_the_bound_every_time_is_never_lent() {
+        // A job without history could run for its whole timeout, and one that took the bound did
+        // not end within it: neither takes the reserve. Just below the bound it does. The bound is
+        // on every remembered pass, not their median (in-lane adversary P2): four quick passes and
+        // three long ones expect a quick one, but the next may be long.
         for (samples, claimed, lent) in [
-            (None, 2, 0),
-            (Some(LEND_SECONDS), 2, 0),
-            (Some(LEND_SECONDS + 1.0), 2, 0),
-            (Some(LEND_SECONDS - 1.0), 4, 2),
+            (&[][..], 2, 0),
+            (&[LEND_SECONDS][..], 2, 0),
+            (&[LEND_SECONDS + 1.0][..], 2, 0),
+            (&[LEND_SECONDS - 1.0][..], 4, 2),
+            (&[60.0, 60.0, 60.0, 60.0, 900.0, 900.0, 900.0][..], 2, 0),
+            (&[60.0, 300.0, LEND_SECONDS - 1.0][..], 4, 2),
         ] {
             let (_root, mut store) = reserve_lab((2, 2048));
-            if let Some(seconds) = samples {
-                history(&store.db, "f-1", "edge", &[seconds]);
+            if !samples.is_empty() {
+                history(&store.db, "f-1", "edge", samples);
             }
             for index in 0..4 {
                 let id = format!("e-{index}");
@@ -5926,6 +6056,50 @@ mod tests {
             .unwrap();
         assert_eq!(row, ("p-a".into(), "validate".into()));
         assert_eq!(of("validate-4", "r-a", "build"), Some(300.0));
+    }
+
+    /// The longest remembered pass lending would bound `q`'s job by, were `q` queued.
+    fn longest(db: &Connection, q: Queue) -> Option<f64> {
+        let action = action(&q);
+        Durations::load(db, std::slice::from_ref(&action))
+            .unwrap()
+            .longest(&action)
+    }
+
+    #[test]
+    fn lending_reads_the_longest_pass_of_the_row_the_estimate_is_taken_from() {
+        // validate-1..3 are one lineage, and validate-2's row is its newest in alpha. A profile's
+        // own row comes first, however old; validate-3, without history, takes validate-2's; beta's
+        // newer row, of another project, never stands in: as `expected` reads them.
+        let (_root, store) = lab();
+        for id in ["validate-1", "validate-2", "validate-3", "beta-validate"] {
+            lineage_profile(&store.db, id, "validate");
+        }
+        for (profile, project, samples, updated) in [
+            ("validate-1", "p-a", &[60.0, 60.0, 120.0][..], 1.0),
+            ("validate-2", "p-a", &[60.0, 900.0, 60.0][..], 2.0),
+            ("beta-validate", "p-b", &[30.0][..], 9.0),
+        ] {
+            recorded(
+                &store.db,
+                (profile, "build"),
+                (project, "validate"),
+                samples,
+                updated,
+            );
+        }
+        let of = |profile, job| {
+            let q = || Queue {
+                profile,
+                job,
+                ..Queue::default()
+            };
+            (expected(&store.db, q()), longest(&store.db, q()))
+        };
+        assert_eq!(of("validate-1", "build"), (Some(60.0), Some(120.0)));
+        assert_eq!(of("validate-2", "build"), (Some(60.0), Some(900.0)));
+        assert_eq!(of("validate-3", "build"), (Some(60.0), Some(900.0)));
+        assert_eq!(of("validate-3", "test"), (None, None));
     }
 
     #[test]

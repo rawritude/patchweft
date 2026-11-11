@@ -39,9 +39,11 @@ head that does not fit yet keeps smaller jobs back until it does, and ranking ma
 the head more often. Another owner's job of the head's own priority that is admitted on its own
 terms (it fits, beside the hold and within the reserve) still starts beside the head if, whichever of the executor's running
 jobs end first, the head would start just as soon (backfill). The head's own owner's job does too,
-but only while no other owner has work of that priority for the executor: its claim moves its
-owner's fair share, and another owner's work could then pass the head. A train's small jobs so
-start beside its own blocked shard. None does with more than 12 jobs
+but only while no other owner has work of that priority for the executor, queued or waiting on a
+running dependency: its claim moves its owner's fair share, and another owner's work could then
+pass the head. A train's small jobs so start beside its own blocked shard. That test is per
+executor while fair share is global, so such a backfill can move its owner behind another owner on
+a different executor. None does with more than 12 jobs
 held there, while a hold above the head's priority applies there (a hold lifts wherever its job
 does not land, and the head would then start at once), or when its claim would move the median
 a job without history is ranked by. The guarantee covers the head and the holds at the time of
@@ -77,14 +79,16 @@ left to other executors, as work larger than an executor is, so it never keeps t
 smaller work back; only short work that fits the reserve stays while the reserve is lent.
 
 While no owner above 0 wants any work that is queued, running or stopping, on any executor (no
-train rides), the reserve is lent. A job of an owner at 0 or below that its history expects to
-take under 10 minutes (one without history never is) and that does not fit the capacity less the
-reserve may then take the reserve, beside the other lent work, up to the reserve's size. Lent
-work counts against the reserve only, never against what the reserve leaves, and its attempt
-says `"lent": true`. From the first prioritized request nothing more is lent, and what was lent
-runs until it ends: a train that arrives then waits for it, about 10 minutes at most if the
-history holds, as its jobs are admitted as soon as they fit the executor. Lane work keeps what
-the reserve leaves meanwhile, and short work larger than that is again left to other executors.
+train rides), the reserve is lent. A job of an owner at 0 or below whose every remembered pass
+took under 10 minutes (one with none never is, nor one that mostly takes a minute but sometimes a
+quarter of an hour) and that does not fit the capacity less the reserve may then take the
+reserve, beside the other lent work, up to the reserve's size. Lent work counts against the
+reserve only, never against what the reserve leaves, and its attempt says `"lent": true`. From
+the first prioritized request nothing more is lent, and what was lent runs until it ends: a train
+that arrives then waits for it, as its jobs are admitted as soon as they fit the executor. The
+bound is on a job's remembered passes, not a promise: a lent job that hangs runs to its timeout,
+and a train that arrives then waits that long; nothing preempts it. Lane work keeps what the
+reserve leaves meanwhile, and short work larger than that is again left to other executors.
 `patchweft executors` shows `"lent"` (the reserve is applied and lent now) and `"lent_held"`, what
 lent work still holds.
 

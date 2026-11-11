@@ -807,8 +807,12 @@ const KEEPALIVE_PROBES: u32 = 4;
 // macOS names the idle time TCP_KEEPALIVE; Linux, where the API runs, names it TCP_KEEPIDLE.
 #[cfg(target_vendor = "apple")]
 const KEEPALIVE_IDLE_OPTION: libc::c_int = libc::TCP_KEEPALIVE;
+#[cfg(target_vendor = "apple")]
+const KEEPALIVE_IDLE_NAME: &str = "TCP_KEEPALIVE";
 #[cfg(not(target_vendor = "apple"))]
 const KEEPALIVE_IDLE_OPTION: libc::c_int = libc::TCP_KEEPIDLE;
+#[cfg(not(target_vendor = "apple"))]
+const KEEPALIVE_IDLE_NAME: &str = "TCP_KEEPIDLE";
 
 /// The listener `serve` accepts on, configured before any connection arrives.
 fn bind(listen: SocketAddr) -> std::io::Result<std::net::TcpListener> {
@@ -818,32 +822,34 @@ fn bind(listen: SocketAddr) -> std::io::Result<std::net::TcpListener> {
     // Accepted sockets inherit these from the listener, so every connection is probed without
     // touching the accept path (the test checks this on a real accepted socket).
     let tcp = libc::IPPROTO_TCP;
-    set_socket_option(&listener, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)?;
     set_socket_option(
         &listener,
-        tcp,
-        KEEPALIVE_IDLE_OPTION,
+        (libc::SOL_SOCKET, libc::SO_KEEPALIVE, "SO_KEEPALIVE"),
+        1,
+    )?;
+    set_socket_option(
+        &listener,
+        (tcp, KEEPALIVE_IDLE_OPTION, KEEPALIVE_IDLE_NAME),
         KEEPALIVE_IDLE.as_secs() as libc::c_int,
     )?;
     set_socket_option(
         &listener,
-        tcp,
-        libc::TCP_KEEPINTVL,
+        (tcp, libc::TCP_KEEPINTVL, "TCP_KEEPINTVL"),
         KEEPALIVE_INTERVAL.as_secs() as libc::c_int,
     )?;
     set_socket_option(
         &listener,
-        tcp,
-        libc::TCP_KEEPCNT,
+        (tcp, libc::TCP_KEEPCNT, "TCP_KEEPCNT"),
         KEEPALIVE_PROBES as libc::c_int,
     )?;
     Ok(listener)
 }
 
+/// Sets one socket option: level, option and the option's name, which a failure names, as `serve`
+/// then fails with it.
 fn set_socket_option(
     socket: &impl std::os::fd::AsRawFd,
-    level: libc::c_int,
-    name: libc::c_int,
+    (level, name, label): (libc::c_int, libc::c_int, &str),
     value: libc::c_int,
 ) -> std::io::Result<()> {
     // SAFETY: the descriptor stays open for the call, and the pointer and length describe a c_int.
@@ -859,7 +865,11 @@ fn set_socket_option(
     if result == 0 {
         Ok(())
     } else {
-        Err(std::io::Error::last_os_error())
+        let error = std::io::Error::last_os_error();
+        Err(std::io::Error::new(
+            error.kind(),
+            format!("setting {label} on the API listener: {error}"),
+        ))
     }
 }
 
@@ -1425,6 +1435,19 @@ mod tests {
         assert_eq!(
             socket_option(&accepted, tcp, libc::TCP_KEEPCNT),
             KEEPALIVE_PROBES as i32
+        );
+    }
+
+    #[test]
+    fn a_socket_option_that_cannot_be_set_is_named_in_the_error() {
+        // `serve` fails with this error, so the operator learns which option the host refused.
+        let listener = bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let error = set_socket_option(&listener, (libc::IPPROTO_TCP, -1, "TCP_BOGUS"), 1)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with("setting TCP_BOGUS on the API listener: "),
+            "{error}"
         );
     }
 }
