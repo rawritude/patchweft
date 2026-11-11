@@ -510,6 +510,63 @@ fn operator_reserve_keeps_local_capacity_for_prioritized_owners() {
 }
 
 #[test]
+fn operator_share_keeps_local_capacity_for_lanes_unless_it_would_strand_a_train_job() {
+    let lab = Lab::new();
+    // The job takes the whole two-slot budget, so it never fits beside a one-slot share.
+    let profile = lab.profile(json!([
+        {"name":"prepare","command":["sh","-c","true"],"slots":2,"reuse":"never","report":{"kind":"command"}}
+    ]));
+    let share = |slots: &str, memory_mb: &str| {
+        lab.call(&["share", "local", "--slots", slots, "--memory-mb", memory_mb])
+    };
+    let listed = || {
+        lab.call(&["executors"])
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["id"] == "local")
+            .unwrap()["share"]
+            .clone()
+    };
+    lab.refuses(
+        &["share", "ghost", "--slots", "1", "--memory-mb", "1024"],
+        "not registered",
+    );
+    lab.refuses(
+        &["share", "local", "--slots", "3", "--memory-mb", "1024"],
+        "fit beside",
+    );
+    assert_eq!(listed(), Value::Null);
+    assert_eq!(
+        share("1", "1024"),
+        json!({"executor":"local","slots":1,"memory_mb":1024})
+    );
+    assert_eq!(listed()["applied"], true);
+    lab.call(&["priority", "api:claude-c", "1"]);
+    lab.call(&[
+        "request",
+        "--revision",
+        &lab.base,
+        "--profile",
+        &profile,
+        "--job",
+        "prepare",
+        "--owner",
+        "api:claude-c",
+    ]);
+    // Only local may run the train's job, and the share would leave it no room: it is not applied.
+    assert_eq!(listed()["applied"], false);
+    assert_eq!(listed()["unapplied"]["reason"], "strands");
+    lab.drain();
+    assert_eq!(lab.call(&["status"])["actions"][0]["state"], "passed");
+    assert_eq!(
+        share("0", "0"),
+        json!({"executor":"local","slots":0,"memory_mb":0})
+    );
+    assert_eq!(listed(), Value::Null);
+}
+
+#[test]
 fn successful_jobs_survive_retry_of_a_failed_obligation() {
     let lab = Lab::new();
     let profile = lab.profile(json!([

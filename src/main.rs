@@ -63,6 +63,15 @@ enum Operation {
         #[arg(long)]
         memory_mb: u32,
     },
+    /// Keep part of an executor's capacity for lane work, which prioritized work may not use (0
+    /// and 0 clear it).
+    Share {
+        executor: String,
+        #[arg(long)]
+        slots: u32,
+        #[arg(long)]
+        memory_mb: u32,
+    },
     /// Replace an existing principal's scope without rotating its credentials.
     Policy {
         #[arg(long)]
@@ -493,6 +502,15 @@ fn run(cli: Cli) -> Result<Value> {
             slots,
             memory_mb,
         } => authority::set_reserve(
+            &mut store,
+            &executor,
+            model::Reservation { slots, memory_mb },
+        )?,
+        Operation::Share {
+            executor,
+            slots,
+            memory_mb,
+        } => authority::set_share(
             &mut store,
             &executor,
             model::Reservation { slots, memory_mb },

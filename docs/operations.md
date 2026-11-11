@@ -57,7 +57,8 @@ A job queued behind a blocked head still starts beside it (backfill) when all of
   head and then each job ranked ahead of it, in rank order, start just as soon as they would
   without it. A lower-priority job must also leave, in each of those cases, the room a train's
   queued work that is not ready yet would find without it: the hold for jobs waiting on a running
-  dependency, and each prioritized job waiting on anything, however its dependencies stand.
+  dependency (that dependency's own room counted as freed while it runs), and each prioritized
+  job waiting on a dependency that has not started.
 - No unverified job is ranked ahead of it, at most 12 jobs are held on the executor, no hold
   above the head's priority applies there (a hold lifts wherever its job does not land, and the
   head would then start at once, which no ending of a held job shows the proof), and its claim
@@ -154,6 +155,10 @@ queued jobs it may run but does not admit now, each with its action, owner and `
 - `unproven`: a lane job behind a train's head (`head`) whose history (`history`: `no-history`,
   `too-few-passes` or `too-long`) does not show it short enough to start beside it.
 - `capacity`: larger than the executor.
+- `share`: a prioritized job larger than what the executor's lane share leaves prioritized work;
+  it runs on another executor.
+- `share-full`: the executor's prioritized head, which fits the executor but not beside the
+  prioritized work already using what the lane share leaves.
 
 Each executor judges with its placement and the profiles it last reported verified or refused; a
 grant narrower than every project and profile can keep more work from it. A job that every
@@ -178,6 +183,55 @@ always keeps some room. An `executor-set` that would lower the capacity to the r
 is refused until the reserve is lowered or cleared. A cgroup limit cannot be refused: while the
 reported limit leaves the reserve no room below it, the reserve is not applied, rather than
 strand other work, and `patchweft executors` shows it with `"applied": false`.
+
+### The lane share
+
+The reserve keeps room for trains; nothing kept room for lanes, and while a train rode they could
+wait for most of the day (#4818: on 11-11, 101 lane jobs queued and none running for 20 minutes).
+`share EXECUTOR --slots N --memory-mb M` keeps part of an executor's capacity for work of owners at
+priority 0 or below, and `--slots 0 --memory-mb 0` clears it. It is operator state in the store,
+read at every claim, and each change is an `executor.share` event; setting or changing it needs no
+restart and no new profile. The default is none, and with none every rule above stands as it is.
+
+With a share on an executor:
+
+- Prioritized work may use only the capacity less the share there. A prioritized job larger than
+  that can never run there: it is skipped there (`share`) and runs on another executor, as a job
+  larger than an executor does.
+- A lane job is admitted into the share whenever what lanes hold there (work lent the reserve
+  aside) and the job fit the share, and the job fits the executor, whatever a prioritized head
+  drains or holds for. The first lane job in queue order that fits is taken, so fair share among
+  lanes stands. A lane job larger than the share never fits it, so it never keeps smaller lane
+  work out of it; it is left to the rules above.
+- Outside the share, everything above stands: the drain, holds, backfill, the reserve, lending and
+  reclaim. Lane work may still use more than the share by those rules.
+
+How they compose on one executor: the reserve and the share never overlap. The share sits inside
+what the reserve leaves to lanes, and the reserve inside what the share leaves to prioritized work:
+`share` refuses a share that would not fit beside the reserve within the capacity, `reserve`
+refuses a reserve that would not fit beside the share, and `executor-set` refuses a capacity that
+would not fit them both. Lent work counts against the reserve only, never against the share.
+Backfill's proof (above) judges prioritized work by what the share leaves it.
+
+`share` also refuses a setting that would leave a job with nowhere to run: a job of a profile with
+an action queued or created in the last week, that the executor's placement allows and that fits
+it, that no other executor may run, and that needs more than the share leaves. Another executor
+may run a job when its placement allows it, it does not refuse the profile, the job fits what its
+own share leaves, and it was seen in the last 5 minutes: a host that has not claimed or renewed
+for that long counts as absent, so one host's outage never strands a train's job on another
+through its share. Capacity, placement, sizes and the other hosts change after a share is set, so
+every claim judges it again: while the share would not fit beside the reserve (under a lower
+cgroup limit, say), or would leave a queued prioritized job that only this executor may run no
+room, it is not applied and holds nothing back. `patchweft executors` shows the share as
+`share`: `slots`, `memory_mb`, `applied`, `unapplied` (`{"reason":"reserve"}` or
+`{"reason":"strands","action":...}`) while it is not, `held` (what lanes hold there, lent work
+aside) and `leaves` (what prioritized work may use, the reserve within it).
+
+A share costs trains capacity on that executor even while no lane has work: unlike the reserve,
+it is never lent back. NG's first setting is pw-robin, `share pw-robin --slots 8 --memory-mb
+12800`: with pw-robin at 16 slots and 24576 MiB and no reserve, trains keep 8 slots and 11776 MiB
+there, enough for `vitest-core-3` (6/9216); a train's census (7/12800) is then skipped there and
+runs elsewhere. It stays off until the chief turns it on.
 
 Private working directories prevent accidental workspace sharing, but are not
 a hostile-code sandbox. Native slot and memory declarations do not impose

@@ -237,6 +237,18 @@ fn held_lent(db: &Connection, executor: &str) -> Result<Reservation> {
     )
 }
 
+/// Reservations of this executor's undrained attempts that are prioritized (`PRIORITIZED`): what a
+/// lane share bounds by what it leaves.
+fn held_prioritized(db: &Connection, executor: &str) -> Result<Reservation> {
+    if !table_exists(db, "owner_priorities")? {
+        return Ok(Reservation {
+            slots: 0,
+            memory_mb: 0,
+        });
+    }
+    held_where(db, executor, PRIORITIZED)
+}
+
 /// Reservations of this executor's undrained attempts that meet `condition`.
 fn held_where(db: &Connection, executor: &str, condition: &str) -> Result<Reservation> {
     Ok(db.query_row(
@@ -417,9 +429,10 @@ pub struct Selection {
     /// Capacity held for prioritized work this executor could run once a running dependency
     /// passes (the train-first hold): what it needs, per priority.
     pub hold: BTreeMap<i64, Reservation>,
-    /// The sizes, with their priorities, of prioritized queued work this executor may run that is
-    /// not eligible yet, whether its dependencies run or have not started: demand `backfill`'s
-    /// proof keeps room for beside lower-priority work (#4818).
+    /// The sizes, with their priorities, of prioritized queued work this executor may run that
+    /// waits on a dependency that has not started (all of a train's work is queued when it is
+    /// submitted): demand `backfill`'s proof keeps room for beside lower-priority work, as it does
+    /// the hold for work waiting only on a running dependency (#4818 review, A1).
     pub unready: Vec<(i64, Reservation)>,
     /// What the running dependencies being waited on hold here, by attempt, with the highest
     /// priority of the held jobs waiting on each: it frees before they start, so it is not counted
@@ -427,6 +440,9 @@ pub struct Selection {
     pub freed: Vec<Freed>,
     /// What this executor keeps for owners above priority 0 (`set_reserve`).
     pub reserve: Option<Reservation>,
+    /// The lane share applied at this claim (`share_state`): prioritized work may use only what it
+    /// leaves, and lane work may always use it.
+    pub share: Option<Reservation>,
 }
 
 /// A choice after the head, as `backfill` reads it.
@@ -475,6 +491,9 @@ pub fn select(
         .collect();
     let priorities = owner_priorities(db)?;
     let reserve = applied(reserve(db, &record.id)?, capacity);
+    let share = share_state(db, record, capacity, reserve)?.applied;
+    // What a share leaves prioritized work: a prioritized job larger can never run here.
+    let leaves = share.map(|share| unreserved(capacity, share));
     let lend_block = match reserve {
         Some(_) => lend_block(db, &record.id)?,
         None => None,
@@ -531,13 +550,16 @@ pub fn select(
                     beyond(unreserved(capacity, reserve)) && !(lent && !beyond(reserve))
                 })
         };
+        // A prioritized job larger than what the lane share leaves can never run here either: it is
+        // left to other executors (#4818).
+        let beyond_share = |priority: i64| priority > 0 && leaves.is_some_and(beyond);
         // Every owner of queued work that may run here has work here, whatever its dependencies'
         // or prerequisites' state: once that work is eligible it may pass a head whose own owner's
         // fair share a backfill moved (#4204 in-lane adversary P1, gate P2-2). Not an owner that
         // could never run it here.
         for owner in &owners {
             let priority = priorities.get(owner).copied().unwrap_or(0);
-            if !beyond_reserve(priority) {
+            if !beyond_reserve(priority) && !beyond_share(priority) {
                 wanting.insert((priority, owner.clone()));
             }
         }
@@ -547,17 +569,19 @@ pub fn select(
             .map(|owner| priorities.get(owner).copied().unwrap_or(0))
             .max()
             .unwrap_or(0);
-        if !eligible && top > 0 {
-            unready.insert((top, reservation.slots, reservation.memory_mb));
-        }
         if !eligible && !engine::eligible_soon(db, &action)? {
+            // Work larger than what a share leaves never finds room here (`Admission::room`), so
+            // it constrains nothing as demand.
+            if top > 0 {
+                unready.insert((top, reservation.slots, reservation.memory_mb));
+            }
             continue;
         }
         if !eligible {
             // The train-first hold (chief, #4204): a prioritized owner's job waiting only on a
             // running dependency keeps the capacity it will need from lower-priority owners.
             let priority = top;
-            if priority > 0 {
+            if priority > 0 && !beyond_share(priority) {
                 let demand = hold.entry(priority).or_insert(Reservation {
                     slots: 0,
                     memory_mb: 0,
@@ -607,9 +631,10 @@ pub fn select(
         // Only work some owner may run here asks for its profile to be verified, as work this
         // executor can never fit does not.
         let runnable = owners.is_empty()
-            || owners
-                .iter()
-                .any(|owner| !beyond_reserve(priorities.get(owner).copied().unwrap_or(0)));
+            || owners.iter().any(|owner| {
+                let priority = priorities.get(owner).copied().unwrap_or(0);
+                !beyond_reserve(priority) && !beyond_share(priority)
+            });
         if runnable
             && !trusted
             && unverified.len() < MAX_UNVERIFIED
@@ -625,6 +650,14 @@ pub fn select(
                         json!({"action":action.id,"owner":owner,"reason":"lanes-share",
                         "lending":unlent.unwrap_or("larger-than-reserve")}),
                     );
+                } else {
+                    skipped_more += 1;
+                }
+                continue;
+            }
+            if beyond_share(priority) {
+                if skipped.len() < MAX_WAITING {
+                    skipped.push(json!({"action":action.id,"owner":owner,"reason":"share"}));
                 } else {
                     skipped_more += 1;
                 }
@@ -710,6 +743,7 @@ pub fn select(
             .collect(),
         freed,
         reserve,
+        share,
     })
 }
 
@@ -1287,12 +1321,14 @@ pub fn claim_for(
         unready,
         freed,
         reserve,
+        share,
         ..
     } = select(&transaction, &record, scope, &verified, &refused, capacity)?;
-    let current = current_load(&transaction, executor, reserve, freed)?;
+    let current = current_load(&transaction, executor, (reserve, share), freed)?;
     let admission = Admission {
         capacity,
         reserve,
+        share,
         hold: &hold,
         unready: &unready,
     };
@@ -1331,6 +1367,9 @@ pub fn claim_for(
     {
         reclaim(&transaction, executor, head, &current, admits)?;
     }
+    // The lane share (#4818): the first lane job in order that fits its free part, whatever the
+    // head drains or holds for, when nothing else is admitted.
+    let shared = in_share(&admission, choice.as_ref(), &later, &current);
     let admitted = match choice {
         Some(choice) if admits(&choice, &current) => Some(choice),
         Some(head) => beside(
@@ -1341,8 +1380,9 @@ pub fn claim_for(
             alone,
             later,
             &current,
-        )?,
-        _ => None,
+        )?
+        .or(shared),
+        None => shared,
     };
     let Some(choice) = admitted else {
         transaction.commit()?;
@@ -1415,25 +1455,31 @@ pub fn claim_for(
 fn current_load(
     db: &Connection,
     executor: &str,
-    reserve: Option<Reservation>,
+    (reserve, share): (Option<Reservation>, Option<Reservation>),
     freed: Vec<Freed>,
 ) -> Result<Load> {
     let held = held(db, executor)?;
-    // Only a reserve reads them.
+    // Only a reserve reads the lanes' and the lent pools, and only a share the prioritized one.
+    let zero = Reservation {
+        slots: 0,
+        memory_mb: 0,
+    };
     let (unprioritized, lent) = match reserve {
         Some(_) => (held_unprioritized(db, executor)?, held_lent(db, executor)?),
-        None => (
-            held,
-            Reservation {
-                slots: 0,
-                memory_mb: 0,
-            },
+        None => (held, zero),
+    };
+    let (unprioritized, prioritized) = match share {
+        Some(_) => (
+            held_unprioritized(db, executor)?,
+            held_prioritized(db, executor)?,
         ),
+        None => (unprioritized, zero),
     };
     Ok(Load {
         held,
         unprioritized,
         lent,
+        prioritized,
         freed,
     })
 }
@@ -1444,6 +1490,7 @@ fn current_load(
 struct Admission<'a> {
     capacity: Reservation,
     reserve: Option<Reservation>,
+    share: Option<Reservation>,
     hold: &'a BTreeMap<i64, Reservation>,
     unready: &'a [(i64, Reservation)],
 }
@@ -1537,9 +1584,26 @@ impl Admission<'_> {
     }
 
     /// Whether work of `priority` reserving `wanted` fits the executor beside `load` and the hold
-    /// above its priority.
+    /// above its priority, and prioritized work what a lane share leaves it (#4818).
     fn room(&self, priority: i64, wanted: Reservation, load: &Load) -> bool {
-        fits(load.held, wanted, self.capacity) && self.hold_room(priority, wanted, load)
+        fits(load.held, wanted, self.capacity)
+            && self.hold_room(priority, wanted, load)
+            && (priority <= 0
+                || self.share.is_none_or(|share| {
+                    fits(load.prioritized, wanted, unreserved(self.capacity, share))
+                }))
+    }
+
+    /// Whether lane work `choice` fits the lane share's free part beside `load` (#4818): what lanes
+    /// hold, not lent, and the job within the share, and the job within the executor. Such work is
+    /// admitted whatever a prioritized head drains or holds for: prioritized work cannot use that
+    /// room. It never counts against the reserve: the share fits beside it.
+    fn in_share(&self, choice: &Choice, load: &Load) -> bool {
+        choice.priority <= 0
+            && self.share.is_some_and(|share| {
+                fits(load.unprioritized, choice.reservation, share)
+                    && fits(load.held, choice.reservation, self.capacity)
+            })
     }
 
     /// Where `choice` claimed beside `load` goes: nowhere, or the lanes' share or the reserve lent
@@ -1560,6 +1624,8 @@ struct Load {
     unprioritized: Reservation,
     /// Those not prioritized that were lent the reserve (`held_lent`): the reserve bounds them.
     lent: Reservation,
+    /// Those prioritized (`held_prioritized`): what a lane share leaves bounds them.
+    prioritized: Reservation,
     /// The running dependencies among them that held jobs wait on, each with the highest priority
     /// waiting on it (`Selection::freed`).
     freed: Vec<Freed>,
@@ -1593,6 +1659,11 @@ impl Load {
                 self.unprioritized
             },
             lent: if held.lent { sub(self.lent) } else { self.lent },
+            prioritized: if !held.unprioritized && !held.lent {
+                sub(self.prioritized)
+            } else {
+                self.prioritized
+            },
             freed: self.freed.clone(),
         }
     }
@@ -1617,6 +1688,11 @@ impl Load {
                 add(self.lent)
             } else {
                 self.lent
+            },
+            prioritized: if unprioritized {
+                self.prioritized
+            } else {
+                add(self.prioritized)
             },
             freed: self.freed.clone(),
         }
@@ -1764,6 +1840,27 @@ fn reclaim(
     Ok(())
 }
 
+/// The first verified lane job, the head then the rest in order, that fits the lane share's free
+/// part (`Admission::in_share`): so fair share among lanes stands in the share. A lane job larger
+/// than the share's room never fits it, so it never keeps smaller lane work out of the share; it
+/// is left to the normal rules (#4818 review, B3).
+fn in_share(
+    admission: &Admission,
+    head: Option<&Choice>,
+    later: &[Later],
+    current: &Load,
+) -> Option<Choice> {
+    head.into_iter()
+        .chain(
+            later
+                .iter()
+                .filter(|later| later.verified)
+                .map(|later| &later.choice),
+        )
+        .find(|choice| admission.in_share(choice, current))
+        .cloned()
+}
+
 /// What goes beside a blocked `head` while its executor drains for it: later small actions cannot
 /// starve its reservation, so only one admitted now on its own terms that never delays it goes
 /// beside it (`backfill`). Nothing while a hold above the head's priority applies here: such a
@@ -1814,9 +1911,10 @@ const MAX_BACKFILL_BELOW: usize = 8;
 ///   first, the head and then each choice ranked before this one are admitted in rank order, each
 ///   beside those before it, exactly as far with this choice held as without it. For a choice of a
 ///   lower priority than the head, the prioritized work not eligible yet keeps its room too: the
-///   room held for jobs waiting only on a running dependency (the train-first hold), and each job
-///   of a higher priority than the choice's that waits on anything (`Selection::unready`), are
-///   still there beside as many of the ranked choices as they are without it. The choice is held
+///   room held for jobs waiting only on a running dependency (the train-first hold, which the
+///   dependencies still held count as freed for), and each job of a higher priority than the
+///   choice's that waits on a dependency not started (`Selection::unready`), are still there
+///   beside as many of the ranked choices as they are without it. The choice is held
 ///   where its claim now puts it: work lent the reserve stays lent, beside the lanes' share rather
 ///   than in it, whatever ends first.
 ///
@@ -1887,6 +1985,10 @@ fn backfill(
                     slots: 0,
                     memory_mb: 0,
                 },
+                prioritized: Reservation {
+                    slots: 0,
+                    memory_mb: 0,
+                },
                 freed: Vec::new(),
             };
             for (index, attempt) in held.iter().enumerate() {
@@ -1903,6 +2005,9 @@ fn backfill(
                 }
                 if attempt.lent {
                     load.lent = add(load.lent);
+                }
+                if !attempt.unprioritized && !attempt.lent {
+                    load.prioritized = add(load.prioritized);
                 }
                 load.freed.extend(
                     current
@@ -3167,6 +3272,23 @@ pub fn configure(store: &mut Store, id: &str, request: &ConfigureRequest) -> Res
             capacity.memory_mb
         );
     }
+    // So does a lane share, beside the reserve (#4818 review, B4).
+    if let Some(share) = share(&transaction, id)? {
+        let capacity = capacity(&transaction, &record)?;
+        let lanes = match reserve(&transaction, id)? {
+            Some(reserve) => unreserved(capacity, reserve),
+            None => capacity,
+        };
+        ensure!(
+            share.slots <= lanes.slots && share.memory_mb <= lanes.memory_mb,
+            "{id} keeps a lane share of {} slots and {} MiB: a capacity of {} slots and {} MiB would \
+             not fit it beside the reserve; lower or clear the share first",
+            share.slots,
+            share.memory_mb,
+            capacity.slots,
+            capacity.memory_mb
+        );
+    }
     save(&transaction, &record)?;
     let view = view(&transaction, &record)?;
     let configured = &view["configured"];
@@ -3204,6 +3326,19 @@ pub fn set_reserve(store: &mut Store, executor: &str, wanted: Reservation) -> Re
             capacity.slots,
             capacity.memory_mb
         );
+        // The lane share sits inside what the reserve leaves (#4818 review, B4).
+        if let Some(share) = share(&transaction, executor)? {
+            let lanes = unreserved(capacity, wanted);
+            ensure!(
+                share.slots <= lanes.slots && share.memory_mb <= lanes.memory_mb,
+                "{executor}'s lane share of {} slots and {} MiB must fit beside the reserve within \
+                 its capacity of {} slots and {} MiB; lower or clear the share first",
+                share.slots,
+                share.memory_mb,
+                capacity.slots,
+                capacity.memory_mb
+            );
+        }
     }
     transaction.execute_batch(
         "CREATE TABLE IF NOT EXISTS executor_reserves (executor TEXT PRIMARY KEY, slots INTEGER NOT NULL, memory_mb INTEGER NOT NULL)",
@@ -3239,6 +3374,261 @@ pub fn reserve(db: &Connection, executor: &str) -> Result<Option<Reservation>> {
             },
         )
         .optional()?)
+}
+
+/// The lane share configured on this executor (`set_share`). A store without shares has none.
+pub fn share(db: &Connection, executor: &str) -> Result<Option<Reservation>> {
+    if !table_exists(db, "executor_shares")? {
+        return Ok(None);
+    }
+    Ok(db
+        .query_row(
+            "SELECT slots, memory_mb FROM executor_shares WHERE executor=?",
+            [executor],
+            |r| {
+                Ok(Reservation {
+                    slots: r.get(0)?,
+                    memory_mb: r.get(1)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+/// How long an executor may go unseen before it counts as unable to run anything when a share
+/// judges where a job may run (#4818 review, B2). A live coordinator claims about every 2 s, and
+/// its record's `last_seen` is rewritten at least every 30 s, so five minutes is ten of those
+/// rewrites missed: a host down or cut off for that long is not taking work, and a share must
+/// not strand a train's job on the strength of it.
+const SILENT_SECONDS: f64 = 300.0;
+
+/// How recently a profile must have had an action for `set_share` to protect its jobs: a profile
+/// used in the last week is one lanes and trains still run.
+const SHARE_PROFILE_SECONDS: f64 = 7.0 * 86400.0;
+
+/// The other executors that may run work now: seen within `SILENT_SECONDS`, each with what its
+/// configured share leaves prioritized work (`unreserved` of its effective capacity).
+fn others(db: &Connection, executor: &str) -> Result<Vec<(ExecutorRecord, Reservation)>> {
+    let records: Vec<ExecutorRecord> = {
+        let mut stmt = db.prepare("SELECT body FROM executors WHERE id<>? ORDER BY id")?;
+        stmt.query_map([executor], |r| r.get::<_, String>(0))?
+            .map(|body| Ok(serde_json::from_str(&body?)?))
+            .collect::<Result<_>>()?
+    };
+    let seen_since = now() - SILENT_SECONDS;
+    let mut others = Vec::new();
+    for record in records {
+        if record
+            .observed
+            .last_seen
+            .is_none_or(|seen| seen < seen_since)
+        {
+            continue;
+        }
+        let Ok(capacity) = capacity(db, &record) else {
+            continue;
+        };
+        let room = match share(db, &record.id)? {
+            Some(share) => unreserved(capacity, share),
+            None => capacity,
+        };
+        others.push((record, room));
+    }
+    Ok(others)
+}
+
+/// Whether a prioritized job of `profile` named `job`, reserving `wanted`, may run on one of
+/// `others`: its placement allows the job, it does not refuse the profile, and the job fits what
+/// its share leaves prioritized work.
+fn runs_elsewhere(
+    others: &[(ExecutorRecord, Reservation)],
+    profile: &str,
+    job: &str,
+    wanted: Reservation,
+) -> bool {
+    others.iter().any(|(record, room)| {
+        record.placement.permits(job)
+            && !record.observed.refused.contains_key(profile)
+            && !record.observed.refused.contains_key(REFUSE_ALL)
+            && fits(
+                Reservation {
+                    slots: 0,
+                    memory_mb: 0,
+                },
+                wanted,
+                *room,
+            )
+    })
+}
+
+/// A share as a claim applies it: configured, and why it is not applied when it is not.
+struct ShareState {
+    configured: Option<Reservation>,
+    applied: Option<Reservation>,
+    reason: Option<Value>,
+}
+
+/// Whether the lane share configured on `record` applies at this claim (#4818 review, B1, B4), as
+/// a reserve is applied: it must fit beside the reserve within the capacity (`reserve`), and what
+/// it leaves prioritized work must hold every queued prioritized job that only this executor may
+/// run (`strands`, with the action): a job its placement allows, that it does not refuse and that
+/// fits its capacity, and that no other executor seen lately may run (`runs_elsewhere`). Capacity,
+/// placement, sizes and other executors change after `share` is set, so the check is made at
+/// every claim; while it fails the share holds nothing back.
+fn share_state(
+    db: &Connection,
+    record: &ExecutorRecord,
+    capacity: Reservation,
+    reserve: Option<Reservation>,
+) -> Result<ShareState> {
+    let Some(configured) = share(db, &record.id)? else {
+        return Ok(ShareState {
+            configured: None,
+            applied: None,
+            reason: None,
+        });
+    };
+    let unapplied = |reason: Value| ShareState {
+        configured: Some(configured),
+        applied: None,
+        reason: Some(reason),
+    };
+    let lanes = reserve.map_or(capacity, |reserve| unreserved(capacity, reserve));
+    let nothing = Reservation {
+        slots: 0,
+        memory_mb: 0,
+    };
+    if !fits(nothing, configured, lanes) {
+        return Ok(unapplied(json!({"reason":"reserve"})));
+    }
+    let leaves = unreserved(capacity, configured);
+    if table_exists(db, "owner_priorities")? {
+        let others = others(db, &record.id)?;
+        let mut stmt = db.prepare(
+            "SELECT a.body FROM actions a WHERE a.state='queued' AND EXISTS
+             (SELECT 1 FROM interests i JOIN owner_priorities p ON p.owner=i.owner
+              WHERE i.action=a.id AND i.active=1 AND p.priority>0) ORDER BY a.created, a.id",
+        )?;
+        let queued: Vec<Action> = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .map(|body| Ok(serde_json::from_str(&body?)?))
+            .collect::<Result<_>>()?;
+        let refused = &record.observed.refused;
+        let mut profiles = BTreeMap::new();
+        for action in queued {
+            if !record.placement.permits(&action.job)
+                || refused.contains_key(&action.profile)
+                || refused.contains_key(REFUSE_ALL)
+            {
+                continue;
+            }
+            let (wanted, _) = budget(db, &mut profiles, &action)?;
+            if fits(nothing, wanted, capacity)
+                && !fits(nothing, wanted, leaves)
+                && !runs_elsewhere(&others, &action.profile, &action.job, wanted)
+            {
+                return Ok(unapplied(json!({"reason":"strands","action":action.id})));
+            }
+        }
+    }
+    Ok(ShareState {
+        configured: Some(configured),
+        applied: Some(configured),
+        reason: None,
+    })
+}
+
+/// Keeps part of an executor's capacity for lane work (owners at priority 0 or below): prioritized
+/// work may use only what it leaves, and a lane job that fits its free part is admitted whatever
+/// a prioritized head drains or holds for (`claim_for`; #4818). 0 slots and 0 MiB remove it. It
+/// must fit beside the reserve within the capacity, and it is refused while it would leave a job
+/// with nowhere to run: a job of a profile with an action in the last week, that this executor's
+/// placement allows and fits, that no other executor seen lately may run, and that needs more than
+/// the share leaves. It is judged again at every claim (`share_state`).
+pub fn set_share(store: &mut Store, executor: &str, wanted: Reservation) -> Result<Value> {
+    let transaction = store.transaction()?;
+    let record = load(&transaction, executor)?.with_context(|| {
+        format!("executor {executor} is not registered (local, or one executor-set registered)")
+    })?;
+    let clear = wanted.slots == 0 && wanted.memory_mb == 0;
+    let detail = json!({"executor":executor,"slots":wanted.slots,"memory_mb":wanted.memory_mb});
+    if clear && share(&transaction, executor)?.is_none() {
+        return Ok(detail);
+    }
+    if !clear {
+        let capacity = capacity(&transaction, &record)?;
+        let reserve = reserve(&transaction, executor)?.unwrap_or(Reservation {
+            slots: 0,
+            memory_mb: 0,
+        });
+        let lanes = unreserved(capacity, reserve);
+        ensure!(
+            wanted.slots <= lanes.slots && wanted.memory_mb <= lanes.memory_mb,
+            "a share must fit beside {executor}'s reserve within its capacity: at most {} slots and \
+             {} MiB",
+            lanes.slots,
+            lanes.memory_mb
+        );
+        let leaves = unreserved(capacity, wanted);
+        let others = others(&transaction, executor)?;
+        let since = now() - SHARE_PROFILE_SECONDS;
+        let mut stmt = transaction.prepare(
+            "SELECT body FROM profiles WHERE id IN (SELECT DISTINCT json_extract(body,'$.profile')
+             FROM actions WHERE state='queued' OR created>=?) ORDER BY id",
+        )?;
+        let profiles: Vec<RegisteredProfile> = stmt
+            .query_map([since], |r| r.get::<_, String>(0))?
+            .map(|body| Ok(serde_json::from_str(&body?)?))
+            .collect::<Result<_>>()?;
+        for profile in &profiles {
+            for job in &profile.definition.jobs {
+                let size = Reservation::from(job);
+                ensure!(
+                    !record.placement.permits(&job.name)
+                        || !fits(
+                            Reservation {
+                                slots: 0,
+                                memory_mb: 0
+                            },
+                            size,
+                            capacity
+                        )
+                        || fits(
+                            Reservation {
+                                slots: 0,
+                                memory_mb: 0
+                            },
+                            size,
+                            leaves
+                        )
+                        || runs_elsewhere(&others, &profile.id, &job.name, size),
+                    "a share of {} slots and {} MiB would leave {}'s {} ({} slots, {} MiB) nowhere \
+                     to run: only {executor} may run it",
+                    wanted.slots,
+                    wanted.memory_mb,
+                    profile.id,
+                    job.name,
+                    size.slots,
+                    size.memory_mb
+                );
+            }
+        }
+    }
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS executor_shares (executor TEXT PRIMARY KEY, slots INTEGER NOT NULL, memory_mb INTEGER NOT NULL)",
+    )?;
+    if clear {
+        transaction.execute("DELETE FROM executor_shares WHERE executor=?", [executor])?;
+    } else {
+        transaction.execute(
+            "INSERT INTO executor_shares VALUES (?,?,?) ON CONFLICT(executor)
+             DO UPDATE SET slots=excluded.slots, memory_mb=excluded.memory_mb",
+            params![executor, wanted.slots, wanted.memory_mb],
+        )?;
+    }
+    event(&transaction, "executor.share", executor, &detail)?;
+    transaction.commit()?;
+    Ok(detail)
 }
 
 /// Every executor with its budget, what it holds and what its coordinator last reported.
@@ -3299,11 +3689,39 @@ fn view(db: &Connection, record: &ExecutorRecord) -> Result<Value> {
         Some(capacity) => waiting(db, record, capacity)?,
         None => (Vec::new(), 0),
     };
+    // `share`: the lane share, whether this claim would apply it (`share_state`) and why not,
+    // what lanes hold of it (`held`, lent work aside), and what it leaves prioritized work
+    // (`leaves`), the reserve inside that.
+    let share = match effective {
+        Some(capacity) => {
+            let applied_reserve = applied(crate::authority::reserve(db, &record.id)?, capacity);
+            let state = share_state(db, record, capacity, applied_reserve)?;
+            match state.configured {
+                Some(configured) => {
+                    let lanes = held_unprioritized(db, &record.id)?;
+                    let leaves = unreserved(capacity, configured);
+                    let mut share = json!({"slots":configured.slots,
+                        "memory_mb":configured.memory_mb,"applied":state.applied.is_some(),
+                        "held":{"slots":lanes.slots,"memory_mb":lanes.memory_mb},
+                        "leaves":{"slots":leaves.slots,"memory_mb":leaves.memory_mb}});
+                    if let Some(reason) = state.reason {
+                        share["unapplied"] = reason;
+                    }
+                    Some(share)
+                }
+                None => None,
+            }
+        }
+        None => share(db, &record.id)?.map(|configured| {
+            json!({"slots":configured.slots,"memory_mb":configured.memory_mb,"applied":false})
+        }),
+    };
     Ok(
         json!({"id":record.id,"configured":{"slots":slots,"memory_mb":memory_mb},
         "effective":effective,
         "held":{"slots":held.slots,"memory_mb":held.memory_mb,"attempts":attempts},
         "reserve":reserve,
+        "share":share,
         "waiting":waiting,"waiting_more":waiting_more,
         "lease_seconds":record.lease_seconds,"placement":record.placement,
         "observed":record.observed}),
@@ -3337,6 +3755,7 @@ fn waiting(
         unready,
         freed,
         reserve,
+        share,
         ..
     } = select(
         db,
@@ -3379,35 +3798,43 @@ fn waiting(
     };
     let mut waiting = Vec::new();
     let mut after = Vec::new();
+    let current = current_load(db, &record.id, (reserve, share), freed)?;
+    let admission = Admission {
+        capacity,
+        reserve,
+        share,
+        hold: &hold,
+        unready: &unready,
+    };
+    // The one job the next claim starts in the lane share, if any.
+    let shared = in_share(&admission, choice.as_ref(), &later, &current);
     if let Some(head) = &unverified_head {
         waiting.push(
             json!({"action":head.action.id,"owner":head.owner,"reason":"verify",
                             "profile":head.action.profile}),
         );
-        after = behind(head, None);
+        after = behind(head, shared.as_ref());
     }
     if let Some(head) = &choice {
-        let current = current_load(db, &record.id, reserve, freed)?;
-        let admission = Admission {
-            capacity,
-            reserve,
-            hold: &hold,
-            unready: &unready,
-        };
-        if !admission.admits(head, &current) {
+        let started = shared
+            .as_ref()
+            .is_some_and(|shared| shared.action.id == head.action.id);
+        if !admission.admits(head, &current) && !started {
             let mut entry = json!({"action":head.action.id,"owner":head.owner});
             if !admission.beside_hold(head, &current) {
                 entry["reason"] = json!("hold");
                 entry["priority"] = json!(hold.keys().next_back());
             } else if !fits(current.held, head.reservation, capacity) {
                 entry["reason"] = json!("drain");
+            } else if head.priority > 0 {
+                entry["reason"] = json!("share-full");
             } else {
                 entry["reason"] = json!("lanes-share");
                 entry["lending"] = json!(head.unlent.unwrap_or("reserve-full"));
             }
             waiting.push(entry);
             let beside = beside(db, &record.id, &admission, head, alone, later, &current)?;
-            after = behind(head, beside.as_ref());
+            after = behind(head, beside.or(shared).as_ref());
         }
     }
     let total = waiting.len() + skipped.len() + skipped_more + after.len();
@@ -4977,6 +5404,470 @@ mod tests {
         assert_eq!(local_claims(&mut store).len(), 4);
     }
 
+    /// A profile `id` in the lab whose jobs are `jobs`: name, slots and MiB.
+    fn sized_profile(store: &Store, id: &str, jobs: &[(&str, u32, u32)]) {
+        let jobs: Vec<Value> = jobs
+            .iter()
+            .map(|(name, slots, memory_mb)| {
+                json!({"name":name,"command":["sh"],"slots":slots,"memory_mb":memory_mb})
+            })
+            .collect();
+        let profile = json!({"id":id,"engine":"e","platform":"linux-x86_64","tools":{},
+            "definition":{"version":1,"name":id,"tools":{},"jobs":jobs}});
+        crate::store::insert(&store.db, "profiles", id, &profile).unwrap();
+    }
+
+    /// Marks `executor` seen `ago` seconds ago, as its coordinator's last claim or renewal does.
+    fn seen_ago(store: &Store, executor: &str, ago: f64) {
+        store
+            .db
+            .execute(
+                "UPDATE executors SET body=json_set(body,'$.observed.last_seen',?) WHERE id=?",
+                params![now() - ago, executor],
+            )
+            .unwrap();
+    }
+
+    /// NG's pw-robin (16/24576, no reserve) beside mauve (20/26624), both seen just now; the train
+    /// (priority 1) and NG's profile `ng`, whose `vitest-core-3` is 6/9216, its census 7/12800 and
+    /// a lane's lint 2/2048.
+    fn robin_and_mauve() -> (tempfile::TempDir, Store) {
+        let (root, store) = lab();
+        register(&store.db, "pw-robin", 16, 24576);
+        register(&store.db, "mauve", 20, 26624);
+        for executor in ["pw-robin", "mauve"] {
+            seen_ago(&store, executor, 1.0);
+        }
+        sized_profile(
+            &store,
+            "ng",
+            &[
+                ("vitest-core-3", 6, 9216),
+                ("census", 7, 12800),
+                ("lint", 2, 2048),
+            ],
+        );
+        crate::worker::set_priority(&store, "train", 1).unwrap();
+        (root, store)
+    }
+
+    /// `owner`'s queued action `id` of NG's `job`, created at `created`, of the job's size.
+    fn ng_wants(store: &Store, id: &str, owner: &str, job: &str, created: f64) {
+        let size = match job {
+            "vitest-core-3" => (6, 9216),
+            "census" => (7, 12800),
+            _ => (2, 2048),
+        };
+        queue(
+            &store.db,
+            Queue {
+                id,
+                owner,
+                profile: "ng",
+                job,
+                created,
+                reservation: Some(size),
+                ..Queue::default()
+            },
+        );
+    }
+
+    fn claims_on(store: &mut Store, executor: &str) -> Vec<String> {
+        std::iter::from_fn(|| {
+            claim_for(
+                store,
+                executor,
+                &Scope::all(),
+                &ask(&unique(), &["ng", "f-1"]),
+            )
+            .unwrap()
+            .claim
+            .map(|claim| claim.action.id)
+        })
+        .collect()
+    }
+
+    #[test]
+    fn a_lane_share_on_pw_robin_leaves_trains_what_it_does_not_take() {
+        // #4818: the chief's first setting, pw-robin 8/12800, leaves trains 8/11776 there. The
+        // train's vitest-core-3 (6/9216) still runs on pw-robin; its census (7/12800) can never
+        // fit what the share leaves, so pw-robin skips it, says so, and mauve runs it.
+        let (_root, mut store) = robin_and_mauve();
+        assert_eq!(
+            set_share(&mut store, "pw-robin", need((8, 12800))).unwrap(),
+            json!({"executor":"pw-robin","slots":8,"memory_mb":12800})
+        );
+        ng_wants(&store, "census", "train", "census", 1.0);
+        ng_wants(&store, "core-3", "train", "vitest-core-3", 2.0);
+        assert_eq!(claims_on(&mut store, "pw-robin"), ["core-3"]);
+        assert_eq!(
+            waiting_on(&store, "pw-robin"),
+            [json!({"action":"census","owner":"train","reason":"share"})]
+        );
+        assert_eq!(claims_on(&mut store, "mauve"), ["census"]);
+        let listed = listed_executor(&store, "pw-robin");
+        assert_eq!(
+            listed["share"],
+            json!({"slots":8,"memory_mb":12800,"applied":true,
+                   "held":{"slots":0,"memory_mb":0},"leaves":{"slots":8,"memory_mb":11776}})
+        );
+        assert_eq!(
+            events(&store.db, "executor.share"),
+            [(
+                "pw-robin".to_owned(),
+                json!({"executor":"pw-robin","slots":8,"memory_mb":12800})
+            )]
+        );
+    }
+
+    #[test]
+    fn a_share_that_would_strand_a_job_only_its_host_may_run_is_refused_or_not_applied() {
+        // #4818 review B1, B2: with mauve's placement denying the census, only pw-robin may run
+        // it, so a share that leaves trains less than 7/12800 there is refused when set.
+        let (_root, mut store) = robin_and_mauve();
+        let mut mauve = load(&store.db, "mauve").unwrap().unwrap();
+        mauve.placement.deny = ["census".to_owned()].into_iter().collect();
+        save(&store.db, &mauve).unwrap();
+        ng_wants(&store, "old", "lane", "lint", 0.0);
+        let refused = set_share(&mut store, "pw-robin", need((8, 12800)))
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("ng's census"), "{refused}");
+        assert!(share(&store.db, "pw-robin").unwrap().is_none());
+        // Set while mauve could run it, the share is not applied at a claim once mauve cannot:
+        // its placement changed, it refuses the profile, or it has not been seen for five minutes. pw-robin then runs the
+        // census, and says why the share holds nothing back.
+        for change in ["placement", "silent", "refused"] {
+            let (_root, mut store) = robin_and_mauve();
+            set_share(&mut store, "pw-robin", need((8, 12800))).unwrap();
+            if change == "placement" {
+                let mut mauve = load(&store.db, "mauve").unwrap().unwrap();
+                mauve.placement.deny = ["census".to_owned()].into_iter().collect();
+                save(&store.db, &mauve).unwrap();
+            } else if change == "silent" {
+                seen_ago(&store, "mauve", SILENT_SECONDS + 1.0);
+            } else {
+                store
+                    .db
+                    .execute(
+                        "UPDATE executors SET body=json_set(body,'$.observed.refused',
+                         json('{\"ng\":\"tool drift\"}')) WHERE id='mauve'",
+                        [],
+                    )
+                    .unwrap();
+            }
+            ng_wants(&store, "census", "train", "census", 1.0);
+            assert_eq!(
+                listed_executor(&store, "pw-robin")["share"]["unapplied"],
+                json!({"reason":"strands","action":"census"}),
+                "{change}"
+            );
+            assert_eq!(claims_on(&mut store, "pw-robin"), ["census"], "{change}");
+        }
+    }
+
+    #[test]
+    fn lane_work_in_the_share_runs_whatever_the_trains_head_drains_or_holds_for() {
+        // #4818: pw-robin keeps 8/12800 for lanes. The train runs two 4/5888 jobs, all the
+        // 8/11776 the share leaves it, so its next job (1/1024) waits though pw-robin has room:
+        // prioritized work never uses the share. Lane jobs of 2/2048 go into the share anyway, up
+        // to its 8 slots; a 9-slot lane job never fits it and keeps none of them out.
+        let (_root, mut store) = robin_and_mauve();
+        set_share(&mut store, "pw-robin", need((8, 12800))).unwrap();
+        for (id, created) in [("t-0", 1.0), ("t-1", 2.0)] {
+            wants(&store, id, "train", created, (4, 5888));
+        }
+        assert_eq!(claims_on(&mut store, "pw-robin"), ["t-0", "t-1"]);
+        wants(&store, "t-2", "train", 3.0, (1, 1024));
+        assert_eq!(claims_on(&mut store, "pw-robin"), Vec::<String>::new());
+        assert_eq!(
+            waiting_on(&store, "pw-robin"),
+            [json!({"action":"t-2","owner":"train","reason":"share-full"})]
+        );
+        wants(&store, "huge", "lane", 4.0, (9, 1024));
+        for index in 0..5 {
+            wants(
+                &store,
+                &format!("l-{index}"),
+                "lane",
+                5.0 + index as f64,
+                (2, 2048),
+            );
+        }
+        assert_eq!(
+            claims_on(&mut store, "pw-robin"),
+            ["l-0", "l-1", "l-2", "l-3"]
+        );
+        assert_eq!(
+            held_prioritized(&store.db, "pw-robin").unwrap(),
+            need((8, 11776))
+        );
+        assert_eq!(
+            held_unprioritized(&store.db, "pw-robin").unwrap(),
+            need((8, 8192))
+        );
+        assert_eq!(held(&store.db, "pw-robin").unwrap(), need((16, 19968)));
+        assert_eq!(state(&store.db, "huge"), "queued");
+        // The train runs 8/11776 on pw-robin, and its 7-slot shard waiting on its prepare holds
+        // room there, so a lane job (2 slots) does not fit beside the hold: pw-robin holds. Lane
+        // work in the share is admitted all the same.
+        let (_root, mut store) = robin_and_mauve();
+        set_share(&mut store, "pw-robin", need((8, 12800))).unwrap();
+        wants(&store, "t-run", "train", 0.5, (8, 11776));
+        assert_eq!(claims_on(&mut store, "pw-robin"), ["t-run"]);
+        job_of(&store, "prepare", "train", "running", (1, 1), &[]);
+        job_of(&store, "shard", "train", "queued", (7, 4096), &["prepare"]);
+        wants(&store, "lint", "lane", 1.0, (2, 2048));
+        let lint = claim_for(
+            &mut store,
+            "pw-robin",
+            &Scope::all(),
+            &ask("k", &["ng", "f-1"]),
+        );
+        assert_eq!(claimed(&lint.unwrap()), Some("lint"));
+        let holding = load(&store.db, "pw-robin").unwrap().unwrap().holding;
+        assert_eq!(holding.map(|holding| holding.slots), Some(7));
+    }
+
+    #[test]
+    fn a_lane_share_keeps_its_invariants_under_random_work() {
+        // #4818 invariants, over seeded random queues, ends and claims on pw-robin (16/24576)
+        // with its 8/12800 share, alone or beside a 4/4096 reserve: never over the capacity;
+        // prioritized work never beyond what the share leaves; lent work never beyond the
+        // reserve; and a claim that admits nothing leaves no lane job that fits the share's free
+        // part.
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = |bound: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % bound
+        };
+        let capacity = need((16, 24576));
+        for run in 0..20 {
+            let (_root, mut store) = robin_and_mauve();
+            estimates(&store.db);
+            let reserve = (run % 2 == 1).then(|| need((4, 4096)));
+            if let Some(reserve) = reserve {
+                set_reserve(&mut store, "pw-robin", reserve).unwrap();
+            }
+            let share = need((8, 12800));
+            set_share(&mut store, "pw-robin", share).unwrap();
+            let sizes = [(1, 1024), (2, 2048), (4, 6144), (6, 9216)];
+            for step in 0..60 {
+                let id = format!("j-{run}-{step}");
+                match next(5) {
+                    0 | 1 => {
+                        let owner = if next(2) == 0 { "train" } else { "lane" };
+                        let job = if next(3) == 0 { "long" } else { "short" };
+                        let size = sizes[next(4) as usize];
+                        job_wants(&store, &id, owner, job, step as f64, size);
+                    }
+                    2 => {
+                        let held: Vec<String> = {
+                            let mut stmt = store
+                                .db
+                                .prepare("SELECT id FROM attempts WHERE drained=0 ORDER BY rowid")
+                                .unwrap();
+                            stmt.query_map([], |r| r.get(0))
+                                .unwrap()
+                                .collect::<rusqlite::Result<_>>()
+                                .unwrap()
+                        };
+                        if !held.is_empty() {
+                            let attempt = &held[next(held.len() as u64) as usize];
+                            ends(&store, attempt);
+                            store
+                                .db
+                                .execute(
+                                    "UPDATE actions SET state='passed' WHERE attempt=?",
+                                    [attempt],
+                                )
+                                .unwrap();
+                        }
+                    }
+                    _ => {
+                        let claim =
+                            claim_for(&mut store, "pw-robin", &Scope::all(), &ask(&id, &["f-1"]))
+                                .unwrap();
+                        let held = held(&store.db, "pw-robin").unwrap();
+                        let lanes = held_unprioritized(&store.db, "pw-robin").unwrap();
+                        let case = format!("run {run} step {step}");
+                        assert!(fits(need((0, 0)), held, capacity), "{case}");
+                        let prioritized = held_prioritized(&store.db, "pw-robin").unwrap();
+                        let leaves = unreserved(capacity, share);
+                        assert!(fits(need((0, 0)), prioritized, leaves), "{case}");
+                        if let Some(reserve) = reserve {
+                            let lent = held_lent(&store.db, "pw-robin").unwrap();
+                            assert!(fits(need((0, 0)), lent, reserve), "{case}");
+                        }
+                        if claim.claim.is_none() {
+                            let mut stmt = store
+                                .db
+                                .prepare(
+                                    "SELECT a.body FROM actions a JOIN interests i ON i.action=a.id
+                                     WHERE a.state='queued' AND i.owner='lane' AND i.active=1",
+                                )
+                                .unwrap();
+                            let queued: Vec<Action> = stmt
+                                .query_map([], |r| r.get::<_, String>(0))
+                                .unwrap()
+                                .map(|body| serde_json::from_str(&body.unwrap()).unwrap())
+                                .collect();
+                            for action in queued {
+                                let wanted = action.reservation.unwrap();
+                                assert!(
+                                    !(fits(lanes, wanted, share) && fits(held, wanted, capacity)),
+                                    "{case}: {} fits the share",
+                                    action.id
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_share_admits_lane_work_only_within_its_own_room_and_the_executors() {
+        // pw-robin keeps 4/4096 for lanes and the train runs 6/9216 there; its 8-slot head does
+        // not fit what the share leaves (12 slots), so it waits. Lane jobs of 2/2048 go into the
+        // share until lanes hold all of it, though pw-robin has room for more: a third waits. A
+        // lane job of a profile pw-robin has not verified is never taken, though first in order.
+        let (_root, mut store) = robin_and_mauve();
+        set_share(&mut store, "pw-robin", need((4, 4096))).unwrap();
+        wants(&store, "t-run", "train", 0.5, (6, 9216));
+        assert_eq!(claims_on(&mut store, "pw-robin"), ["t-run"]);
+        wants(&store, "head", "train", 1.0, (8, 4096));
+        queue(
+            &store.db,
+            Queue {
+                id: "unverified",
+                owner: "lane",
+                profile: "f-2",
+                created: 2.0,
+                reservation: Some((2, 2048)),
+                ..Queue::default()
+            },
+        );
+        for index in 0..3 {
+            wants(
+                &store,
+                &format!("l-{index}"),
+                "lane",
+                3.0 + index as f64,
+                (2, 2048),
+            );
+        }
+        let verified = |store: &mut Store| {
+            std::iter::from_fn(|| {
+                claim_for(
+                    store,
+                    "pw-robin",
+                    &Scope::all(),
+                    &ask(&unique(), &["f-1", "ng"]),
+                )
+                .unwrap()
+                .claim
+                .map(|claim| claim.action.id)
+            })
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(verified(&mut store), ["l-0", "l-1"]);
+        assert_eq!(state(&store.db, "l-2"), "queued");
+        assert_eq!(state(&store.db, "unverified"), "queued");
+        // Shared after the train took 15 slots there, the share has room for a 2-slot lane job,
+        // but pw-robin does not: it waits.
+        let (_root, mut store) = robin_and_mauve();
+        wants(&store, "t-run", "train", 0.5, (15, 12288));
+        assert_eq!(claims_on(&mut store, "pw-robin"), ["t-run"]);
+        set_share(&mut store, "pw-robin", need((8, 12800))).unwrap();
+        wants(&store, "lint", "lane", 1.0, (2, 2048));
+        assert_eq!(claims_on(&mut store, "pw-robin"), Vec::<String>::new());
+        assert_eq!(held(&store.db, "pw-robin").unwrap(), need((15, 12288)));
+    }
+
+    #[test]
+    fn backfill_judges_a_trains_jobs_by_what_the_share_leaves_them() {
+        // pw-robin (16/24576) keeps 4/4096 for lanes, so trains have 12 slots. The train runs
+        // 4/2048 and a lane attempt holds 2/14336, which the train's head (6/10241) waits for.
+        // Its next job (4/9216) never starts beside the head while the train's attempt runs: 14
+        // slots would pass the 12 the share leaves. So a 1/4096 lane job, which leaves room for
+        // the head whichever ends first, goes beside it.
+        let (_root, mut store) = robin_and_mauve();
+        history(&store.db, "f-1", "test", &[60.0, 60.0]);
+        set_share(&mut store, "pw-robin", need((4, 4096))).unwrap();
+        wants(&store, "t-run", "train", 0.5, (4, 2048));
+        assert_eq!(claims_on(&mut store, "pw-robin"), ["t-run"]);
+        hold(&store.db, "lanes", Some("pw-robin"), 2, 14336);
+        wants(&store, "head", "train", 1.0, (6, 10241));
+        wants(&store, "next", "train", 2.0, (4, 9216));
+        wants(&store, "install", "lane", 3.0, (1, 4096));
+        assert_eq!(claims_on(&mut store, "pw-robin"), ["install"]);
+    }
+
+    #[test]
+    fn a_train_job_too_large_for_what_the_share_leaves_holds_nothing_there() {
+        // The train's census (7/12800) waits on its running prepare, but can never run on
+        // pw-robin beside its 8/12800 share: pw-robin holds no room for it, and a 10-slot lane job
+        // too large for the share is admitted by the usual rules.
+        let (_root, mut store) = robin_and_mauve();
+        set_share(&mut store, "pw-robin", need((8, 12800))).unwrap();
+        job_of(&store, "prepare", "train", "running", (1, 1), &[]);
+        job_of(
+            &store,
+            "census",
+            "train",
+            "queued",
+            (7, 12800),
+            &["prepare"],
+        );
+        wants(&store, "wide", "lane", 1.0, (10, 2048));
+        assert_eq!(claims_on(&mut store, "pw-robin"), ["wide"]);
+        assert_eq!(load(&store.db, "pw-robin").unwrap().unwrap().holding, None);
+    }
+
+    #[test]
+    fn a_share_fits_beside_the_reserve_within_the_capacity() {
+        // #4818 review B4: share and reserve together never exceed the capacity, whichever is set
+        // last, and an executor-set that would shrink the capacity under them is refused.
+        let (_root, mut store) = robin_and_mauve();
+        set_reserve(&mut store, "pw-robin", need((8, 9216))).unwrap();
+        for (wanted, refused) in [((9, 1024), true), ((8, 15361), true), ((8, 15360), false)] {
+            let result = set_share(&mut store, "pw-robin", need(wanted));
+            assert_eq!(result.is_err(), refused, "{wanted:?}");
+        }
+        assert!(set_reserve(&mut store, "pw-robin", need((9, 9216))).is_err());
+        let lower = ConfigureRequest {
+            slots: Some(15),
+            ..ConfigureRequest::default()
+        };
+        let error = configure(&mut store, "pw-robin", &lower).unwrap_err();
+        assert!(format!("{error:#}").contains("lane share"), "{error:#}");
+        assert_eq!(
+            load(&store.db, "pw-robin").unwrap().unwrap().slots,
+            Some(16)
+        );
+        // A cgroup limit cannot be refused: under one the share does not fit beside the reserve,
+        // so it is not applied.
+        store
+            .db
+            .execute(
+                "UPDATE executors SET body=json_set(body,'$.observed.memory_limit_mb',20480)
+                 WHERE id='pw-robin'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            listed_executor(&store, "pw-robin")["share"]["unapplied"],
+            json!({"reason":"reserve"})
+        );
+        // Cleared, it is gone.
+        set_share(&mut store, "pw-robin", need((0, 0))).unwrap();
+        assert_eq!(listed_executor(&store, "pw-robin")["share"], Value::Null);
+    }
+
     #[test]
     fn reserve_refuses_an_unknown_executor_and_one_that_leaves_no_room() {
         let (_root, mut store) = lab();
@@ -5509,12 +6400,55 @@ mod tests {
         );
         assert_eq!(mindy_claims(&mut store, "k1"), None);
         // With no prioritized owner a lane's head drains as before: a lower priority's job does
-        // not go beside it.
+        // not go beside it, however short.
         let (_root, mut store) = mindy_running(&[(6, 9216), (6, 9216)]);
+        history(&store.db, "f-1", "test", &[60.0, 60.0]);
         crate::worker::set_priority(&store, "batch", -1).unwrap();
         wants(&store, "head", "lane", 1.0, (6, 9216));
         wants(&store, "install", "batch", 3.0, (2, 4096));
         assert_eq!(mindy_claims(&mut store, "k1"), None);
+    }
+
+    #[test]
+    fn a_lane_job_beside_a_trains_head_leaves_the_room_its_waiting_jobs_need_together() {
+        // As above, with two 1/1024 jobs waiting on the running dependency: once the 8192 MiB
+        // attempt ends and the head starts, either would still fit beside a 2/2048 lane job, but
+        // not both, and both start when the dependency passes: the lane job waits.
+        let (_root, mut store) = hold_lab();
+        register(&store.db, "mindy", 20, 24576);
+        history(&store.db, "f-1", "test", &[60.0, 60.0]);
+        hold(&store.db, "run-0", Some("mindy"), 6, 9216);
+        hold(&store.db, "run-1", Some("mindy"), 2, 8192);
+        crate::worker::set_priority(&store, "train", 1).unwrap();
+        wants(&store, "head", "train", 1.0, (6, 12288));
+        job_of(&store, "dep", "train", "running", (1, 1), &[]);
+        for id in ["waits-0", "waits-1"] {
+            history(&store.db, "f-1", id, &[60.0, 60.0]);
+            job_of(&store, id, "train", "queued", (1, 1024), &["dep"]);
+        }
+        wants(&store, "install", "lane", 3.0, (2, 2048));
+        assert_eq!(mindy_claims(&mut store, "k1"), None);
+    }
+
+    #[test]
+    fn a_lane_job_beside_a_trains_head_counts_the_dependency_the_hold_waits_on_as_freed() {
+        // mindy (20/24576) runs the train's prepare (6/9216), which its 6/9216 shard waits on, and a
+        // 2/4096 attempt. The 16384 MiB head waits for the prepare. A 2/4096 lane job fits now
+        // beside the hold, the prepare's room counted as freed, as it ends before the shard starts;
+        // and whichever attempt ends first, the head and the shard keep their room beside it.
+        let (_root, mut store) = hold_lab();
+        register(&store.db, "mindy", 20, 24576);
+        for job in ["test", "shard"] {
+            history(&store.db, "f-1", job, &[60.0, 60.0]);
+        }
+        job_of(&store, "prepare", "train", "running", (6, 9216), &[]);
+        running_on_mindy(&store, "prepare", (6, 9216));
+        job_of(&store, "shard", "train", "queued", (6, 9216), &["prepare"]);
+        hold(&store.db, "other", Some("mindy"), 2, 4096);
+        crate::worker::set_priority(&store, "train", 1).unwrap();
+        wants(&store, "head", "train", 1.0, (6, 16384));
+        wants(&store, "install", "lane", 3.0, (2, 4096));
+        assert_eq!(mindy_claims(&mut store, "k1").as_deref(), Some("install"));
     }
 
     #[test]
@@ -5624,6 +6558,7 @@ mod tests {
             crate::worker::set_priority(&store, "train", 1).unwrap();
             wants(&store, "head", "train", 1.0, (6, 12288));
             if held {
+                history(&store.db, "f-1", "waits", &[60.0, 60.0]);
                 job_of(&store, "dep", "train", "running", (1, 1), &[]);
                 job_of(&store, "waits", "train", "queued", (1, 2048), &["dep"]);
             }
@@ -6690,6 +7625,7 @@ mod tests {
             held: need((3, 3072)),
             unprioritized: need((1, 1024)),
             lent: need((1, 1024)),
+            prioritized: need((1, 1024)),
             freed: Vec::new(),
         };
         let choice = |priority: i64| Choice {
