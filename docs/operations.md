@@ -42,18 +42,28 @@ A job queued behind a blocked head still starts beside it (backfill) when all of
 
 - It is admitted on its own terms: it fits, beside the hold and within the reserve or the lent
   reserve.
-- It is of the head's own priority.
-- It is another owner's job, or the head's own owner's while no other owner has queued work of
-  that priority that may run on the executor, whatever that work's dependencies: the claim moves
-  its owner's fair share, and another owner's work could then pass the head. This is how a
-  train's small jobs start beside its own blocked shard.
-- It delays nothing ranked before it at that priority: whichever of the executor's running jobs
-  end first, the head and then each job of its priority ranked ahead of it, in rank order, start
-  just as soon as they would without it.
-- No unverified job of that priority is ranked ahead of it, at most 12 jobs are held on the
-  executor, no hold above the head's priority applies there (a hold lifts wherever its job does
-  not land, and the head would then start at once), and its claim would not move the median a
-  job without history is ranked by.
+- It is of the head's own priority, or of a lower one when the head is prioritized (a lane job
+  beside a train's head). Never of a higher one.
+- Of the head's priority: it is another owner's job, or the head's own owner's while no other
+  owner has queued work of that priority that may run on the executor, whatever that work's
+  dependencies: the claim moves its owner's fair share, and another owner's work could then pass
+  the head. This is how a train's small jobs start beside its own blocked shard.
+- Of a lower priority: its history holds at least two passes, every one under 10 minutes, as for
+  lending, so that work no proof can see (the next train, a requeue, a restarted train) waits for
+  it about 10 minutes at most; no job of a higher priority than its own that fits now is ranked
+  ahead of it (a train's job that fits never waits for a lane's); and it is among the first 8
+  such jobs the claim tries, which keeps a claim's cost flat however many lane jobs wait.
+- It delays nothing ranked before it: whichever of the executor's running jobs end first, the
+  head and then each job ranked ahead of it, in rank order, start just as soon as they would
+  without it. A lower-priority job must also leave, in each of those cases, the room a train's
+  queued work that is not ready yet would find without it: the hold for jobs waiting on a running
+  dependency, and each prioritized job waiting on anything, however its dependencies stand.
+- No unverified job is ranked ahead of it, at most 12 jobs are held on the executor, no hold
+  above the head's priority applies there (a hold lifts wherever its job does not land, and the
+  head would then start at once, which no ending of a held job shows the proof), and its claim
+  would not move the median a job without history is ranked by. A hold at the head's own
+  priority never keeps the head back: for a lower-priority job it is demand the proof keeps room
+  for.
 
 The owner test is per executor while fair share is global, so a backfill of the head's own owner's
 job can move that owner behind another owner on a different executor. The guarantee covers the
@@ -141,6 +151,8 @@ queued jobs it may run but does not admit now, each with its action, owner and `
   is taken) or `larger-than-reserve`.
 - `behind`: queued behind the head (`head`) the executor drains for, holds or awaits verification
   of; the one job backfill would start beside the head is not listed.
+- `unproven`: a lane job behind a train's head (`head`) whose history (`history`: `no-history`,
+  `too-few-passes` or `too-long`) does not show it short enough to start beside it.
 - `capacity`: larger than the executor.
 
 Each executor judges with its placement and the profiles it last reported verified or refused; a

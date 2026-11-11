@@ -334,6 +334,7 @@ fn unprioritized(db: &Connection) -> Result<String> {
 
 /// One undrained attempt on an executor, as `backfill` releases it.
 struct HeldAttempt {
+    id: String,
     reservation: Reservation,
     /// Counted in `held_unprioritized`.
     unprioritized: bool,
@@ -348,11 +349,12 @@ fn held_attempts(db: &Connection, executor: &str) -> Result<Vec<HeldAttempt>> {
     let mut stmt = db.prepare(&format!(
         "SELECT COALESCE(json_extract(body,'$.slots'),0),
          COALESCE(json_extract(body,'$.memory_mb'),0),
-         ({unprioritized}) AND NOT {LENT}, ({unprioritized}) AND {LENT}
+         ({unprioritized}) AND NOT {LENT}, ({unprioritized}) AND {LENT}, id
          FROM attempts WHERE drained=0 AND {EXECUTOR}=? ORDER BY rowid"
     ))?;
     let rows = stmt.query_map([executor], |r| {
         Ok(HeldAttempt {
+            id: r.get(4)?,
             reservation: Reservation {
                 slots: r.get(0)?,
                 memory_mb: r.get(1)?,
@@ -384,6 +386,9 @@ pub struct Choice {
     /// On an executor with a reserve, why the job may not be lent it now (`waiting`); None when it
     /// may, or without a reserve.
     pub unlent: Option<&'static str>,
+    /// Why the job's history does not show it short (`Durations::unlendable`), as work of a lower
+    /// priority than a blocked head must be to go beside it (`backfill`); None when it does.
+    pub unproven: Option<&'static str>,
 }
 
 pub struct Selection {
@@ -412,10 +417,14 @@ pub struct Selection {
     /// Capacity held for prioritized work this executor could run once a running dependency
     /// passes (the train-first hold): what it needs, per priority.
     pub hold: BTreeMap<i64, Reservation>,
-    /// What the running dependencies being waited on hold here, with the highest priority of the
-    /// held jobs waiting on each: it frees before they start, so it is not counted beside the hold
-    /// as well (gate P3-3), and only for heads below that priority (re-gate P3-1).
-    pub freed: Vec<(i64, Reservation)>,
+    /// The sizes, with their priorities, of prioritized queued work this executor may run that is
+    /// not eligible yet, whether its dependencies run or have not started: demand `backfill`'s
+    /// proof keeps room for beside lower-priority work (#4818).
+    pub unready: Vec<(i64, Reservation)>,
+    /// What the running dependencies being waited on hold here, by attempt, with the highest
+    /// priority of the held jobs waiting on each: it frees before they start, so it is not counted
+    /// beside the hold as well (gate P3-3), and only for heads below that priority (re-gate P3-1).
+    pub freed: Vec<Freed>,
     /// What this executor keeps for owners above priority 0 (`set_reserve`).
     pub reserve: Option<Reservation>,
 }
@@ -477,6 +486,7 @@ pub fn select(
     let mut choices = Vec::new();
     let mut hold: BTreeMap<i64, Reservation> = BTreeMap::new();
     let mut waited_on = BTreeMap::new();
+    let mut unready: BTreeSet<(i64, u32, u32)> = BTreeSet::new();
     // The owners, with their priorities, of queued work that may run here (`Selection::alone`).
     let mut wanting: BTreeSet<(i64, String)> = BTreeSet::new();
     for (action, rank) in queued.into_iter().zip(ranks) {
@@ -532,17 +542,21 @@ pub fn select(
             }
         }
         let eligible = engine::eligible(db, &action)?;
+        let top = owners
+            .iter()
+            .map(|owner| priorities.get(owner).copied().unwrap_or(0))
+            .max()
+            .unwrap_or(0);
+        if !eligible && top > 0 {
+            unready.insert((top, reservation.slots, reservation.memory_mb));
+        }
         if !eligible && !engine::eligible_soon(db, &action)? {
             continue;
         }
         if !eligible {
             // The train-first hold (chief, #4204): a prioritized owner's job waiting only on a
             // running dependency keeps the capacity it will need from lower-priority owners.
-            let priority = owners
-                .iter()
-                .map(|owner| priorities.get(owner).copied().unwrap_or(0))
-                .max()
-                .unwrap_or(0);
+            let priority = top;
             if priority > 0 {
                 let demand = hold.entry(priority).or_insert(Reservation {
                     slots: 0,
@@ -630,6 +644,7 @@ pub fn select(
                 timeout_seconds,
                 lent,
                 unlent,
+                unproven: durations.unlendable(&action),
             };
             choices.push((priority, served, rank, trusted, choice));
         }
@@ -675,8 +690,10 @@ pub fn select(
         })
         .collect();
     let freed = waited_on
-        .into_values()
-        .map(|(priority, slots, memory_mb)| (priority, Reservation { slots, memory_mb }))
+        .into_iter()
+        .map(|(attempt, (priority, slots, memory_mb))| {
+            (attempt, priority, Reservation { slots, memory_mb })
+        })
         .collect();
     Ok(Selection {
         choice,
@@ -687,6 +704,10 @@ pub fn select(
         skipped,
         skipped_more,
         hold,
+        unready: unready
+            .into_iter()
+            .map(|(priority, slots, memory_mb)| (priority, Reservation { slots, memory_mb }))
+            .collect(),
         freed,
         reserve,
     })
@@ -1263,6 +1284,7 @@ pub fn claim_for(
         alone,
         unverified,
         hold,
+        unready,
         freed,
         reserve,
         ..
@@ -1272,6 +1294,7 @@ pub fn claim_for(
         capacity,
         reserve,
         hold: &hold,
+        unready: &unready,
     };
     let admits = |choice: &Choice, load: &Load| admission.admits(choice, load);
     let blocked = choice
@@ -1393,7 +1416,7 @@ fn current_load(
     db: &Connection,
     executor: &str,
     reserve: Option<Reservation>,
-    freed: Vec<(i64, Reservation)>,
+    freed: Vec<Freed>,
 ) -> Result<Load> {
     let held = held(db, executor)?;
     // Only a reserve reads them.
@@ -1416,11 +1439,13 @@ fn current_load(
 }
 
 /// The rules a choice is admitted by on one executor: its capacity, its reserve, and the holds of
-/// the priorities waiting on running dependencies (`Selection`).
+/// the priorities waiting on running dependencies (`Selection`); and the prioritized work not
+/// eligible yet that `backfill` keeps room for.
 struct Admission<'a> {
     capacity: Reservation,
     reserve: Option<Reservation>,
     hold: &'a BTreeMap<i64, Reservation>,
+    unready: &'a [(i64, Reservation)],
 }
 
 impl Admission<'_> {
@@ -1465,17 +1490,24 @@ impl Admission<'_> {
     /// Whether `choice` fits beside the hold above its priority. Only dependencies higher
     /// priorities wait on free room for it.
     fn beside_hold(&self, choice: &Choice, load: &Load) -> bool {
-        self.holding(choice.priority).is_none_or(|demand| {
+        self.hold_room(choice.priority, choice.reservation, load)
+    }
+
+    /// Whether `wanted` fits beside `load` and the hold above `priority`, counting the
+    /// dependencies those holds wait on as freed: with nothing wanted, whether the held jobs above
+    /// `priority` still find their room.
+    fn hold_room(&self, priority: i64, wanted: Reservation, load: &Load) -> bool {
+        self.holding(priority).is_none_or(|demand| {
             let freed = load
                 .freed
                 .iter()
-                .filter(|(priority, _)| *priority > choice.priority)
+                .filter(|(_, waiting, _)| *waiting > priority)
                 .fold(
                     Reservation {
                         slots: 0,
                         memory_mb: 0,
                     },
-                    |sum, (_, need)| Reservation {
+                    |sum, (_, _, need)| Reservation {
                         slots: sum.slots.saturating_add(need.slots),
                         memory_mb: sum.memory_mb.saturating_add(need.memory_mb),
                     },
@@ -1493,7 +1525,7 @@ impl Admission<'_> {
                         .saturating_sub(freed.memory_mb)
                         .saturating_add(demand.memory_mb),
                 },
-                choice.reservation,
+                wanted,
                 self.capacity,
             )
         })
@@ -1501,9 +1533,13 @@ impl Admission<'_> {
 
     /// Whether `choice` is admitted beside `load`: it fits the executor, the hold and the reserve.
     fn admits(&self, choice: &Choice, load: &Load) -> bool {
-        fits(load.held, choice.reservation, self.capacity)
-            && self.beside_hold(choice, load)
-            && self.beside_reserve(choice, load)
+        self.room(choice.priority, choice.reservation, load) && self.beside_reserve(choice, load)
+    }
+
+    /// Whether work of `priority` reserving `wanted` fits the executor beside `load` and the hold
+    /// above its priority.
+    fn room(&self, priority: i64, wanted: Reservation, load: &Load) -> bool {
+        fits(load.held, wanted, self.capacity) && self.hold_room(priority, wanted, load)
     }
 
     /// Where `choice` claimed beside `load` goes: nowhere, or the lanes' share or the reserve lent
@@ -1526,8 +1562,12 @@ struct Load {
     lent: Reservation,
     /// The running dependencies among them that held jobs wait on, each with the highest priority
     /// waiting on it (`Selection::freed`).
-    freed: Vec<(i64, Reservation)>,
+    freed: Vec<Freed>,
 }
+
+/// A running dependency held jobs wait on: its attempt, the highest priority waiting on it, and
+/// what it holds.
+pub type Freed = (String, i64, Reservation);
 
 impl Load {
     /// Whether `choice`, claimed beside this load, is lent the reserve: it may be (`Choice::lent`),
@@ -1651,6 +1691,7 @@ fn reclaim(
                 r.get(0)?,
                 r.get(1)?,
                 HeldAttempt {
+                    id: r.get(0)?,
                     reservation: Reservation {
                         slots: r.get(2)?,
                         memory_mb: r.get(3)?,
@@ -1725,9 +1766,11 @@ fn reclaim(
 
 /// What goes beside a blocked `head` while its executor drains for it: later small actions cannot
 /// starve its reservation, so only one admitted now on its own terms that never delays it goes
-/// beside it (`backfill`). Nothing while a hold above the head applies here: a hold lifts wherever
-/// the job it keeps room for does not land, and the head would then start at once. `claim_for`
-/// claims it, and `waiting` leaves it out.
+/// beside it (`backfill`). Nothing while a hold above the head's priority applies here: such a
+/// hold lifts wherever the job it keeps room for does not land, and the head would then start at
+/// once, which no release of a held attempt shows `backfill`'s proof. A hold at the head's
+/// priority never keeps the head back; it is demand the proof counts for lower-priority work.
+/// `claim_for` claims it, and `waiting` leaves it out.
 fn beside(
     db: &Connection,
     executor: &str,
@@ -1740,55 +1783,82 @@ fn beside(
     if admission.holding(head.priority).is_some() {
         return Ok(None);
     }
-    let place = |choice: &Choice, load: &Load| admission.place(choice, load);
-    backfill(db, executor, head, alone, later, current, place)
+    backfill(db, executor, admission, head, alone, later, current)
 }
+
+/// Lower-priority choices `backfill` tries beside one blocked head per claim at most. Each costs a
+/// replay of every ranked job over up to 2^`MAX_BACKFILL_HELD` sets of releases; with about 100
+/// lane jobs queued behind a train, trying them all would make each claim's latency grow with the
+/// lanes' queue. The first few that fit now are the ones fair share would take next anyway.
+const MAX_BACKFILL_BELOW: usize = 8;
 
 /// Which choice after a verified head that `admits` keeps back goes beside it (#4204, lane run
 /// 4456: mindy drained most of 80 minutes for a third shard while smaller jobs that would not have
 /// delayed it waited). The first in `later`'s order that:
-/// - is admitted now on its own terms (`place`);
-/// - is of the head's own priority, so it never goes ahead of higher work queued behind the head
-///   (a lane job beside a train's head would take the room the train's next job fits in);
-/// - is another owner's, so its claim moves only that owner's fair share and the head stays the
-///   head, or the head's own owner's while that owner is `alone` at the priority here
-///   (`Selection::alone`; #4204, train 358: mauve kept 8 slots and 8 GiB idle for 23 minutes while
-///   the train's small jobs waited behind its own 9 GiB group);
-/// - may go beside (`Later::beside`), with no unverified choice of that priority ranked before
-///   it, as that one's fit cannot be judged;
-/// - delays nothing ranked before it at that priority (#4204 gate P2-1): whichever of the attempts
-///   held here end first, the head and then each choice of its priority ranked before this one
-///   are admitted in rank order, each beside those before it, exactly as far with this choice
-///   held as without it. The choice is held where its claim now puts it (`place`): work lent the
-///   reserve stays lent, beside the lanes' share rather than in it, whatever ends first.
+/// - is admitted now on its own terms (`Admission::place`);
+/// - is of the head's own priority, or of a lower one beside a prioritized head (#4818, train
+///   375: mindy kept 8 slots and 6144 MiB idle under a 9216 MiB head while 101 lane jobs waited),
+///   never above it;
+/// - of the head's priority, is another owner's, so its claim moves only that owner's fair share
+///   and the head stays the head, or the head's own owner's while that owner is `alone` at the
+///   priority here (`Selection::alone`; #4204, train 358: mauve kept 8 slots and 8 GiB idle for 23
+///   minutes while the train's small jobs waited behind its own 9 GiB group);
+/// - of a lower priority, has a history that shows it short, as lending's does
+///   (`Choice::unproven`): what no proof can see (the next train, a requeue, a restarted train)
+///   then waits for it about `LEND_SECONDS` at most; goes ahead of no choice of a higher priority
+///   than its own that is admitted now on its own terms, so a train's job that fits never waits
+///   for a lane's; and is among the first `MAX_BACKFILL_BELOW` such choices tried;
+/// - may go beside (`Later::beside`), with no unverified choice ranked before it, as that one's
+///   fit cannot be judged;
+/// - delays nothing ranked before it (#4204 gate P2-1): whichever of the attempts held here end
+///   first, the head and then each choice ranked before this one are admitted in rank order, each
+///   beside those before it, exactly as far with this choice held as without it. For a choice of a
+///   lower priority than the head, the prioritized work not eligible yet keeps its room too: the
+///   room held for jobs waiting only on a running dependency (the train-first hold), and each job
+///   of a higher priority than the choice's that waits on anything (`Selection::unready`), are
+///   still there beside as many of the ranked choices as they are without it. The choice is held
+///   where its claim now puts it: work lent the reserve stays lent, beside the lanes' share rather
+///   than in it, whatever ends first.
 ///
-/// Nothing goes beside with more than `MAX_BACKFILL_HELD` attempts held here. Backfill runs only
-/// while no hold above the head applies, so no check here reads freed room. `alone` is judged per
+/// Nothing goes beside with more than `MAX_BACKFILL_HELD` attempts held here. `alone` is judged per
 /// executor while fair share is global, so the head's own owner's job backfilled here can move
 /// that owner behind another owner on a different executor.
 fn backfill(
     db: &Connection,
     executor: &str,
+    admission: &Admission,
     head: &Choice,
     alone: bool,
     later: Vec<Later>,
     current: &Load,
-    place: impl Fn(&Choice, &Load) -> Option<bool>,
 ) -> Result<Option<Choice>> {
-    // The head, then the choices of its priority after it in rank order, up to the first whose
-    // fit cannot be judged; and among them the ones that may go beside, by position.
+    let place = |choice: &Choice, load: &Load| admission.place(choice, load);
+    // The head, then the choices after it in rank order, up to the first whose fit cannot be
+    // judged; and among them the ones that may go beside, by position.
     let mut ranked: Vec<&Choice> = vec![head];
     let mut candidates: Vec<(usize, &Choice)> = Vec::new();
-    for later in later
-        .iter()
-        .filter(|later| later.choice.priority == head.priority)
-    {
+    let mut below = 0;
+    for later in &later {
         if !later.verified {
             break;
         }
         let choice = &later.choice;
-        if later.beside && (alone || choice.owner != head.owner) && place(choice, current).is_some()
-        {
+        let eligible = if choice.priority == head.priority {
+            alone || choice.owner != head.owner
+        } else {
+            // Below a prioritized head only, short, never ahead of higher work that fits now.
+            choice.priority < head.priority
+                && head.priority > 0
+                && choice.unproven.is_none()
+                && below < MAX_BACKFILL_BELOW
+                && !ranked.iter().any(|before| {
+                    before.priority > choice.priority && place(before, current).is_some()
+                })
+        };
+        if later.beside && eligible && place(choice, current).is_some() {
+            if choice.priority < head.priority {
+                below += 1;
+            }
             candidates.push((ranked.len(), choice));
         }
         ranked.push(choice);
@@ -1800,7 +1870,8 @@ fn backfill(
     if held.len() > MAX_BACKFILL_HELD {
         return Ok(None);
     }
-    // What would be held after each set of releases.
+    // What would be held after each set of releases, with the dependencies held jobs wait on that
+    // still run.
     let releases: Vec<Load> = (0..1u32 << held.len())
         .map(|released| {
             let mut load = Load {
@@ -1833,42 +1904,97 @@ fn backfill(
                 if attempt.lent {
                     load.lent = add(load.lent);
                 }
+                load.freed.extend(
+                    current
+                        .freed
+                        .iter()
+                        .filter(|(waited, _, _)| *waited == attempt.id)
+                        .cloned(),
+                );
             }
             load
         })
         .collect();
-    // How many of the first `limit` ranked choices are admitted in order beside `load`: each is
-    // placed as its claim would be, and one whose action is already admitted (another owner's
-    // choice of it, or `admitted`) needs no more room.
-    let reach = |mut load: Load, limit: usize, admitted: Option<&str>| -> usize {
+    // The loads as the first `limit` ranked choices are admitted in order beside `load`, one per
+    // choice admitted, until one is not: each is placed as its claim would be, and one whose
+    // action is already admitted (another owner's choice of it, or `admitted`) needs no more room.
+    let prefix = |load: Load, limit: usize, admitted: Option<&str>| -> Vec<Load> {
         let mut actions: BTreeSet<&str> = admitted.into_iter().collect();
-        for (index, choice) in ranked[..limit].iter().enumerate() {
+        let mut loads = vec![load];
+        for choice in &ranked[..limit] {
+            let load = loads.last().expect("one load at least");
             if actions.contains(choice.action.id.as_str()) {
+                loads.push(load.clone());
                 continue;
             }
-            match place(choice, &load) {
+            match place(choice, load) {
                 Some(lent) => {
-                    load = load.with(choice, lent);
+                    loads.push(load.with(choice, lent));
                     actions.insert(&choice.action.id);
                 }
-                None => return index,
+                None => break,
             }
         }
-        limit
+        loads
     };
-    let without: Vec<usize> = releases
+    let without: Vec<Vec<Load>> = releases
         .iter()
-        .map(|load| reach(load.clone(), ranked.len(), None))
+        .map(|load| prefix(load.clone(), ranked.len(), None))
         .collect();
+    let nothing = Reservation {
+        slots: 0,
+        memory_mb: 0,
+    };
+    // A lower-priority candidate that fails is no smaller than a later one in the same pool:
+    // skip that one.
+    let mut failed: Vec<(Reservation, bool)> = Vec::new();
     Ok(candidates
         .into_iter()
         .find(|(position, choice)| {
             let lent = place(choice, current) == Some(true);
-            releases.iter().zip(&without).all(|(load, reached)| {
-                let reached = (*reached).min(*position);
-                reached == 0
-                    || reach(load.with(choice, lent), *position, Some(&choice.action.id)) >= reached
-            })
+            let lower = choice.priority < head.priority;
+            if lower
+                && failed.iter().any(|(reservation, pool)| {
+                    *pool == lent
+                        && choice.reservation.slots >= reservation.slots
+                        && choice.reservation.memory_mb >= reservation.memory_mb
+                })
+            {
+                return false;
+            }
+            // The demand not eligible yet that must keep its room beside a lower-priority choice:
+            // the hold above its priority, and each unready job above it.
+            let demands: Vec<(i64, Reservation)> = if lower {
+                std::iter::once((choice.priority, nothing))
+                    .chain(
+                        admission
+                            .unready
+                            .iter()
+                            .filter(|(priority, _)| *priority > choice.priority)
+                            .copied(),
+                    )
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let roomy = |(priority, wanted): (i64, Reservation), load: &Load| {
+                admission.room(priority, wanted, load)
+            };
+            let delays = releases.iter().zip(&without).any(|(load, loads)| {
+                let reached = (loads.len() - 1).min(*position);
+                let with = prefix(load.with(choice, lent), *position, Some(&choice.action.id));
+                reached > 0 && with.len() - 1 < reached
+                    || demands.iter().any(|demand| {
+                        (0..=reached.min(with.len() - 1))
+                            .rev()
+                            .find(|count| roomy(*demand, &loads[*count]))
+                            .is_some_and(|count| !roomy(*demand, &with[count]))
+                    })
+            });
+            if delays && lower {
+                failed.push((choice.reservation, lent));
+            }
+            !delays
         })
         .map(|(_, choice)| choice.clone()))
 }
@@ -3208,6 +3334,7 @@ fn waiting(
         skipped,
         skipped_more,
         hold,
+        unready,
         freed,
         reserve,
         ..
@@ -3219,19 +3346,34 @@ fn waiting(
         &refused,
         capacity,
     )?;
-    let queued: Vec<(String, String)> = later
+    type Queued = (String, String, i64, Option<&'static str>);
+    let queued: Vec<Queued> = later
         .iter()
-        .map(|later| (later.choice.action.id.clone(), later.choice.owner.clone()))
+        .map(|later| {
+            let choice = &later.choice;
+            (
+                choice.action.id.clone(),
+                choice.owner.clone(),
+                choice.priority,
+                choice.unproven,
+            )
+        })
         .collect();
-    // The work behind `head`, but for `beside`.
+    // The work behind `head`, but for `beside`: a job of a lower priority than a prioritized head
+    // whose history does not show it short may not go beside it (`unproven`).
     let behind = |head: &Choice, beside: Option<&Choice>| -> Vec<Value> {
         queued
             .iter()
-            .filter(|(action, owner)| {
+            .filter(|(action, owner, _, _)| {
                 beside.is_none_or(|beside| beside.action.id != *action || beside.owner != *owner)
             })
-            .map(|(action, owner)| {
-                json!({"action":action,"owner":owner,"reason":"behind","head":head.action.id})
+            .map(|(action, owner, priority, unproven)| {
+                match unproven.filter(|_| head.priority > 0 && *priority < head.priority) {
+                    Some(history) => json!({"action":action,"owner":owner,"reason":"unproven",
+                                            "head":head.action.id,"history":history}),
+                    None => json!({"action":action,"owner":owner,"reason":"behind",
+                                   "head":head.action.id}),
+                }
             })
             .collect()
     };
@@ -3250,6 +3392,7 @@ fn waiting(
             capacity,
             reserve,
             hold: &hold,
+            unready: &unready,
         };
         if !admission.admits(head, &current) {
             let mut entry = json!({"action":head.action.id,"owner":head.owner});
@@ -5305,6 +5448,191 @@ mod tests {
         assert_eq!(mindy_claims(&mut store, "k1").as_deref(), Some("small"));
     }
 
+    /// mindy (20/24576) running two 6/9216 attempts, 6144 MiB free; the train (priority 1) has
+    /// its 6/9216 head and `next` queued after it, and a lane wants a 2/4096 install. Every job
+    /// has two short passes.
+    fn a_lane_install_behind_a_trains_head(next: Queue) -> (tempfile::TempDir, Store) {
+        let (root, store) = mindy_running(&[(6, 9216), (6, 9216)]);
+        history(&store.db, "f-1", "test", &[60.0, 60.0]);
+        crate::worker::set_priority(&store, "train", 1).unwrap();
+        wants(&store, "head", "train", 1.0, (6, 9216));
+        queue(&store.db, next);
+        wants(&store, "install", "lane", 3.0, (2, 4096));
+        (root, store)
+    }
+
+    #[test]
+    fn a_lane_job_goes_beside_a_trains_head_only_if_no_train_job_could_use_its_room() {
+        // #4818 (train 375): mindy had 8 slots and 6144 MiB free under the train's 9216 MiB head
+        // while 101 lane jobs waited. The install takes room no train job can use whichever
+        // attempt ends first: the head starts at either end, and the train's next 9216 MiB job
+        // only once both have ended, beside the install too.
+        let next = |reservation: (u32, u32)| Queue {
+            id: "next",
+            owner: "train",
+            created: 2.0,
+            reservation: Some(reservation),
+            ..Queue::default()
+        };
+        let (_root, mut store) = a_lane_install_behind_a_trains_head(next((6, 9216)));
+        assert_eq!(mindy_claims(&mut store, "k1").as_deref(), Some("install"));
+        ends(&store, "run-0");
+        assert_eq!(mindy_claims_all(&mut store), ["head"]);
+        ends(&store, "run-1");
+        assert_eq!(mindy_claims_all(&mut store), ["next"]);
+        // A 12288 MiB next job fits beside the head once both attempts end, and not beside the
+        // install too: the lane waits.
+        let (_root, mut store) = a_lane_install_behind_a_trains_head(next((6, 12288)));
+        assert_eq!(mindy_claims(&mut store, "k1"), None);
+        assert_eq!(state(&store.db, "install"), "queued");
+        // So does it for a train job whose fit cannot be judged here.
+        let (_root, mut store) = a_lane_install_behind_a_trains_head(Queue {
+            profile: "f-2",
+            ..next((6, 9216))
+        });
+        assert_eq!(mindy_claims(&mut store, "k1"), None);
+        // And for a train job not eligible yet, behind a dependency that has not started (it
+        // never fits mindy): once both attempts end it fits beside the head, and not beside the
+        // install too (#4818 review, A1).
+        let (_root, mut store) = a_lane_install_behind_a_trains_head(next((6, 9216)));
+        wants(&store, "prep", "train", 0.5, (21, 512));
+        queue(
+            &store.db,
+            Queue {
+                id: "late",
+                owner: "train",
+                created: 2.5,
+                reservation: Some((6, 12288)),
+                dependencies: &["prep"],
+                ..Queue::default()
+            },
+        );
+        assert_eq!(mindy_claims(&mut store, "k1"), None);
+        // With no prioritized owner a lane's head drains as before: a lower priority's job does
+        // not go beside it.
+        let (_root, mut store) = mindy_running(&[(6, 9216), (6, 9216)]);
+        crate::worker::set_priority(&store, "batch", -1).unwrap();
+        wants(&store, "head", "lane", 1.0, (6, 9216));
+        wants(&store, "install", "batch", 3.0, (2, 4096));
+        assert_eq!(mindy_claims(&mut store, "k1"), None);
+    }
+
+    #[test]
+    fn only_a_lane_job_whose_history_shows_it_short_goes_beside_a_trains_head() {
+        // #4818 review A2: what no proof sees (the next train, a requeue) can wait for the lane
+        // job, so it must be one whose passes all ended within LEND_SECONDS, two at least. The
+        // executor says why the others wait.
+        for (samples, claimed, why) in [
+            (&[][..], None, Some("no-history")),
+            (&[60.0][..], None, Some("too-few-passes")),
+            (&[60.0, LEND_SECONDS][..], None, Some("too-long")),
+            (&[60.0, 60.0][..], Some("install"), None),
+        ] {
+            let (_root, mut store) = mindy_running(&[(6, 9216), (6, 9216)]);
+            history(&store.db, "f-1", "build", &[60.0, 60.0]);
+            crate::worker::set_priority(&store, "train", 1).unwrap();
+            for (id, created) in [("head", 1.0), ("next", 2.0)] {
+                queue(
+                    &store.db,
+                    Queue {
+                        id,
+                        owner: "train",
+                        job: "build",
+                        created,
+                        reservation: Some((6, 9216)),
+                        ..Queue::default()
+                    },
+                );
+            }
+            if !samples.is_empty() {
+                history(&store.db, "f-1", "install", samples);
+            }
+            job_wants(&store, "install", "lane", "install", 3.0, (2, 4096));
+            if let Some(why) = why {
+                assert_eq!(
+                    waiting_on(&store, "mindy").last().unwrap(),
+                    &json!({"action":"install","owner":"lane","reason":"unproven",
+                            "head":"head","history":why})
+                );
+            }
+            assert_eq!(
+                mindy_claims(&mut store, "k1").as_deref(),
+                claimed,
+                "{samples:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_claim_tries_a_bounded_number_of_lane_jobs_beside_a_trains_head() {
+        // #4818 review A3: eight 2/4096 lane jobs would each keep the train's 12288 MiB job from
+        // starting beside its head; a ninth, of 1/1024, would not, but is past the bound, so the
+        // claim's cost stays flat however many lane jobs wait.
+        let (_root, mut store) = a_lane_install_behind_a_trains_head(Queue {
+            id: "next",
+            owner: "train",
+            created: 2.0,
+            reservation: Some((6, 12288)),
+            ..Queue::default()
+        });
+        for index in 1..MAX_BACKFILL_BELOW {
+            let id = format!("install-{index}");
+            wants(&store, &id, "lane", 3.0 + index as f64, (2, 4096));
+        }
+        wants(&store, "lint", "lane", 20.0, (1, 1024));
+        assert_eq!(mindy_claims(&mut store, "k1"), None);
+        store
+            .db
+            .execute("UPDATE interests SET active=0 WHERE action='install-1'", [])
+            .unwrap();
+        assert_eq!(mindy_claims(&mut store, "k2").as_deref(), Some("lint"));
+    }
+
+    #[test]
+    fn a_lane_job_never_goes_ahead_of_a_train_job_that_fits_now() {
+        // The train's 4/4608 job fits now, but beside its head it would delay it, so it waits:
+        // the lane's 2/1024 job, which would delay no train job, waits too rather than take room
+        // a train job fits in now.
+        let (_root, mut store) = mindy_running(&[(6, 12288), (6, 6144)]);
+        history(&store.db, "f-1", "test", &[60.0, 60.0]);
+        crate::worker::set_priority(&store, "train", 1).unwrap();
+        wants(&store, "shard", "train", 1.0, (6, 9216));
+        wants(&store, "wide", "train", 2.0, (4, 4608));
+        wants(&store, "lint", "lane", 3.0, (2, 1024));
+        assert_eq!(mindy_claims(&mut store, "k1"), None);
+        // Once that job is gone, the lane's goes beside the head.
+        store
+            .db
+            .execute("UPDATE interests SET active=0 WHERE action='wide'", [])
+            .unwrap();
+        assert_eq!(mindy_claims(&mut store, "k2").as_deref(), Some("lint"));
+    }
+
+    #[test]
+    fn a_lane_job_beside_a_trains_head_leaves_the_room_held_for_its_waiting_jobs() {
+        // mindy (20/24576) runs 6/9216 and 2/8192. The train's 6/12288 head waits for the 8192 MiB
+        // attempt; its 1/2048 job waits on a dependency running elsewhere, and mindy holds room
+        // for it. A 2/3072 lane job fits now beside that hold, but once the 8192 MiB attempt ends
+        // and the head starts, the held job's room would be gone with the lane job there: it
+        // waits. Without the held job it goes beside the head.
+        for held in [true, false] {
+            let (_root, mut store) = hold_lab();
+            register(&store.db, "mindy", 20, 24576);
+            history(&store.db, "f-1", "test", &[60.0, 60.0]);
+            hold(&store.db, "run-0", Some("mindy"), 6, 9216);
+            hold(&store.db, "run-1", Some("mindy"), 2, 8192);
+            crate::worker::set_priority(&store, "train", 1).unwrap();
+            wants(&store, "head", "train", 1.0, (6, 12288));
+            if held {
+                job_of(&store, "dep", "train", "running", (1, 1), &[]);
+                job_of(&store, "waits", "train", "queued", (1, 2048), &["dep"]);
+            }
+            wants(&store, "install", "lane", 3.0, (2, 3072));
+            let claimed = (!held).then_some("install");
+            assert_eq!(mindy_claims(&mut store, "k1").as_deref(), claimed, "{held}");
+        }
+    }
+
     #[test]
     fn nothing_unverified_is_admitted_beside_a_head() {
         // An unverified head admits nothing until it is judged, beside it or otherwise.
@@ -6375,11 +6703,13 @@ mod tests {
             timeout_seconds: 60,
             lent: true,
             unlent: None,
+            unproven: None,
         };
         for (priority, lent, unprioritized) in
             [(0, true, false), (0, false, true), (1, false, false)]
         {
             let held = HeldAttempt {
+                id: "x-a".into(),
                 reservation: need((1, 512)),
                 unprioritized,
                 lent,
