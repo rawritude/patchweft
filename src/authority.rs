@@ -326,6 +326,7 @@ fn held_attempts(db: &Connection, executor: &str) -> Result<Vec<HeldAttempt>> {
 
 /// Admissible work for one of its owners; `select` orders these by priority, fair share,
 /// critical-path rank and age.
+#[derive(Clone)]
 pub struct Choice {
     pub owner: String,
     /// The owner's scheduling priority.
@@ -342,17 +343,15 @@ pub struct Choice {
 
 pub struct Selection {
     pub choice: Option<Choice>,
-    /// The verified choices after the head, in the same order: what a blocked head may admit
-    /// beside it (`backfill`). Empty while the head is unverified, as it then admits nothing. A
-    /// choice whose claim would move the median a job without history ranks by is left out: it
-    /// could change the head. Any estimated job of a profile with such a job queued counts as one,
-    /// whether or not its claim would move the median: only a job with no history at all is held
-    /// up by it, and only while it is queued.
-    pub later: Vec<Choice>,
-    /// Whether the head's owner is the only one with work of the head's priority for this
-    /// executor, queued or waiting only on a running dependency, verified or not: only then may its
-    /// own job go beside its blocked head (`backfill`), as its claim moves its fair share and
-    /// nobody is there to pass the head.
+    /// Every choice after the head, verified or not, in the same order: what a blocked head may
+    /// admit beside it, and the jobs ranked before each that it must not delay (`backfill`). Empty
+    /// while the head is unverified, as it then admits nothing.
+    pub later: Vec<Later>,
+    /// Whether the head's owner is the only one with queued work of the head's priority that may
+    /// run on this executor, whatever its dependencies' or prerequisites' state, verified or not:
+    /// only then may its own job go beside its blocked head (`backfill`), as its claim moves its
+    /// fair share and nobody is there to pass the head (#4204 gate P2-2: work not yet eligible
+    /// passes the head once it is).
     pub alone: bool,
     /// Profiles of admissible work the executor has not verified (at most 32).
     pub unverified: Vec<String>,
@@ -365,6 +364,18 @@ pub struct Selection {
     pub freed: Vec<(i64, Reservation)>,
     /// What this executor keeps for owners above priority 0 (`set_reserve`).
     pub reserve: Option<Reservation>,
+}
+
+/// A choice after the head, as `backfill` reads it.
+pub struct Later {
+    pub choice: Choice,
+    /// Its profile is verified here, so its fit can be judged.
+    pub verified: bool,
+    /// It may go beside a blocked head: verified, and its claim moves no median a job without
+    /// history ranks by, which could change the head. Any estimated job of a profile with such a
+    /// job queued counts as one, whether or not its claim would move the median: only a job with
+    /// no history at all is held up by it, and only while it is queued.
+    pub beside: bool,
 }
 
 /// The head of one executor's queue: work it may run and could ever fit, ordered by owner
@@ -407,18 +418,14 @@ pub fn select(
     let mut choices = Vec::new();
     let mut hold: BTreeMap<i64, Reservation> = BTreeMap::new();
     let mut waited_on = BTreeMap::new();
-    // The owners, with their priorities, of jobs here that wait only on a running dependency.
-    let mut waiting: Vec<(i64, String)> = Vec::new();
+    // The owners, with their priorities, of queued work that may run here (`Selection::alone`).
+    let mut wanting: BTreeSet<(i64, String)> = BTreeSet::new();
     for (action, rank) in queued.into_iter().zip(ranks) {
         if !scope.allows_profile(&action.profile)
             || refused.contains(&action.profile)
             || refused.contains(REFUSE_ALL)
             || !record.placement.permits(&action.job)
         {
-            continue;
-        }
-        let eligible = engine::eligible(db, &action)?;
-        if !eligible && !engine::eligible_soon(db, &action)? {
             continue;
         }
         if scope.projects.is_some() && !scope.allows_project(&project(db, &action.revision)?) {
@@ -450,17 +457,21 @@ pub fn select(
                     beyond(unreserved(capacity, reserve)) && !(lent && !beyond(reserve))
                 })
         };
-        if !eligible {
-            // An owner whose job here waits only on a running dependency has work here too: once
-            // the dependency passes, that job may pass a head whose own owner's fair share a
-            // backfill moved (`Selection::alone`, #4204 in-lane adversary P1). Not an owner that
-            // could never run it here.
-            for owner in &owners {
-                let priority = priorities.get(owner).copied().unwrap_or(0);
-                if !beyond_reserve(priority) {
-                    waiting.push((priority, owner.clone()));
-                }
+        // Every owner of queued work that may run here has work here, whatever its dependencies'
+        // or prerequisites' state: once that work is eligible it may pass a head whose own owner's
+        // fair share a backfill moved (#4204 in-lane adversary P1, gate P2-2). Not an owner that
+        // could never run it here.
+        for owner in &owners {
+            let priority = priorities.get(owner).copied().unwrap_or(0);
+            if !beyond_reserve(priority) {
+                wanting.insert((priority, owner.clone()));
             }
+        }
+        let eligible = engine::eligible(db, &action)?;
+        if !eligible && !engine::eligible_soon(db, &action)? {
+            continue;
+        }
+        if !eligible {
             // The train-first hold (chief, #4204): a prioritized owner's job waiting only on a
             // running dependency keeps the capacity it will need from lower-priority owners.
             let priority = owners
@@ -575,21 +586,20 @@ pub fn select(
         .map(|(_, choice)| choice);
     let rest: Vec<(bool, Choice)> = order.collect();
     let alone = choice.as_ref().is_some_and(|head| {
-        rest.iter()
-            .all(|(_, other)| other.priority != head.priority || other.owner == head.owner)
-            && waiting
-                .iter()
-                .all(|(priority, owner)| *priority != head.priority || *owner == head.owner)
+        wanting
+            .iter()
+            .all(|(priority, owner)| *priority != head.priority || *owner == head.owner)
     });
     let later = match choice {
         Some(_) => rest
             .into_iter()
-            .filter(|(trusted, choice)| {
-                *trusted
+            .map(|(trusted, choice)| Later {
+                beside: trusted
                     && !(estimated.contains(&choice.action.id)
-                        && unestimated.contains(&choice.action.profile))
+                        && unestimated.contains(&choice.action.profile)),
+                verified: trusted,
+                choice,
             })
-            .map(|(_, choice)| choice)
             .collect(),
         None => Vec::new(),
     };
@@ -1290,17 +1300,12 @@ pub fn claim_for(
         // above the head applies here: a hold lifts wherever the job it keeps room for does not
         // land, and the head would then start at once.
         Some(head) if holding(head.priority).is_none() => {
-            let admissible = later.into_iter().filter(|choice| admits(choice, &current));
-            let lends = |choice: &Choice| current.lends(choice, left);
-            backfill(
-                &transaction,
-                executor,
-                &head,
-                alone,
-                admissible,
-                admits,
-                lends,
-            )?
+            // Where a choice claimed beside `load` goes: nowhere, or the lanes' share or the
+            // reserve lent (`Load::lends`).
+            let place = |choice: &Choice, load: &Load| {
+                admits(choice, load).then(|| load.lends(choice, left))
+            };
+            backfill(&transaction, executor, &head, alone, later, &current, place)?
         }
         _ => None,
     };
@@ -1372,6 +1377,7 @@ pub fn claim_for(
 }
 
 /// What admission counts as held on an executor.
+#[derive(Clone)]
 struct Load {
     /// Every undrained attempt (`held`).
     held: Reservation,
@@ -1425,42 +1431,63 @@ impl Load {
 /// set of them that could end first.
 const MAX_BACKFILL_HELD: usize = 12;
 
-/// Which of the `admissible` choices after a verified head that `admits` keeps back goes beside
-/// it (#4204, lane run 4456: mindy drained most of 80 minutes for a third shard while smaller jobs
-/// that would not have delayed it waited). The first in order that is of the head's own priority,
-/// so it never goes ahead of higher work queued behind the head (a lane job beside a train's head
-/// would take the room the train's next job fits in); another owner's, so its claim moves only
-/// that owner's fair share and the head stays the head, or the head's own owner's when it is
-/// `alone` at that priority here (`Selection::alone`), so no other owner's work can pass the head
-/// as its fair share moves (#4204, train 358: mauve kept 8 slots and 8 GiB idle for 23 minutes
-/// while the train's small jobs waited behind its own 9 GiB group); and that never delays the
-/// head: whichever of the attempts held here end first, if their end would admit the head, it
-/// still does with this choice held too, so the head starts at the same release as without it.
-/// The choice is held there where its claim now puts it (`lends`): work lent the reserve stays
-/// lent, beside the head's share rather than in it, whatever ends first. It runs only while no
-/// hold above the head applies, so the head's hold check reads no freed room. `alone` is judged
-/// per executor while fair share is global, so the head's own owner's job backfilled here can move
+/// Which choice after a verified head that `admits` keeps back goes beside it (#4204, lane run
+/// 4456: mindy drained most of 80 minutes for a third shard while smaller jobs that would not have
+/// delayed it waited). The first in `later`'s order that:
+/// - is admitted now on its own terms (`place`);
+/// - is of the head's own priority, so it never goes ahead of higher work queued behind the head
+///   (a lane job beside a train's head would take the room the train's next job fits in);
+/// - is another owner's, so its claim moves only that owner's fair share and the head stays the
+///   head, or the head's own owner's while that owner is `alone` at the priority here
+///   (`Selection::alone`; #4204, train 358: mauve kept 8 slots and 8 GiB idle for 23 minutes while
+///   the train's small jobs waited behind its own 9 GiB group);
+/// - may go beside (`Later::beside`), with no unverified choice of that priority ranked before
+///   it, as that one's fit cannot be judged;
+/// - delays nothing ranked before it at that priority (#4204 gate P2-1): whichever of the attempts
+///   held here end first, the head and then each choice of its priority ranked before this one
+///   are admitted in rank order, each beside those before it, exactly as far with this choice
+///   held as without it. The choice is held where its claim now puts it (`place`): work lent the
+///   reserve stays lent, beside the lanes' share rather than in it, whatever ends first.
+///
+/// Nothing goes beside with more than `MAX_BACKFILL_HELD` attempts held here. Backfill runs only
+/// while no hold above the head applies, so no check here reads freed room. `alone` is judged per
+/// executor while fair share is global, so the head's own owner's job backfilled here can move
 /// that owner behind another owner on a different executor.
 fn backfill(
     db: &Connection,
     executor: &str,
     head: &Choice,
     alone: bool,
-    admissible: impl Iterator<Item = Choice>,
-    admits: impl Fn(&Choice, &Load) -> bool,
-    lends: impl Fn(&Choice) -> bool,
+    later: Vec<Later>,
+    current: &Load,
+    place: impl Fn(&Choice, &Load) -> Option<bool>,
 ) -> Result<Option<Choice>> {
-    let mut beside = admissible
-        .filter(|choice| choice.priority == head.priority && (alone || choice.owner != head.owner))
-        .peekable();
-    if beside.peek().is_none() {
+    // The head, then the choices of its priority after it in rank order, up to the first whose
+    // fit cannot be judged; and among them the ones that may go beside, by position.
+    let mut ranked: Vec<&Choice> = vec![head];
+    let mut candidates: Vec<(usize, &Choice)> = Vec::new();
+    for later in later
+        .iter()
+        .filter(|later| later.choice.priority == head.priority)
+    {
+        if !later.verified {
+            break;
+        }
+        let choice = &later.choice;
+        if later.beside && (alone || choice.owner != head.owner) && place(choice, current).is_some()
+        {
+            candidates.push((ranked.len(), choice));
+        }
+        ranked.push(choice);
+    }
+    if candidates.is_empty() {
         return Ok(None);
     }
     let held = held_attempts(db, executor)?;
     if held.len() > MAX_BACKFILL_HELD {
         return Ok(None);
     }
-    // What would be held after each set of releases that admits the head.
+    // What would be held after each set of releases.
     let releases: Vec<Load> = (0..1u32 << held.len())
         .map(|released| {
             let mut load = Load {
@@ -1496,14 +1523,41 @@ fn backfill(
             }
             load
         })
-        .filter(|load| admits(head, load))
         .collect();
-    Ok(beside.find(|choice| {
-        let lent = lends(choice);
-        releases
-            .iter()
-            .all(|load| admits(head, &load.with(choice, lent)))
-    }))
+    // How many of the first `limit` ranked choices are admitted in order beside `load`: each is
+    // placed as its claim would be, and one whose action is already admitted (another owner's
+    // choice of it, or `admitted`) needs no more room.
+    let reach = |mut load: Load, limit: usize, admitted: Option<&str>| -> usize {
+        let mut actions: BTreeSet<&str> = admitted.into_iter().collect();
+        for (index, choice) in ranked[..limit].iter().enumerate() {
+            if actions.contains(choice.action.id.as_str()) {
+                continue;
+            }
+            match place(choice, &load) {
+                Some(lent) => {
+                    load = load.with(choice, lent);
+                    actions.insert(&choice.action.id);
+                }
+                None => return index,
+            }
+        }
+        limit
+    };
+    let without: Vec<usize> = releases
+        .iter()
+        .map(|load| reach(load.clone(), ranked.len(), None))
+        .collect();
+    Ok(candidates
+        .into_iter()
+        .find(|(position, choice)| {
+            let lent = place(choice, current) == Some(true);
+            releases.iter().zip(&without).all(|(load, reached)| {
+                let reached = (*reached).min(*position);
+                reached == 0
+                    || reach(load.with(choice, lent), *position, Some(&choice.action.id)) >= reached
+            })
+        })
+        .map(|(_, choice)| choice.clone()))
 }
 
 /// Steady polling rewrites the record at most every 30 s; changed verification is an event.
@@ -4581,14 +4635,22 @@ mod tests {
         // 5120 MiB beside it. A 4096 MiB job would delay it if the first pair ended first.
         let (_root, mut store) = mindy_running(&[(1, 5120), (1, 6144), (1, 7168)]);
         wants(&store, "head", "a", 1.0, (1, 14336));
-        wants(&store, "most", "b", 2.0, (1, 4096));
-        wants(&store, "least", "c", 3.0, (1, 3072));
+        wants(&store, "least", "c", 2.0, (1, 3072));
+        wants(&store, "most", "b", 3.0, (1, 4096));
         assert_eq!(mindy_claims(&mut store, "k1").as_deref(), Some("least"));
         ends(&store, "run-0");
         assert_eq!(mindy_claims(&mut store, "k2"), None);
         ends(&store, "run-1");
         assert_eq!(mindy_claims(&mut store, "k3").as_deref(), Some("head"));
         assert_eq!(state(&store.db, "most"), "queued");
+        // Ranked before the 3072 MiB job, the 4096 MiB one starts beside the head once the first
+        // and third attempts end: the smaller held would take its room, so it waits too (gate
+        // P2-1).
+        let (_root, mut store) = mindy_running(&[(1, 5120), (1, 6144), (1, 7168)]);
+        wants(&store, "head", "a", 1.0, (1, 14336));
+        wants(&store, "most", "b", 2.0, (1, 4096));
+        wants(&store, "least", "c", 3.0, (1, 3072));
+        assert_eq!(mindy_claims(&mut store, "k1"), None);
     }
 
     #[test]
@@ -4751,6 +4813,70 @@ mod tests {
     }
 
     #[test]
+    fn a_job_backfilled_beside_a_trains_head_never_delays_the_trains_next_ranked_job() {
+        // Gate P2-1 (#4204): mindy (20/24576) runs 1/6144 and 1/10240, so 8192 MiB is free. The
+        // train's shard (6/9216) is its blocked head, shard2 (6/9216) is ranked next and lint
+        // (1/1024) last. Once the 10240 MiB attempt ends both shards start; lint held would leave
+        // shard2 1024 MiB short until lint or the other attempt ended, so it waits, though it
+        // never delays the head itself.
+        for lint in [false, true] {
+            let (_root, mut store) = mindy_running(&[(1, 6144), (1, 10240)]);
+            crate::worker::set_priority(&store, "train", 1).unwrap();
+            wants(&store, "shard", "train", 1.0, (6, 9216));
+            wants(&store, "shard2", "train", 2.0, (6, 9216));
+            if lint {
+                wants(&store, "lint", "train", 3.0, (1, 1024));
+            }
+            assert_eq!(mindy_claims(&mut store, "k1"), None, "{lint}");
+            ends(&store, "run-1");
+            assert_eq!(mindy_claims_all(&mut store), ["shard", "shard2"], "{lint}");
+        }
+    }
+
+    #[test]
+    fn an_owner_whose_work_waits_on_a_dependency_queued_elsewhere_keeps_the_heads_own_owner_back() {
+        // Gate P2-2 (#4204): b's job waits on a dependency that never fits mindy and is queued for
+        // another executor, so the job is neither eligible nor waiting on a running dependency
+        // here. It is still b's work that may run here: once the dependency passes it would pass
+        // a's head if a's own small job had gone beside it, so that job waits, and the head
+        // starts when an attempt ends, as it does without the small job.
+        for small in [false, true] {
+            let (_root, mut store) = mindy_running(&[(6, 9216), (6, 9216)]);
+            store
+                .db
+                .execute_batch("INSERT INTO dispatches VALUES ('a',100.0),('b',200.0)")
+                .unwrap();
+            wants(&store, "head", "a", 1.0, (6, 9216));
+            if small {
+                wants(&store, "a-small", "a", 2.0, (1, 1024));
+            }
+            wants(&store, "dep", "b", 0.5, (21, 512));
+            queue(
+                &store.db,
+                Queue {
+                    id: "b-job",
+                    owner: "b",
+                    created: 3.0,
+                    reservation: Some((6, 9216)),
+                    dependencies: &["dep"],
+                    ..Queue::default()
+                },
+            );
+            assert_eq!(mindy_claims(&mut store, "k1"), None, "{small}");
+            store
+                .db
+                .execute("UPDATE actions SET state='passed' WHERE id='dep'", [])
+                .unwrap();
+            ends(&store, "run-0");
+            assert_eq!(
+                mindy_claims(&mut store, "k2").as_deref(),
+                Some("head"),
+                "{small}"
+            );
+        }
+    }
+
+    #[test]
     fn nothing_unverified_is_admitted_beside_a_head() {
         // An unverified head admits nothing until it is judged, beside it or otherwise.
         let (_root, mut store) = mindy_running(&[(6, 9216), (6, 9216)]);
@@ -4770,18 +4896,25 @@ mod tests {
         let both = ask("k2", &["f-1", "f-2"]);
         let response = claim_for(&mut store, "mindy", &Scope::all(), &both).unwrap();
         assert_eq!(claimed(&response), Some("shard"));
-        // A verified head admits only verified work beside it.
-        let (_root, mut store) = mindy_running(&[(6, 12288), (6, 6144)]);
-        wants(&store, "head", "a", 1.0, (6, 9216));
-        queue(
-            &store.db,
-            Queue {
-                reservation: Some((1, 1024)),
-                ..unverified("unverified", "b", 2.0)
-            },
-        );
-        wants(&store, "verified", "c", 3.0, (1, 1024));
-        assert_eq!(mindy_claims(&mut store, "k1").as_deref(), Some("verified"));
+        // A verified head admits only verified work beside it, and nothing ranked after work of
+        // its priority that is not verified, whose fit cannot be judged.
+        for (unverified_created, claimed) in [(4.0, Some("verified")), (2.0, None)] {
+            let (_root, mut store) = mindy_running(&[(6, 12288), (6, 6144)]);
+            wants(&store, "head", "a", 1.0, (6, 9216));
+            queue(
+                &store.db,
+                Queue {
+                    reservation: Some((1, 1024)),
+                    ..unverified("unverified", "b", unverified_created)
+                },
+            );
+            wants(&store, "verified", "c", 3.0, (1, 1024));
+            assert_eq!(
+                mindy_claims(&mut store, "k1").as_deref(),
+                claimed,
+                "{unverified_created}"
+            );
+        }
     }
 
     #[test]
@@ -4813,9 +4946,11 @@ mod tests {
         wants(&store, "prepare", "train", 0.5, (6, 10240));
         assert_eq!(mindy_claims(&mut store, "k1").as_deref(), Some("prepare"));
         wants(&store, "head", "a", 1.0, (4, 6656));
-        wants(&store, "larger", "b", 2.0, (2, 2048));
-        wants(&store, "smaller", "c", 3.0, (2, 1024));
+        wants(&store, "smaller", "c", 2.0, (2, 1024));
+        wants(&store, "larger", "b", 3.0, (2, 2048));
         assert_eq!(mindy_claims(&mut store, "k2").as_deref(), Some("smaller"));
+        assert_eq!(mindy_claims(&mut store, "k3"), None);
+        assert_eq!(state(&store.db, "larger"), "queued");
     }
 
     #[test]
