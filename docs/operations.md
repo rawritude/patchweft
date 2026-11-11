@@ -66,14 +66,27 @@ with priority above 0, and `--slots 0 --memory-mb 0` clears it. `patchweft execu
 `reserve`, and each change is an `executor.reserve` event. Trains run almost back to back, so
 prioritized work seldom leaves the reserve idle.
 
-Work no owner above 0 wants never occupies the reserve: it is admitted only if it fits, beside
-the other such work held there, within the capacity less the reserve. Prioritized work running
-there, inside the reserve or beyond it, never counts against what is left to priority 0; the
-whole capacity still bounds everything the executor runs, and a lower-priority head must fit
-beside both the hold and the reserve. A head the reserve keeps back drains the executor as one
-that does not fit yet does; it is not a hold and does not set `holding`. Work of an owner at 0
-or below that is larger than the capacity less the reserve is left to other executors, as work
-larger than an executor is, so it never keeps that executor's smaller work back.
+Work no owner above 0 wants occupies the reserve only while it is lent (below): otherwise it is
+admitted only if it fits, beside the other such work held there, within the capacity less the
+reserve. Prioritized work running there, inside the reserve or beyond it, never counts against
+what is left to priority 0; the whole capacity still bounds everything the executor runs, and a
+lower-priority head must fit beside both the hold and the reserve. A head the reserve keeps back
+drains the executor as one that does not fit yet does; it is not a hold and does not set
+`holding`. Work of an owner at 0 or below that is larger than the capacity less the reserve is
+left to other executors, as work larger than an executor is, so it never keeps that executor's
+smaller work back; only short work that fits the reserve stays while the reserve is lent.
+
+While no owner above 0 wants any work that is queued, running or stopping, on any executor (no
+train rides), the reserve is lent. A job of an owner at 0 or below that its history expects to
+take under 10 minutes (one without history never is) and that does not fit the capacity less the
+reserve may then take the reserve, beside the other lent work, up to the reserve's size. Lent
+work counts against the reserve only, never against what the reserve leaves, and its attempt
+says `"lent": true`. From the first prioritized request nothing more is lent, and what was lent
+runs until it ends: a train that arrives then waits for it, about 10 minutes at most if the
+history holds, as its jobs are admitted as soon as they fit the executor. Lane work keeps what
+the reserve leaves meanwhile, and short work larger than that is again left to other executors.
+`patchweft executors` shows `"lent"` (the reserve is applied and lent now) and `"lent_held"`, what
+lent work still holds.
 
 A queued action counts as prioritized while any owner above 0 wants it, as it does for ordering,
 and its claim is that owner's. A running attempt counts as prioritized while the owner it was

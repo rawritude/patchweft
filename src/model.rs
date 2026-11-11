@@ -299,6 +299,10 @@ pub struct Attempt {
     /// not report the attempt again. Outcome, exit code, reason and time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refused: Option<serde_json::Value>,
+    /// Admitted into the executor's reserve while it was lent to short work without priority: it
+    /// counts against the reserve, not against what the reserve leaves. Absent when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lent: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
