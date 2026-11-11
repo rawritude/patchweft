@@ -57,8 +57,9 @@ A job queued behind a blocked head still starts beside it (backfill) when all of
   head and then each job ranked ahead of it, in rank order, start just as soon as they would
   without it. A lower-priority job must also leave, in each of those cases, the room a train's
   queued work that is not ready yet would find without it: the hold for jobs waiting on a running
-  dependency (that dependency's own room counted as freed while it runs), and each prioritized
-  job waiting on a dependency that has not started.
+  dependency (that dependency's own room counted as freed while it runs here), and the prioritized
+  jobs waiting on a dependency that has not started, each alone and all of them together with the
+  hold.
 - No unverified job is ranked ahead of it, at most 12 jobs are held on the executor, no hold
   above the head's priority applies there (a hold lifts wherever its job does not land, and the
   head would then start at once, which no ending of a held job shows the proof), and its claim
