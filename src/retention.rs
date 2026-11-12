@@ -44,8 +44,8 @@ const ASIDE: &str = ".retention-";
 /// refuses: NTP slews at most 500 ppm (under 2 s an hour), so five minutes passes an honest clock
 /// while any step that could move a 30-day cutoff by a day is caught.
 pub const RETENTION_CLOCK_SLACK_SECONDS: f64 = 300.0;
-/// With no reading from this boot to compare with, how far the clock at process start may run
-/// past the newest time the store recorded: a quiet store may sit a day with nothing recorded.
+/// With no reading from this boot to compare with, how far the boot's start may lie past the
+/// newest time the store recorded before it: a host may be down, or the store quiet, for a day.
 const NEWEST_RECORD_SLACK_SECONDS: f64 = 86400.0;
 
 /// Additive and idempotent. Keys recorded before uses were (or by a v29 binary since) count as
@@ -451,18 +451,19 @@ fn tallies(map: &BTreeMap<String, Tally>) -> Value {
     map.iter().map(|(k, v)| (k.clone(), v.value())).collect()
 }
 
-/// The newest time the store recorded: attempts' `created`, `started` and `ended`, events' `time`
-/// (retention's own left out, as they carry the very clock under test) and candidates'
-/// `created`. None for an empty store.
-fn newest_recorded(db: &Connection) -> Result<Option<f64>> {
+/// The newest time the store recorded before `before`: attempts' `created`, `started` and
+/// `ended`, events' `time` (retention's own left out, as they carry the very clock under test) and
+/// candidates' `created`. None for a store with nothing that old.
+fn newest_recorded_before(db: &Connection, before: f64) -> Result<Option<f64>> {
     Ok(db.query_row(
         "SELECT MAX(t) FROM (
-          SELECT MAX(MAX(COALESCE(json_extract(body,'$.created'),0),
-                         COALESCE(json_extract(body,'$.started'),0),
-                         COALESCE(json_extract(body,'$.ended'),0))) AS t FROM attempts
-          UNION ALL SELECT MAX(time) FROM events WHERE kind NOT LIKE 'retention.%'
-          UNION ALL SELECT MAX(json_extract(body,'$.created')) FROM candidates)",
-        [],
+          SELECT json_extract(body,'$.created') AS t FROM attempts
+          UNION ALL SELECT json_extract(body,'$.started') FROM attempts
+          UNION ALL SELECT json_extract(body,'$.ended') FROM attempts
+          UNION ALL SELECT time FROM events WHERE kind NOT LIKE 'retention.%'
+          UNION ALL SELECT json_extract(body,'$.created') FROM candidates)
+         WHERE t < ?",
+        [before],
         |r| r.get(0),
     )?)
 }
@@ -521,26 +522,33 @@ impl Clock {
     }
 }
 
-/// What a process read before it wrote anything to the store: its clocks and the newest time the
-/// store had recorded. Its rounds check against it until there is a reading from this boot.
+/// What a process read at its start: its clocks, and the newest time the store recorded before
+/// this boot began. Its rounds check against it until there is a reading from this boot.
 #[derive(Debug, Clone)]
 pub struct Start {
     clock: Clock,
+    /// Before [`Start::origin`] less the slack. Only records from before this boot are evidence
+    /// for the clock: anything written since, by this process or any other (a local `worker`
+    /// claiming before `serve` starts), was stamped by the very clock under test.
     newest: Option<f64>,
 }
 
 impl Start {
-    /// Read before this process writes anything: once it has, the newest record is its own and
-    /// proves nothing about its clock.
     pub fn read(db: &Connection) -> Result<Self> {
         Self::at(db, Clock::read())
     }
 
     fn at(db: &Connection, clock: Clock) -> Result<Self> {
+        let before = clock.wall - clock.boottime - RETENTION_CLOCK_SLACK_SECONDS;
         Ok(Self {
+            newest: newest_recorded_before(db, before)?,
             clock,
-            newest: newest_recorded(db)?,
         })
+    }
+
+    /// When this boot began, by the wall clock at start: what the clock claims for the boot.
+    fn origin(&self) -> f64 {
+        self.clock.wall - self.clock.boottime
     }
 }
 
@@ -592,14 +600,17 @@ fn clock_fault(db: &Connection, start: &Start, clock: &Clock) -> Result<Option<F
             recorded
         }
         _ => {
+            // The boot began after the store's last record before it, by its downtime: a clock
+            // ahead at start puts the boot's origin that far later.
             if let Some(newest) = start.newest
-                && start.clock.wall - newest > NEWEST_RECORD_SLACK_SECONDS
+                && start.origin() - newest > NEWEST_RECORD_SLACK_SECONDS
             {
                 return Ok(Some(Fault {
-                    seconds: start.clock.wall - newest,
+                    seconds: start.origin() - newest,
                     detail: json!({
-                        "reason":"at start the clock was past the newest recorded time by more \
-                                  than a day","now":clock.wall,"started":start.clock.wall,
+                        "reason":"the boot began, by the clock at start, more than a day after \
+                                  the newest record from before it","now":clock.wall,
+                        "started":start.clock.wall,"boot_origin":start.origin(),
                         "newest_recorded":newest,"slack_seconds":NEWEST_RECORD_SLACK_SECONDS}),
                 }));
             }
@@ -1667,7 +1678,8 @@ mod tests {
         let refused = lab.round_on(&first).unwrap();
         assert_eq!(
             refused["refused"]["reason"],
-            "at start the clock was past the newest recorded time by more than a day",
+            "the boot began, by the clock at start, more than a day after the newest record \
+             from before it",
             "{refused}"
         );
         assert!(lab.present(&attempt) && !lab.deleted(&attempt));
@@ -1691,6 +1703,72 @@ mod tests {
                 wall: t0 + 60.0,
                 boottime: 72.0,
                 boot: "fresh".into(),
+            })
+            .unwrap();
+        assert_eq!(summary.get("refused"), None, "{summary}");
+    }
+
+    /// Only records from before this boot vouch for the clock at start: another process (a local
+    /// `worker` claiming before `serve` starts) writes under the very clock under test.
+    #[test]
+    fn a_write_since_the_boot_is_no_evidence_for_the_clock_at_start() {
+        let mut lab = Lab::new();
+        let attempt = lab.passed("a", "check", OLD);
+        let t0 = now();
+        lab.key("a", t0);
+        lab.activity(t0);
+        lab.on();
+        assert!(lab.round(t0).unwrap().get("refused").is_none());
+        // Rebooted 60 days ahead; the worker writes before serve reads its start.
+        let jumped = t0 + 60.0 * DAY;
+        lab.activity(jumped + 2.0);
+        lab.start = Start::at(
+            lab.db(),
+            Clock {
+                wall: jumped + 5.0,
+                boottime: 25.0,
+                boot: "next".into(),
+            },
+        )
+        .unwrap();
+        assert!(
+            lab.start.newest.unwrap() < t0 + 60.0,
+            "the worker's write is not counted"
+        );
+        let refused = lab
+            .round_on(&Clock {
+                wall: jumped + 6.0,
+                boottime: 26.0,
+                boot: "next".into(),
+            })
+            .unwrap();
+        assert!(refused.get("refused").is_some(), "{refused}");
+        assert!(lab.present(&attempt) && !lab.deleted(&attempt));
+        assert_eq!(lab.keys().len(), 1);
+        // A restart 40 days into an honest boot: the boot began within a day of the store's last
+        // record before it, whatever was written since.
+        let mut lab = Lab::new();
+        lab.activity(t0 - 40.0 * DAY - 1000.0);
+        lab.activity(t0 - 60.0);
+        lab.on();
+        lab.start = Start::at(
+            lab.db(),
+            Clock {
+                wall: t0,
+                boottime: 40.0 * DAY + 100.0,
+                boot: "long".into(),
+            },
+        )
+        .unwrap();
+        assert!(
+            lab.start.newest.unwrap() < t0 - 40.0 * DAY,
+            "only the record before the boot"
+        );
+        let summary = lab
+            .round_on(&Clock {
+                wall: t0 + 60.0,
+                boottime: 40.0 * DAY + 160.0,
+                boot: "long".into(),
             })
             .unwrap();
         assert_eq!(summary.get("refused"), None, "{summary}");

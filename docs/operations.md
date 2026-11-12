@@ -668,10 +668,13 @@ record proves nothing. Each round that runs or refuses records its clocks with
 `retention_last_run`: the wall clock, `CLOCK_BOOTTIME` (monotonic, counting suspend) and the boot
 id. The next round compares: the wall clock must have moved as boottime did, within five minutes
 (`RETENTION_CLOCK_SLACK_SECONDS`, 300: NTP slews at most 500 ppm). With no reading from this boot
-(after a reboot, or the first round ever), the anchor is the reading `serve` took at start, before
-it wrote anything, and that is trusted only if the store had recorded something within a day of
-it then: attempts' `created`, `started` and `ended`, events' `time` (other than retention's own)
-and candidates' `created`. A last run recorded later than the clock is a fault too.
+(after a reboot, or the first round ever), the anchor is the reading `serve` took at start. It is
+trusted only if the boot began, by that clock (the wall clock less boottime), within a day of the
+newest record from *before* the boot: attempts' `created`, `started` and `ended`, events' `time`
+(other than retention's own) and candidates' `created`. Records from since the boot never count,
+whoever wrote them (a local `worker` may claim before `serve` starts): they carry the very clock
+under test. A store with nothing from before the boot trusts the clock. A last run recorded later
+than the clock is a fault too.
 
 On a fault the round refuses: it deletes and retires nothing, records `retention.refused` with the
 times it compared and logs `{"event":"retention_refused",…}`. It records its own clocks as the
