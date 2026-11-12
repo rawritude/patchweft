@@ -1573,8 +1573,9 @@ mod identity_tests {
         fn build(p: &mut RegisteredProfile) -> &mut Job {
             &mut p.definition.jobs[0]
         }
-        let unchanged: [Edit; 6] = [
+        let unchanged: [Edit; 7] = [
             ("memory_mb", &|p| build(p).memory_mb = 4096),
+            ("uses_containers", &|p| build(p).uses_containers = true),
             ("timeout_seconds", &|p| build(p).timeout_seconds = 7),
             ("profile name", &|p| p.definition.name = "renamed".into()),
             ("certifying", &|p| p.definition.certifying = false),
@@ -1655,6 +1656,22 @@ mod identity_tests {
         assert_ne!(renamed["compile"], golden["build"]);
         assert_ne!(renamed["test"], golden["test"]);
         assert!(!changed(&|p| p.definition.jobs[1].memory_mb = 1, "build"));
+    }
+
+    /// Unset, the field is not in a definition, so no existing profile id moves; set, it is, so a
+    /// profile that sets it is a new profile (its recipes unchanged, above).
+    #[test]
+    fn uses_containers_is_absent_from_a_definition_until_set() {
+        let job: Job = serde_json::from_value(json!({"name":"j","command":["x"]})).unwrap();
+        assert!(!job.uses_containers);
+        assert_eq!(
+            serde_json::to_value(&job).unwrap().get("uses_containers"),
+            None
+        );
+        let job: Job =
+            serde_json::from_value(json!({"name":"j","command":["x"],"uses_containers":true}))
+                .unwrap();
+        assert_eq!(serde_json::to_value(&job).unwrap()["uses_containers"], true);
     }
 
     #[test]

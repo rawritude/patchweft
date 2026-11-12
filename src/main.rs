@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use patchweft::{
     api, authority, client, engine, executor, http, mcp, model, runner, source, store::Store,
     worker,
@@ -195,6 +195,9 @@ enum Operation {
         /// jobs.
         #[arg(long)]
         no_loopback_check: bool,
+        /// A cgroup per attempt, measured into its evidence (`auto`: where the unit is delegated).
+        #[arg(long, value_enum, default_value_t = AttemptCgroups::Auto)]
+        attempt_cgroups: AttemptCgroups,
     },
     /// Run a remote executor's coordinator against an API; --drain exits when all currently
     /// runnable work is finished. A second coordinator for the same work directory waits as a
@@ -227,6 +230,9 @@ enum Operation {
         /// jobs.
         #[arg(long)]
         no_loopback_check: bool,
+        /// A cgroup per attempt, measured into its evidence (`auto`: where the unit is delegated).
+        #[arg(long, value_enum, default_value_t = AttemptCgroups::Auto)]
+        attempt_cgroups: AttemptCgroups,
     },
     /// Register or reconfigure an executor. `local` sets the store's own budget; a remote
     /// executor runs only the jobs placed on it with --allow-job.
@@ -433,6 +439,22 @@ fn remote(connection: &Connection, operation: &RemoteOperation) -> Result<Value>
     Ok(value)
 }
 
+/// `--attempt-cgroups`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum AttemptCgroups {
+    Auto,
+    Off,
+}
+
+impl AttemptCgroups {
+    fn mode(self) -> patchweft::cgroup::Mode {
+        match self {
+            Self::Auto => patchweft::cgroup::Mode::Auto,
+            Self::Off => patchweft::cgroup::Mode::Off,
+        }
+    }
+}
+
 fn run(cli: Cli) -> Result<Value> {
     if let Some(path) = &cli.runner {
         runner::set_override(path)?;
@@ -469,6 +491,7 @@ fn run(cli: Cli) -> Result<Value> {
             retain_hours,
             loopback_allow,
             no_loopback_check,
+            attempt_cgroups,
         } => {
             return executor::remote(
                 || connection.open(),
@@ -477,6 +500,7 @@ fn run(cli: Cli) -> Result<Value> {
                     drain: *drain,
                     poll: Duration::from_millis(*poll_ms),
                     heartbeat: Duration::from_secs(*heartbeat_seconds),
+                    cgroups: attempt_cgroups.mode(),
                 },
                 executor::Bounds {
                     min_free: min_free_gb * GIB,
@@ -589,12 +613,14 @@ fn run(cli: Cli) -> Result<Value> {
             min_free_gb,
             loopback_allow,
             no_loopback_check,
+            attempt_cgroups,
         } => executor::local(
             &store,
             executor::Options {
                 drain,
                 poll: Duration::from_millis(poll_ms),
                 heartbeat: Duration::from_secs(heartbeat_seconds),
+                cgroups: attempt_cgroups.mode(),
             },
             executor::Guards {
                 min_free: min_free_gb * GIB,

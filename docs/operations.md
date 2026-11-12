@@ -392,6 +392,108 @@ is recorded and it has drained, its job trees (`work/`, `scratch/`, `home/`) are
 `worker` sweeps any drained attempt that still has them when it starts. Logs of a
 remote attempt are available only after it completes.
 
+### Attempt cgroups
+
+Each attempt runs in its own cgroup v2, and its evidence records what the kernel measured there,
+so reservations can be set from measured peaks. Nothing is enforced: no `memory.max`, no CPU
+limit; `memory_mb` stays an admission unit.
+
+**Setup, per host.** The coordinator's user unit needs a drop-in, applied as the executor account
+(no sudo):
+
+| Host | Unit | Drop-in |
+|---|---|---|
+| mauve | `patchweft-worker` (local) | `~/.config/systemd/user/patchweft-worker.service.d/cgroups.conf` |
+| each remote executor host | `patchweft-executor` | `~/.config/systemd/user/patchweft-executor.service.d/cgroups.conf` |
+
+```ini
+[Service]
+Delegate=memory pids cpu
+DelegateSubgroup=coordinator
+```
+
+Then `systemctl --user daemon-reload` and restart the unit, drained. `DelegateSubgroup=` needs
+systemd 254 or later (`systemctl --version`); the hosts run cgroup v2 with `cpu memory pids` in
+`user@1001.service`'s `cgroup.subtree_control`. Check with
+`systemctl --user show patchweft-executor -p Delegate -p DelegateSubgroup` and
+`cat /proc/$(systemctl --user show -p MainPID --value patchweft-executor)/cgroup`, which must end in
+`/coordinator`.
+
+**How it works.** At start the coordinator finds its unit's cgroup from `/proc/self/cgroup`. It
+must be delegated: either the coordinator started in `<unit>/coordinator`, where systemd puts it
+only for a delegated unit with `DelegateSubgroup=coordinator`, or the unit's cgroup carries
+systemd's `user.delegate`/`trusted.delegate` mark (systemd 255's user manager sets none, so the
+drop-in's second line is what proves delegation there). A coordinator started in the unit's own
+cgroup moves itself into `<unit>/coordinator`. It then writes `+memory +pids +cpu` to the unit's
+`cgroup.subtree_control`. It logs `{"event":"attempt_cgroups",…}` with the unit, or why not, and
+passes the result to each supervisor it launches (`_supervise … --cgroup UNIT` or
+`--cgroup-unavailable WHY`). Once registered, each supervisor creates `<unit>/attempt-<id>`, moves
+itself there before the job's preparation, samples `memory.stat` every 5 seconds, and at the end,
+after the job's processes and its cleanup are gone, reads the counters, kills what is left, moves
+back to `<unit>/coordinator` and removes the attempt's cgroup.
+
+The `coordinator` leaf is why `DelegateSubgroup=` is needed and not just tidy. Once the unit's
+subtree enables a controller, cgroup v2 lets no process join the unit's own cgroup (`EBUSY`). With
+`KillMode=process`, supervisors outlive a coordinator restart in their attempt cgroups, so systemd
+could not start the new coordinator in the unit's cgroup; with `DelegateSubgroup=coordinator` it
+starts it in the leaf.
+
+`--attempt-cgroups auto|off` on `worker` and `executor` (default `auto`). `off`, an undelegated
+unit, a missing memory controller, or any failure to create or enter the attempt's cgroup records
+`"cgroup": {"unavailable": "<why>"}` and the job runs exactly as without cgroups: measuring never
+fails, refuses or delays a job.
+
+**Evidence.** Every attempt whose supervisor got past registration has `evidence.cgroup`:
+
+```json
+"cgroup": {
+  "memory_peak_bytes": 162656256, "swap_peak_bytes": 0,
+  "noncache_peak_bytes": 161792000, "noncache_peak_at_seconds": 4.87,
+  "noncache_formula": "anon + shmem + kernel",
+  "seconds_above_90pct": 5.0, "reservation_mb": 128, "sample_seconds": 5.0, "samples": 3,
+  "oom": 0, "oom_kill": 0, "cpu_usec": 1458331, "pids_peak": 5,
+  "memory_pressure_full_usec": 0, "cpu_pressure_some_usec": 4306,
+  "includes_supervisor": true
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `memory_peak_bytes` | `memory.peak`: the most the cgroup was charged, **page cache included**. A job that unpacks or reads many files shows gigabytes here; do not size reservations from it. |
+| `swap_peak_bytes` | `memory.swap.peak` where the kernel has it, else null. Swapped memory is missing from `memory.peak`. |
+| `noncache_peak_bytes` | The highest sampled `anon + shmem + kernel` from `memory.stat` (`anon + shmem + kernel_stack + slab + percpu + sock` on kernels without `kernel`; `noncache_formula` says which). What a reservation must cover. `kernel` includes reclaimable slab (dentries, inodes), so a job touching many files carries some of that. |
+| `noncache_peak_at_seconds` | When that peak was sampled, in seconds from the command's start; negative when it came during preparation (checkout, dependency copies), and from the cgroup's entry when the command never started. |
+| `seconds_above_90pct` | Seconds with non-cache memory at or above 90% of the job's `memory_mb`, to one sample interval: each sample at or above counts the interval since the previous one. A spike reads about 5, a plateau its length. Null when the reservation is 0. |
+| `reservation_mb`, `sample_seconds`, `samples` | The reservation the 90% mark is from, the interval and the number of successful samples. |
+| `oom`, `oom_kill` | `memory.events`: times the cgroup hit a limit and processes the OOM killer killed in it (a host-wide OOM kill of one of its processes counts too). |
+| `cpu_usec` | `cpu.stat` `usage_usec`: CPU time used. |
+| `pids_peak` | `pids.peak` where present: most tasks (threads included) at once. |
+| `memory_pressure_full_usec` | `memory.pressure` `full total=`: microseconds every task of the cgroup stalled on memory. |
+| `cpu_pressure_some_usec` | `cpu.pressure` `some total=`: microseconds some task waited for a core, what stretches durations on a loaded host. |
+| `leftover_pids` | Present only when processes were still in the cgroup after the job, its cleanup and the supervisor's own kill of its descendants: `{"count": N, "pids": [first 10]}`. They are killed with `cgroup.kill` (by pid on kernels before 5.14). |
+| `leftover_after_kill` | Present only when some were still there 2 seconds after the kill. |
+| `errors` | Present only when leaving or removing the cgroup failed. |
+
+Unreadable or missing files give null. A job with `"uses_containers": true` (Profiles) also gets
+`"containers_unmeasured": true`.
+
+**Not measured.**
+- *Container memory.* Containers under rootless Docker are charged to Docker's own user service,
+  not to the attempt; the attempt's numbers are the job's own processes alone. Take such jobs'
+  real peak from elsewhere until the daemon's cgroup parent is set per job.
+- *Supervisor overhead is included, not excluded.* The supervisor runs in the attempt's cgroup
+  with the job, so the numbers include it (a few MiB, and its threads in `pids_peak`), as well as
+  the attempt's preparation (checkout, dependency copies, mostly page cache) and its external
+  cleanup. Putting the job alone in a child cgroup would need the move between `fork` and `exec`
+  and would miss the preparation and cleanup the attempt also costs the host.
+- *Spikes shorter than the 5-second sampling* are missed by `noncache_peak_bytes` (never by
+  `memory_peak_bytes`).
+- *Attempts that never ran:* a supervisor stopped before registration, or a launch that failed in
+  the coordinator, has no `cgroup` field.
+- *A supervisor killed outright* (SIGKILL) leaves its attempt's cgroup behind, with any orphan of
+  its job in it; nothing removes it yet. Supervisors from before v30 run in no attempt cgroup;
+  drain them at the cutover.
+
 ## Failure and recovery
 
 `cancel ACTION_ID --owner NAME` detaches that owner's interests. The last

@@ -89,6 +89,8 @@ pub fn recipes_for(profile: &RegisteredProfile, version: &str) -> Result<BTreeMa
                 cleanup,
                 report,
                 export_slots,
+                // Evidence metadata (`containers_unmeasured`), never seen by the job.
+                uses_containers: _,
             } = job;
             let Report {
                 kind,

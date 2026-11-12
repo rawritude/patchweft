@@ -85,6 +85,11 @@ pub struct Job {
     /// False makes `slots` a pure admission reservation: no `PATCHWEFT_SLOTS`, not in identity.
     #[serde(default = "yes", skip_serializing_if = "is_true")]
     pub export_slots: bool,
+    /// The job starts containers (rootless Docker), whose memory is charged to the Docker
+    /// daemon's own cgroup, not the attempt's: its evidence says `containers_unmeasured`.
+    /// Evidence metadata only, never seen by the job, so not in its recipe.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub uses_containers: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -213,6 +213,11 @@ impl Lab {
     /// Spawns `_supervise` as the coordinator does: cleared environment, own process group. The
     /// root has no store: a supervisor must never need one.
     fn spawn(&self, claim: &ClaimFile) -> Supervisor {
+        self.spawn_with(claim, &[])
+    }
+
+    /// `spawn` with the coordinator's cgroup arguments.
+    fn spawn_with(&self, claim: &ClaimFile, cgroup: &[&str]) -> Supervisor {
         let log = fs::File::create(self.directory(claim).join("supervisor.log")).unwrap();
         Supervisor(
             Command::new(AW)
@@ -221,6 +226,7 @@ impl Lab {
                 .arg("_supervise")
                 .arg(&self.root)
                 .arg(&claim.attempt.id)
+                .args(cgroup)
                 .stdin(Stdio::null())
                 .stdout(log.try_clone().unwrap())
                 .stderr(log)

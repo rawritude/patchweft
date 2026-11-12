@@ -5,6 +5,7 @@
 use crate::{
     api::{self, MAX_HAVES, MAX_RETAINED_UPLOADS, TRANSFER_TIMEOUT_SECONDS},
     authority::{self, AuthorityError, LOCAL, MAX_LEASES, Outputs, REFUSE_ALL, Scope},
+    cgroup,
     client::{Refused, Remote},
     engine, file_hash,
     model::*,
@@ -315,6 +316,8 @@ pub struct Options {
     pub drain: bool,
     pub poll: Duration,
     pub heartbeat: Duration,
+    /// `--attempt-cgroups`: a cgroup per attempt where the unit's is delegated.
+    pub cgroups: cgroup::Mode,
 }
 
 /// Free bytes on the filesystem holding a path.
@@ -483,6 +486,8 @@ pub struct Coordinator<T> {
     runner: Option<Runner>,
     host: Option<String>,
     guards: Guards,
+    /// The unit cgroup each supervisor's attempt cgroup goes under, or why there is none.
+    cgroups: cgroup::Setup,
     state: Mutex<State>,
     heartbeat: Condvar,
     publisher: Condvar,
@@ -531,6 +536,7 @@ impl<T: Transport> Coordinator<T> {
             runner: None,
             host: worker::host(),
             guards: Guards::default(),
+            cgroups: cgroup::Setup::Unavailable("not prepared".into()),
             state: Mutex::new(State {
                 ledger: BTreeMap::new(),
                 taken_up: BTreeSet::new(),
@@ -564,6 +570,11 @@ impl<T: Transport> Coordinator<T> {
     fn launching(mut self, runner: Runner) -> Self {
         self.engine = runner.sha256.clone();
         self.runner = Some(runner);
+        self
+    }
+
+    fn measured(mut self, cgroups: cgroup::Setup) -> Self {
+        self.cgroups = cgroups;
         self
     }
 
@@ -1748,6 +1759,14 @@ pub fn run<T: Transport + 'static>(
     if let Some(disk) = &guards.disk {
         disk.start(SystemTime::now())?;
     }
+    // Once, with the executor lock held: a standby never moves while the active one runs.
+    let cgroups = cgroup::prepare_coordinator(options.cgroups);
+    log(
+        json!({"event":"attempt_cgroups","executor":hello.executor,"cgroups":match &cgroups {
+            cgroup::Setup::Available(unit) => json!({"unit":unit}),
+            cgroup::Setup::Unavailable(why) => cgroup::unavailable(why),
+        }}),
+    );
     let coordinator = Arc::new(
         Coordinator::new(
             transport,
@@ -1757,7 +1776,8 @@ pub fn run<T: Transport + 'static>(
             engine,
         )
         .guarded(guards)
-        .launching(runner),
+        .launching(runner)
+        .measured(cgroups),
     );
     coordinator.verify(&hello.profiles);
     for attempt in coordinator.reconcile(false)? {
@@ -1825,6 +1845,8 @@ pub fn recover(store: &mut Store, confirmed: Option<&str>) -> Result<Value> {
             drain: true,
             poll: Duration::from_millis(100),
             heartbeat: Duration::from_secs(1),
+            // Recovery launches no supervisor.
+            cgroups: cgroup::Mode::Off,
         };
         let coordinator = Coordinator::new(
             transport,
@@ -2986,6 +3008,7 @@ mod tests {
             drain: true,
             poll: Duration::from_millis(10),
             heartbeat: Duration::from_secs(1),
+            cgroups: cgroup::Mode::Off,
         };
         Coordinator::new(fake, "mindy".into(), 10, options, "e".into())
     }

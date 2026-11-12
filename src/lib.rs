@@ -1,4 +1,5 @@
 pub mod authority;
+pub mod cgroup;
 pub mod declared;
 pub mod engine;
 pub mod executor;
