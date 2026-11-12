@@ -3,7 +3,7 @@ use crate::{
     store::{Store, event},
 };
 // Shared with the runner, which supervises the jobs.
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 pub use patchweft_control::{
     control_reason, descendants_of, evidence_identity, host, stop_reason, write_atomically,
 };
@@ -66,6 +66,9 @@ pub fn deliver(store: &Store, action_id: &str, destination: &Path) -> Result<Val
             .query_row("SELECT attempt FROM actions WHERE id=?", [action_id], |r| {
                 r.get(0)
             })?;
+    if let Some(note) = crate::retention::deleted_note(&store.db, &attempt_id)? {
+        bail!("the action's artifacts were {note}");
+    }
     let attempt = store.attempt(&attempt_id)?;
     let evidence = attempt.result.context("missing execution evidence")?;
     let artifacts = evidence["artifacts"]

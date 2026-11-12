@@ -1298,3 +1298,96 @@ fn executor_refuses_to_register_with_an_unlisted_loopback_listener() {
     assert_eq!(lab.state_of(&candidate), "passed");
     assert!(lab.mindy()["observed"]["refused"].get("*").is_none());
 }
+
+#[test]
+fn retention_deletes_old_outputs_on_the_authority_and_what_its_executor_left() {
+    let (mut lab, candidate) = producer_consumer();
+    let build = lab.attempt_of(candidate["required"]["build"].as_str().unwrap());
+    let build_id = build["id"].as_str().unwrap().to_owned();
+    let used = lab.attempt_of(candidate["required"]["use"].as_str().unwrap());
+    let used_id = used["id"].as_str().unwrap().to_owned();
+    // A tree mindy could not delete when it retired the attempt.
+    let left = lab.work.join("attempts").join(&build_id);
+    fs::create_dir_all(left.join("work")).unwrap();
+    fs::write(left.join("work").join("leftover"), "x").unwrap();
+    for id in [&build_id, &used_id] {
+        assert!(
+            lab.state
+                .join("attempts")
+                .join(id)
+                .join("output.log")
+                .exists()
+        );
+    }
+    // Off by default: the API ran its maintenance at start and deleted nothing.
+    assert_eq!(lab.count("retention.deleted"), 0);
+    // Long ago, and nothing open still refers to them.
+    lab.database()
+        .execute_batch(
+            "UPDATE attempts SET body=json_set(body,'$.ended',1000.0);
+             UPDATE candidates SET body=json_set(body,'$.created',1.0);",
+        )
+        .unwrap();
+    let short = lab.command(&["retention", "--days", "7"]).output().unwrap();
+    assert!(!short.status.success());
+    assert!(String::from_utf8_lossy(&short.stderr).contains("at least 30 days"));
+    let dry = lab.call(&["retention", "--days", "30", "--dry"]);
+    assert_eq!(dry["delete"]["attempts"], 2, "{dry}");
+    assert_eq!(dry["by_executor"]["mindy"]["attempts"], 2, "{dry}");
+    assert!(dry["delete"]["bytes"].as_u64().unwrap() > 0, "{dry}");
+    assert!(lab.state.join("attempts").join(&build_id).exists());
+    assert_eq!(
+        lab.call(&["retention", "--days", "30"]),
+        json!({"days":30,"previous":null})
+    );
+    // The API's maintenance runs it at start.
+    lab.stop_server();
+    lab.serve("127.0.0.1:0");
+    wait_until("the retention round", || {
+        lab.count("retention.deleted") == 1
+    });
+    let summary = &lab.events_of("retention.deleted")[0]["detail"];
+    assert_eq!(summary["attempts"], 2, "{summary}");
+    assert_eq!(summary["bytes"], dry["delete"]["bytes"], "{summary}");
+    for id in [&build_id, &used_id] {
+        assert!(!lab.state.join("attempts").join(id).exists(), "{id}");
+        let logs = lab.call(&["logs", id]);
+        assert_eq!(logs["log"], "deleted by retention after 30 days", "{logs}");
+        assert_eq!(logs["attempt"]["result"]["executor"], "mindy");
+    }
+    let client = Remote::new(&lab.endpoint(), &lab.credential, None).unwrap();
+    let refused = client
+        .query_value(&patchweft::api::Query::Logs {
+            attempt: build_id.clone(),
+            offset: 0,
+            limit: 1024,
+        })
+        .unwrap_err();
+    let refused = format!("{refused:#}");
+    assert!(refused.contains("log_deleted"), "{refused}");
+    assert!(
+        refused.contains("deleted by retention after 30 days"),
+        "{refused}"
+    );
+    let destination = lab.temp.path().join("too-late");
+    let delivered = patchweft()
+        .args(["remote", "--endpoint", &lab.endpoint(), "--credential-file"])
+        .arg(&lab.credential)
+        .args([
+            "deliver",
+            candidate["required"]["build"].as_str().unwrap(),
+            "--destination",
+            destination.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!delivered.status.success());
+    assert!(
+        String::from_utf8_lossy(&delivered.stderr).contains("deleted by retention"),
+        "{}",
+        String::from_utf8_lossy(&delivered.stderr)
+    );
+    // mindy's next claim carries the ids; it removes what it still had.
+    assert_eq!(lab.drain_remote(), json!({"executor":"mindy","launched":0}));
+    assert!(!left.exists());
+}

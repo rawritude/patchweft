@@ -3,6 +3,7 @@ pub mod declared;
 pub mod engine;
 pub mod executor;
 pub mod model;
+pub mod retention;
 pub mod runner;
 pub mod source;
 pub mod store;

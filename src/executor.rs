@@ -782,6 +782,7 @@ impl<T: Transport> Coordinator<T> {
                 Ok(response) => response,
                 Err(error) => return self.unclaimed(error),
             };
+            self.forget(&response.retire);
             if let Some(attempt) = response.fenced {
                 log(json!({"event":"claim_fenced","executor":self.executor,"attempt":attempt}));
                 // Unless the ledger held it, the key's attempt ended before this coordinator
@@ -850,6 +851,47 @@ impl<T: Transport> Coordinator<T> {
                     self.refuse(&mut state, profile, error);
                 }
             }
+        }
+    }
+
+    /// Deletes what is left here of attempts whose outputs retention deleted on the authority, as
+    /// retire does: renamed out of `attempts/` into `tmp/` (which every start clears) at once,
+    /// deleted off the claim loop. Never an attempt this coordinator holds or held.
+    fn forget(&self, attempts: &[String]) {
+        for attempt in attempts {
+            if !crate::retention::safe_id(attempt) || self.recorded(attempt) {
+                continue;
+            }
+            let directory = self.transport.root().join("attempts").join(attempt);
+            if fs::symlink_metadata(&directory).is_err() {
+                continue;
+            }
+            let aside = self
+                .transport
+                .root()
+                .join("tmp")
+                .join(format!("retention-{attempt}-{}", unique()));
+            let moved = aside
+                .parent()
+                .context("tmp directory")
+                .and_then(|tmp| Ok(fs::create_dir_all(tmp)?))
+                .and_then(|()| Ok(fs::rename(&directory, &aside)?));
+            if let Err(error) = moved {
+                log(
+                    json!({"event":"retention_retire_failed","executor":self.executor,
+                           "attempt":attempt,"error":format!("{error:#}")}),
+                );
+                continue;
+            }
+            let (executor, attempt) = (self.executor.clone(), attempt.clone());
+            thread::spawn(move || match remove_tree(&aside) {
+                Ok(()) => log(json!({"event":"retention_retired","executor":executor,
+                                     "attempt":attempt})),
+                Err(error) => log(
+                    json!({"event":"retention_retire_failed","executor":executor,
+                                         "attempt":attempt,"error":format!("{error:#}")}),
+                ),
+            });
         }
     }
 
@@ -2438,7 +2480,7 @@ impl Disk {
 }
 
 /// Removes a directory tree, including directories a job left read-only.
-fn remove_tree(path: &Path) -> Result<()> {
+pub(crate) fn remove_tree(path: &Path) -> Result<()> {
     match fs::remove_dir_all(path) {
         Ok(()) => return Ok(()),
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
@@ -2815,6 +2857,7 @@ mod tests {
                     claim: None,
                     fenced: None,
                     unverified: vec![],
+                    retire: vec![],
                 }))
         }
         fn renew(&self, request: &RenewRequest) -> Result<RenewResponse, TransportError> {
@@ -3243,11 +3286,13 @@ mod tests {
                 claim: None,
                 fenced: None,
                 unverified: vec![],
+                retire: vec![],
             },
             ClaimResponse {
                 claim: Some(claim("a1")),
                 fenced: None,
                 unverified: vec![],
+                retire: vec![],
             },
         ]);
         let coordinator = coordinator(fake);
@@ -3281,6 +3326,7 @@ mod tests {
             claim: None,
             fenced: Some(attempt.into()),
             unverified: vec![],
+            retire: vec![],
         }
     }
 
@@ -3382,6 +3428,7 @@ mod tests {
             claim: Some(claim("a1")),
             fenced: None,
             unverified: vec![],
+            retire: vec![],
         });
         let coordinator = coordinator(fake);
         fs::write(
@@ -3419,6 +3466,7 @@ mod tests {
                     claim: Some(claim(attempt)),
                     fenced: None,
                     unverified: vec![],
+                    retire: vec![],
                 });
             assert_eq!(coordinator.claim().unwrap(), Claimed::Retry, "{attempt}");
             assert!(!pending.exists());
@@ -3426,6 +3474,91 @@ mod tests {
         assert!(coordinator.lock().ledger["a2"].registered);
         assert!(!coordinator.lock().ledger.contains_key("a3"));
         assert!(!coordinator.ledger("a3").exists());
+    }
+
+    #[test]
+    fn a_claim_response_retires_what_retention_deleted_and_nothing_held() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = fake(temp.path());
+        let root = fake.root.clone();
+        for attempt in ["gone", "held", "taken", "ledgered"] {
+            let directory = root.join("attempts").join(attempt);
+            fs::create_dir_all(directory.join("work")).unwrap();
+            fs::write(directory.join("output.log"), "log").unwrap();
+        }
+        fs::create_dir_all(root.join("escape")).unwrap();
+        fake.claims.lock().unwrap().push_back(ClaimResponse {
+            retire: [
+                "gone",
+                "held",
+                "taken",
+                "ledgered",
+                "missing",
+                "..",
+                "../escape",
+            ]
+            .map(String::from)
+            .to_vec(),
+            ..ClaimResponse::default()
+        });
+        let coordinator = coordinator(fake);
+        coordinator
+            .lock()
+            .ledger
+            .insert("held".into(), Entry::new(claim("held"), Phase::Launched));
+        coordinator.lock().taken_up.insert("taken".into());
+        fs::write(
+            coordinator.ledger("ledgered"),
+            serde_json::to_vec(&claim("ledgered")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(coordinator.claim().unwrap(), Claimed::Idle);
+        assert!(!root.join("attempts").join("gone").exists());
+        // Deleted off the claim loop, from `tmp/`, which every start clears.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while fs::read_dir(root.join("tmp")).unwrap().next().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "the retired tree was not deleted"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        for attempt in ["held", "taken", "ledgered"] {
+            assert!(root.join("attempts").join(attempt).exists(), "{attempt}");
+        }
+        assert!(root.join("escape").exists());
+    }
+
+    #[test]
+    fn an_executor_that_predates_retire_ignores_it_and_a_new_one_reads_its_absence() {
+        /// `ClaimResponse` exactly as v29 (main 8531edf) declares it.
+        #[derive(serde::Deserialize)]
+        struct V29ClaimResponse {
+            claim: Option<Claim>,
+            fenced: Option<String>,
+            unverified: Vec<String>,
+        }
+        let response = ClaimResponse {
+            claim: Some(claim("a1")),
+            fenced: None,
+            unverified: vec!["p-ok".into()],
+            retire: vec!["old-1".into(), "old-2".into()],
+        };
+        // As the API sends it and `Remote::executor` decodes it.
+        let wire = json!({"result": response});
+        assert_eq!(wire["result"]["retire"], json!(["old-1", "old-2"]));
+        let old: V29ClaimResponse = serde_json::from_value(wire["result"].clone()).unwrap();
+        assert_eq!(old.claim.unwrap().attempt.id, "a1");
+        assert_eq!(
+            (old.fenced, old.unverified),
+            (None, vec!["p-ok".to_string()])
+        );
+        // A v29 authority's answer: no field, nothing to retire.
+        let v29 = json!({"claim":null,"fenced":"a9","unverified":[]});
+        let new: ClaimResponse = serde_json::from_value(v29.clone()).unwrap();
+        assert!(new.retire.is_empty());
+        // Nothing to retire is not on the wire: such answers are what v29 sent.
+        assert_eq!(serde_json::to_value(&new).unwrap(), v29);
     }
 
     #[test]
@@ -3478,6 +3611,7 @@ mod tests {
             claim: None,
             fenced: None,
             unverified: vec!["p-ok".into(), "p-bad".into(), "p-gone".into()],
+            retire: vec![],
         });
         let coordinator = Arc::new(coordinator(fake));
         assert_eq!(
@@ -3643,6 +3777,7 @@ mod tests {
                 claim: Some(claim("a1")),
                 fenced: None,
                 unverified: vec![],
+                retire: vec![],
             });
         other.store(900, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(coordinator.claim().unwrap(), Claimed::Attempt("a1".into()));
@@ -3663,6 +3798,7 @@ mod tests {
             claim: Some(claim("a1")),
             fenced: None,
             unverified: vec![],
+            retire: vec![],
         });
         let coordinator = coordinator(fake).guarded(Guards {
             min_free: 1,

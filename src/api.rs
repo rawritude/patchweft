@@ -285,6 +285,7 @@ pub struct Api {
 pub fn prepare(store: &Store) -> Result<()> {
     store.db.execute_batch(SCHEMA)?;
     crate::authority::prepare(&store.db)?;
+    crate::retention::prepare(&store.db)?;
     store.db.execute(
         "INSERT OR IGNORE INTO api_settings VALUES ('version','1')",
         [],
@@ -1156,6 +1157,15 @@ fn query_inner(
                     "Log limit must be 1–65536 bytes.",
                 ));
             }
+            if let Some(note) =
+                crate::retention::deleted_note(&store.db, &row.id).map_err(ApiError::internal)?
+            {
+                return Err(ApiError::new(
+                    410,
+                    "log_deleted",
+                    &format!("The log was {note}."),
+                ));
+            }
             let path = store.root.join("attempts").join(&row.id).join("output.log");
             let mut file = File::open(path).map_err(|_| {
                 ApiError::new(404, "log_unavailable", "The log is not available yet.")
@@ -1474,12 +1484,17 @@ impl Api {
         }
         let mut store = Store::open(&self.root).map_err(ApiError::internal)?;
         let (principal, scope) = executor(&store, token)?;
-        Ok(authority::claim_for(
-            &mut store,
-            &principal.id,
-            &scope,
-            request,
-        )?)
+        let mut response = authority::claim_for(&mut store, &principal.id, &scope, request)?;
+        // Never fails a claim: the list is sent again on a later one.
+        match crate::retention::retire_list(&mut store, &principal.id) {
+            Ok(retire) => response.retire = retire,
+            Err(error) => eprintln!(
+                "{}",
+                json!({"event":"retention_retire_list_failed","executor":principal.id,
+                       "error":format!("{error:#}")})
+            ),
+        }
+        Ok(response)
     }
 
     pub fn executor_renew(&self, token: &str, request: &RenewRequest) -> ApiResult<RenewResponse> {
@@ -1802,6 +1817,15 @@ fn artifact_manifest(store: &Store, action: &str) -> ApiResult<Value> {
             r.get(0)
         })
         .map_err(ApiError::internal)?;
+    if let Some(note) =
+        crate::retention::deleted_note(&store.db, &attempt).map_err(ApiError::internal)?
+    {
+        return Err(ApiError::new(
+            410,
+            "artifacts_deleted",
+            &format!("The action's artifacts were {note}."),
+        ));
+    }
     let row = store.attempt(&attempt).map_err(ApiError::internal)?;
     let files = row
         .result

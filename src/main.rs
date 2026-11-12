@@ -77,6 +77,15 @@ enum Operation {
         #[arg(long)]
         memory_mb: u32,
     },
+    /// Delete the logs and artifacts of attempts that ended more than N days ago and nothing
+    /// still uses (off by default; 0 clears it; at least 30). `--dry` only lists what N days
+    /// would delete now, with its bytes.
+    Retention {
+        #[arg(long)]
+        days: u32,
+        #[arg(long)]
+        dry: bool,
+    },
     /// Replace an existing principal's scope without rotating its credentials.
     Policy {
         #[arg(long)]
@@ -518,6 +527,12 @@ fn run(cli: Cli) -> Result<Value> {
             &executor,
             model::Reservation { slots, memory_mb },
         )?,
+        Operation::Retention { days, dry: true } => {
+            patchweft::retention::dry_run(&store, days, patchweft::now())?
+        }
+        Operation::Retention { days, dry: false } => {
+            patchweft::retention::set_retention(&mut store, days)?
+        }
         Operation::Policy { policy } => {
             api::update_policy(&store, serde_json::from_slice(&fs::read(policy)?)?)?
         }
@@ -655,6 +670,9 @@ fn run(cli: Cli) -> Result<Value> {
         Operation::Events { after } => serde_json::to_value(store.events(after)?)?,
         Operation::Logs { attempt } => {
             let row = store.attempt(&attempt)?;
+            if let Some(note) = patchweft::retention::deleted_note(&store.db, &row.id)? {
+                return Ok(json!({"attempt":row,"output":null,"log":note}));
+            }
             let path = store.root.join("attempts").join(&row.id).join("output.log");
             json!({"attempt":row,"output":fs::read_to_string(path).unwrap_or_default()})
         }

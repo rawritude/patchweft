@@ -277,11 +277,16 @@ pub struct ClaimRequest {
     pub unrecorded: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ClaimResponse {
     pub claim: Option<Claim>,
     pub fenced: Option<String>,
     pub unverified: Vec<String>,
+    /// Attempts this executor ran whose outputs retention deleted on the authority: their
+    /// `attempts/<id>` directories here go too. Absent when empty, so it is new only to executors
+    /// that know it; one that predates it ignores it, as it ignores any unknown response field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retire: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
