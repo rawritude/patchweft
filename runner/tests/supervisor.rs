@@ -8,7 +8,7 @@ use patchweft_control::{
         Action, ActionIdentity, CONTROL_VERSION, ClaimFile, DependencyFile, Grant, JOB_RECIPE, Job,
         Outcome, Profile, RegisteredProfile, Reservation, RevisionRef, SupervisorResult,
     },
-    recipe as engine,
+    recipe,
 };
 use serde_json::{Value, json};
 use std::{
@@ -123,16 +123,16 @@ impl Lab {
         };
         let profile = RegisteredProfile {
             id: "f-1".into(),
-            tools: engine::tool_identity(&definition).unwrap(),
+            tools: recipe::tool_identity(&definition).unwrap(),
             definition,
             engine: engine_hash().into(),
-            platform: engine::platform(),
+            platform: recipe::platform(),
         };
         self.claim_for(profile, timeout_seconds)
     }
 
     fn claim_for(&self, profile: RegisteredProfile, timeout_seconds: u64) -> ClaimFile {
-        let recipe = engine::recipes_for(&profile, JOB_RECIPE).unwrap()["job"].clone();
+        let recipe = recipe::recipes_for(&profile, JOB_RECIPE).unwrap()["job"].clone();
         let id = unique();
         ClaimFile {
             version: CONTROL_VERSION,

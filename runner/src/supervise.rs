@@ -1,11 +1,12 @@
-//! `_supervise ROOT ATTEMPT`: one claimed attempt, run from its control files alone. Moved from
-//! the scheduler's `worker.rs` unchanged; the scheduler no longer runs jobs.
-use crate::{api, cgroup, engine, source};
+//! `_supervise ROOT ATTEMPT`: one claimed attempt, run from its control files alone.
+use crate::cgroup;
 use anyhow::{Context, Result, bail, ensure};
 use patchweft_control::{
+    MAX_ARTIFACT_BYTES, MAX_ATTEMPT_OUTPUT_BYTES, MAX_MANIFEST_BYTES,
     cgroup::{Setup, unavailable},
-    descendants_of, evidence_identity, file_hash, host,
+    descendants_of, evidence_identity, file_hash, git, host,
     model::*,
+    recipe::{self, verify_runtime_for},
     stop_reason, write_atomically,
 };
 use serde_json::{Value, json};
@@ -69,10 +70,17 @@ fn reap_command(
     Ok(())
 }
 
+/// Checks the tools, platform and this process's own bytes against the profile. The bytes are the
+/// content of `/proc/self/exe`, what this process executes: the sealed memfd its coordinator
+/// launched it from (`/memfd:patchweft-runner`), whatever its path now names.
+fn verify_runtime(profile: &RegisteredProfile) -> Result<()> {
+    verify_runtime_for(profile, &file_hash(Path::new("/proc/self/exe"))?)
+}
+
 /// Source and dependencies for the job, from the repository and files the claim names.
 fn prepare(claim: &ClaimFile, job: &Job, directory: &Path) -> Result<(PathBuf, Value)> {
     let source_started = Instant::now();
-    engine::verify_runtime(&claim.profile).map_err(RuntimeMismatch)?;
+    verify_runtime(&claim.profile).map_err(RuntimeMismatch)?;
     let view = directory.join("work");
     let (repo, commit) = (&claim.repository, &claim.revision.commit);
     // Infrastructure (this host's I/O, its checkout) is marked `setup`; content checks the revision
@@ -80,9 +88,9 @@ fn prepare(claim: &ClaimFile, job: &Job, directory: &Path) -> Result<(PathBuf, V
     if job.reuse == Reuse::Files {
         setup(fs::create_dir(&view))?;
         for input in &job.inputs {
-            let path = source::relative_path(input)?;
+            let path = git::relative_path(input)?;
             let output = setup(
-                source::git_command(repo)
+                git::git_command(repo)
                     .args(["show", &format!("{commit}:{input}")])
                     .output(),
             )?;
@@ -90,7 +98,7 @@ fn prepare(claim: &ClaimFile, job: &Job, directory: &Path) -> Result<(PathBuf, V
             let target = view.join(path);
             setup(fs::create_dir_all(target.parent().context("input parent")?))?;
             setup(fs::write(&target, output.stdout))?;
-            let entry = setup(source::git(repo, &["ls-tree", commit, "--", input]))?;
+            let entry = setup(git::git(repo, &["ls-tree", commit, "--", input]))?;
             if entry.starts_with("100755 ") {
                 setup(fs::set_permissions(
                     target,
@@ -99,7 +107,7 @@ fn prepare(claim: &ClaimFile, job: &Job, directory: &Path) -> Result<(PathBuf, V
             }
         }
     } else {
-        setup(source::checkout_from(repo, commit, &view))?;
+        setup(git::checkout_from(repo, commit, &view))?;
     }
     let source_seconds = source_started.elapsed().as_secs_f64();
     let dependencies_started = Instant::now();
@@ -108,7 +116,7 @@ fn prepare(claim: &ClaimFile, job: &Job, directory: &Path) -> Result<(PathBuf, V
     let mut restored = BTreeMap::new();
     for dependency in &claim.dependencies {
         let name = &dependency.name;
-        let relative = source::relative_path(name)?;
+        let relative = git::relative_path(name)?;
         let metadata = setup(fs::symlink_metadata(&dependency.path))?;
         ensure!(
             !metadata.file_type().is_symlink(),
@@ -232,9 +240,9 @@ struct Limits {
 
 /// Every host enforces the same limits, so a result recorded on one is deliverable from all.
 const LIMITS: Limits = Limits {
-    file: api::MAX_ARTIFACT_BYTES,
-    attempt: api::MAX_ATTEMPT_OUTPUT_BYTES,
-    manifest: api::MAX_MANIFEST_BYTES,
+    file: MAX_ARTIFACT_BYTES,
+    attempt: MAX_ATTEMPT_OUTPUT_BYTES,
+    manifest: MAX_MANIFEST_BYTES,
 };
 
 /// The attempt's logs so far, each within the per-file limit; returns their total size.
@@ -278,7 +286,7 @@ fn execute_command(
     let (action, profile) = (&claim.action, &claim.profile);
     let started = Instant::now();
     if let Some(identity) = &action.identity {
-        let current = engine::recipes_for(profile, &identity.version)
+        let current = recipe::recipes_for(profile, &identity.version)
             .ok()
             .and_then(|r| r.get(&job.name).cloned());
         ensure!(
@@ -293,7 +301,7 @@ fn execute_command(
     setup(fs::create_dir(&scratch))?;
     setup(fs::create_dir(&home))?;
     if ["vitest", "junit"].contains(&job.report.kind.as_str()) {
-        let report = view.join(source::relative_path(&job.report.path)?);
+        let report = view.join(git::relative_path(&job.report.path)?);
         contained_parent(&view, &report)?;
         if fs::symlink_metadata(&report).is_ok() {
             fs::remove_file(&report)?;
@@ -625,7 +633,7 @@ pub fn supervise(root: &Path, attempt: &str, cgroups: &Setup) -> Result<Value> {
     );
     // Jobs find their attempt directory as `$PATCHWEFT_STATE/attempts/$PATCHWEFT_ATTEMPT`.
     claim.root = root.clone();
-    let job = engine::job(&claim.profile, &claim.action.job)?;
+    let job = recipe::job(&claim.profile, &claim.action.job)?;
     let result = match registration(&claim, job, &control)? {
         Some(result) => result,
         None => {
@@ -742,7 +750,7 @@ fn cleanup_external(claim: &ClaimFile, job: &Job, directory: &Path) -> Result<()
 
 pub fn validate_report(job: &Job, view: &Path, log: &Path) -> Result<Value> {
     if ["vitest", "junit"].contains(&job.report.kind.as_str()) {
-        let report = view.join(source::relative_path(&job.report.path)?);
+        let report = view.join(git::relative_path(&job.report.path)?);
         ensure!(
             fs::symlink_metadata(&report)?.is_file()
                 && report.canonicalize()?.starts_with(view.canonicalize()?),
@@ -848,7 +856,7 @@ fn copy_files(
         for entry in fs::read_dir(source)? {
             let entry = entry?;
             let path = relative.join(entry.file_name());
-            ensure!(!source::protected(&path), "protected artifact path");
+            ensure!(!git::protected(&path), "protected artifact path");
             copy_files(
                 &entry.path(),
                 &destination.join(entry.file_name()),
@@ -896,7 +904,7 @@ fn capture_artifacts(
     fs::create_dir(&output)?;
     let mut manifest = BTreeMap::new();
     for path in &job.artifacts {
-        let relative = source::relative_path(path)?;
+        let relative = git::relative_path(path)?;
         let target = view.join(&relative);
         ensure!(
             target.canonicalize()?.starts_with(view.canonicalize()?),
@@ -1009,9 +1017,9 @@ mod tests {
         assert_eq!(
             LIMITS,
             Limits {
-                file: api::MAX_ARTIFACT_BYTES,
-                attempt: api::MAX_ATTEMPT_OUTPUT_BYTES,
-                manifest: api::MAX_MANIFEST_BYTES,
+                file: MAX_ARTIFACT_BYTES,
+                attempt: MAX_ATTEMPT_OUTPUT_BYTES,
+                manifest: MAX_MANIFEST_BYTES,
             }
         );
     }
@@ -1023,7 +1031,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let repository = temp.path().join("mirror");
         fs::create_dir(&repository).unwrap();
-        let git = |args: &[&str]| source::git(&repository, args).unwrap();
+        let git = |args: &[&str]| git::git(&repository, args).unwrap();
         git(&["init", "--quiet"]);
         fs::write(repository.join("input.txt"), "x\n").unwrap();
         git(&["add", "."]);
@@ -1048,7 +1056,7 @@ mod tests {
             definition,
             tools: BTreeMap::from([("sh".to_owned(), file_hash(Path::new("/bin/sh")).unwrap())]),
             engine: file_hash(&std::env::current_exe().unwrap()).unwrap(),
-            platform: engine::platform(),
+            platform: recipe::platform(),
         };
         let claim = ClaimFile {
             version: CONTROL_VERSION,
@@ -1094,7 +1102,7 @@ mod tests {
             json!({"reason":"no-requesters"}).to_string(),
         )
         .unwrap();
-        let job = engine::job(&profile, "full").unwrap();
+        let job = recipe::job(&profile, "full").unwrap();
         let result = execute_command(
             &claim,
             job,
@@ -1120,7 +1128,7 @@ mod tests {
         // The claim's repository lies outside the root, which has no repos/ at all.
         let repository = temp.path().join("mirror");
         fs::create_dir(&repository).unwrap();
-        let git = |args: &[&str]| source::git(&repository, args).unwrap();
+        let git = |args: &[&str]| git::git(&repository, args).unwrap();
         git(&["init", "--quiet"]);
         fs::write(repository.join("input.txt"), "from the claim\n").unwrap();
         fs::write(repository.join("tool.sh"), "#!/bin/sh\n").unwrap();
@@ -1153,7 +1161,7 @@ mod tests {
             definition,
             tools: BTreeMap::new(),
             engine: file_hash(&std::env::current_exe().unwrap()).unwrap(),
-            platform: engine::platform(),
+            platform: recipe::platform(),
         };
         let claim = ClaimFile {
             version: CONTROL_VERSION,
@@ -1194,7 +1202,7 @@ mod tests {
         let directory = root.join("attempts").join("a1");
         fs::create_dir_all(&directory).unwrap();
         let (view, preparation) =
-            prepare(&claim, engine::job(&profile, "lint").unwrap(), &directory).unwrap();
+            prepare(&claim, recipe::job(&profile, "lint").unwrap(), &directory).unwrap();
         assert_eq!(
             fs::read_to_string(view.join("input.txt")).unwrap(),
             "from the claim\n"
@@ -1219,8 +1227,8 @@ mod tests {
         let directory = root.join("attempts").join("a2");
         fs::create_dir_all(&directory).unwrap();
         let (view, _) =
-            prepare(&claim, engine::job(&profile, "full").unwrap(), &directory).unwrap();
+            prepare(&claim, recipe::job(&profile, "full").unwrap(), &directory).unwrap();
         assert!(view.join("unlisted.txt").exists());
-        assert_eq!(source::git(&view, &["rev-parse", "HEAD"]).unwrap(), commit);
+        assert_eq!(git::git(&view, &["rev-parse", "HEAD"]).unwrap(), commit);
     }
 }

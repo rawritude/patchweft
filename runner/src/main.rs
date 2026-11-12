@@ -13,25 +13,6 @@ use patchweft_control::cgroup::{CGROUP_ARG, Setup, UNAVAILABLE_ARG};
 use serde_json::json;
 use std::{ffi::OsString, path::Path};
 
-/// The scheduler's names for what the moved code uses, so it reads as it did in `worker.rs`.
-mod engine {
-    pub use patchweft_control::recipe::*;
-    use patchweft_control::{file_hash, model::RegisteredProfile};
-
-    /// Checks the tools, platform and this process's own bytes against the profile. The bytes
-    /// are the content of `/proc/self/exe`, what this process executes: the sealed memfd its
-    /// coordinator launched it from (`/memfd:patchweft-runner`), whatever its path now names.
-    pub fn verify_runtime(profile: &RegisteredProfile) -> anyhow::Result<()> {
-        verify_runtime_for(profile, &file_hash(std::path::Path::new("/proc/self/exe"))?)
-    }
-}
-mod source {
-    pub use patchweft_control::git::*;
-}
-mod api {
-    pub use patchweft_control::{MAX_ARTIFACT_BYTES, MAX_ATTEMPT_OUTPUT_BYTES, MAX_MANIFEST_BYTES};
-}
-
 fn usage() -> anyhow::Error {
     anyhow::anyhow!(
         "usage: patchweft-runner _supervise ROOT ATTEMPT \
