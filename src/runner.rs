@@ -11,7 +11,7 @@
 //!
 //! `runner/` holds exactly that one hash directory. `--runner PATH` names another file instead.
 //! A coordinator hashes the runner when it starts, and again just before each launch, from the
-//! file it then executes.
+//! bytes it then executes, sealed in memory.
 use anyhow::{Context, Result, bail, ensure};
 use patchweft_control::{file_hash, reader_hash};
 use std::{
@@ -19,7 +19,7 @@ use std::{
     fs::{self, File},
     io,
     os::{
-        fd::{AsRawFd, RawFd},
+        fd::{AsRawFd, FromRawFd, RawFd},
         unix::{ffi::OsStrExt, process::CommandExt},
     },
     path::{Path, PathBuf},
@@ -133,12 +133,16 @@ impl Runner {
         })
     }
 
-    /// Opens the runner and hashes the opened file, refusing it unless its bytes are `expected`
-    /// (the claimed profile's engine). [`Opened::spawn`] executes that same open file, so what
-    /// runs is what was hashed, even if the path is replaced meanwhile.
+    /// Copies the runner's bytes into a sealed memfd and hashes that, refusing it unless its
+    /// bytes are `expected` (the claimed profile's engine). [`Opened::spawn`] executes that same
+    /// memfd, whose seals forbid any change, so what runs is what was hashed, even if the file is
+    /// replaced or rewritten in place meanwhile.
     pub fn open(&self, expected: &str) -> Result<Opened> {
-        let file =
+        let mut source =
             File::open(&self.path).with_context(|| format!("runner {}", self.path.display()))?;
+        let file = sealed_copy(&mut source)
+            .with_context(|| format!("runner {}: sealed copy", self.path.display()))?;
+        drop(source);
         let sha256 = reader_hash(&file)?;
         ensure!(
             sha256 == expected,
@@ -153,7 +157,30 @@ impl Runner {
     }
 }
 
-/// A runner file opened and checked by [`Runner::open`].
+/// `source`'s bytes in a new memfd, sealed against any write, growth or shrinking (and against
+/// new seals), read-only and positioned at its start. Close-on-exec, which `fexecve` of an ELF
+/// file allows.
+fn sealed_copy(source: &mut File) -> io::Result<File> {
+    let name = CString::new(BINARY).expect("static name");
+    // SAFETY: a valid C string; the descriptor returned is owned by the File made from it.
+    let fd =
+        unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut memfd = unsafe { File::from_raw_fd(fd) };
+    io::copy(source, &mut memfd)?;
+    let seals = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+    if unsafe { libc::fcntl(memfd.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Executing needs no descriptor open for writing (ETXTBSY): a read-only one in its place.
+    let readonly = File::open(format!("/proc/self/fd/{}", memfd.as_raw_fd()))?;
+    drop(memfd);
+    Ok(readonly)
+}
+
+/// A runner's bytes, sealed in memory and checked by [`Runner::open`].
 #[derive(Debug)]
 pub struct Opened {
     file: File,
@@ -161,9 +188,11 @@ pub struct Opened {
 }
 
 impl Opened {
-    /// Launches `patchweft-runner ARGS…` from the opened file, through `fexecve`: only `PATH` in
+    /// Launches `patchweft-runner ARGS…` from the sealed bytes, through `fexecve`: only `PATH` in
     /// its environment, stdin from /dev/null, stdout and stderr to `log`, in its own process
-    /// group. Its argv[0] is the runner's path, so operators find it by that path.
+    /// group. Its argv[0] is the runner's path, so operators find it by that path in `ps`; its
+    /// `/proc/self/exe` names the memfd, `/memfd:patchweft-runner (deleted)`, whose content the
+    /// runner hashes again.
     pub fn spawn(self, args: &[&OsStr], log: File) -> Result<Child> {
         let mut strings = vec![CString::new(self.path.as_os_str().as_bytes())?];
         for arg in args {
@@ -283,6 +312,21 @@ mod tests {
         )
         .unwrap();
         assert!(refusal(&exe).contains("named by the runner's sha256"));
+    }
+
+    #[test]
+    fn spawn_executes_the_hashed_bytes_even_when_the_file_is_rewritten_in_place() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(BINARY);
+        program("/usr/bin/true", &path);
+        let runner = Runner::at(&path).unwrap();
+        let opened = runner.open(&runner.sha256).unwrap();
+        // The same inode, other bytes: an open file descriptor would now read `false`.
+        fs::write(&path, fs::read("/usr/bin/false").unwrap()).unwrap();
+        assert_ne!(file_hash(&path).unwrap(), runner.sha256);
+        let log = File::create(temp.path().join("log")).unwrap();
+        let mut child = opened.spawn(&[], log).unwrap();
+        assert!(child.wait().unwrap().success(), "true ran, not false");
     }
 
     #[test]

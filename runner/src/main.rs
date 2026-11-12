@@ -19,8 +19,8 @@ mod engine {
     use patchweft_control::{file_hash, model::RegisteredProfile};
 
     /// Checks the tools, platform and this process's own bytes against the profile. The bytes
-    /// are read through `/proc/self/exe`, the file this process executes, whatever its path now
-    /// names.
+    /// are the content of `/proc/self/exe`, what this process executes: the sealed memfd its
+    /// coordinator launched it from (`/memfd:patchweft-runner`), whatever its path now names.
     pub fn verify_runtime(profile: &RegisteredProfile) -> anyhow::Result<()> {
         verify_runtime_for(profile, &file_hash(std::path::Path::new("/proc/self/exe"))?)
     }

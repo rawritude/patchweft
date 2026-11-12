@@ -697,10 +697,19 @@ there.
 
 **Hash what runs.** A coordinator hashes the runner when it starts, which is the `engine` it
 reports on `patchweft executors` and the one it verifies profiles against. Before each launch it
-opens the runner, hashes the open file, refuses the launch unless that hash is the claimed
-profile's engine, and executes that same open file (`fexecve`). A runner replaced since the start is
-refused like drifted tools: the attempt ends `runtime-mismatch`, not started, and the profile is
-refused on that executor. The runner checks itself again before the job, through `/proc/self/exe`.
+copies the runner's bytes into a memfd sealed against any change (`F_SEAL_WRITE`, `F_SEAL_GROW`,
+`F_SEAL_SHRINK`, `F_SEAL_SEAL`), hashes the memfd, refuses the launch unless that hash is the
+claimed profile's engine, and executes that same memfd (`fexecve`), so neither a replacement nor
+an in-place rewrite of the file can change what runs. Its argv[0] is still the runner's path, so
+`ps` shows it by that path; its `/proc/<pid>/exe` reads `/memfd:patchweft-runner (deleted)`. A
+runner replaced since the start is refused like drifted tools: the attempt ends
+`runtime-mismatch`, not started, and the profile is refused on that executor. The runner checks
+itself again before the job, hashing the content of `/proc/self/exe`.
+
+A runner checks a claim's control `version` before anything else in it, so one written by a
+newer coordinator fails as `unsupported claim version N`. A supervisor that ends without a result
+is reported Lost with the last 2 KiB of its `supervisor.log` as `supervisor_log_tail` in the
+evidence, which names such a refusal.
 
 **Building it.** The runner is its own cargo workspace, `runner/`, with its own lockfile
 (`runner/Cargo.lock`). Its member `runner/control` (`patchweft-control`) holds the control-file
