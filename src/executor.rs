@@ -22,7 +22,7 @@ use std::{
     cell::Cell,
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{self, File, OpenOptions},
-    io::{self, ErrorKind},
+    io::{self, ErrorKind, Read, Seek, SeekFrom},
     net::{IpAddr, Ipv6Addr, SocketAddr},
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Component, Path, PathBuf},
@@ -230,6 +230,25 @@ impl Transport for LocalTransport {
             log(json!({"event":"job_trees_swept","executor":LOCAL,"result":swept}));
         }
         Ok(Some(swept["failed"].as_array().map_or(0, Vec::len)))
+    }
+}
+
+/// What a Lost report carries of the supervisor's own log: its last bytes, which name why a
+/// supervisor ended without a result (such as a claim it refused). Null when there is none.
+const SUPERVISOR_LOG_TAIL: u64 = 2048;
+
+fn log_tail(path: &Path) -> Value {
+    let read = || -> std::io::Result<Vec<u8>> {
+        let mut file = File::open(path)?;
+        let length = file.metadata()?.len();
+        file.seek(SeekFrom::Start(length.saturating_sub(SUPERVISOR_LOG_TAIL)))?;
+        let mut tail = Vec::new();
+        file.take(SUPERVISOR_LOG_TAIL).read_to_end(&mut tail)?;
+        Ok(tail)
+    };
+    match read() {
+        Ok(tail) if !tail.is_empty() => json!(String::from_utf8_lossy(&tail)),
+        _ => Value::Null,
     }
 }
 
@@ -681,6 +700,21 @@ impl<T: Transport> Coordinator<T> {
     fn wake(&self) {
         self.lock().wake = true;
         self.heartbeat.notify_all();
+    }
+
+    /// The attempts in the ledger whose supervisors are alive: the attempt cgroups in use.
+    fn live_supervisors(&self) -> BTreeSet<String> {
+        self.lock()
+            .ledger
+            .iter()
+            .filter(|(_, entry)| {
+                entry
+                    .supervisor
+                    .as_ref()
+                    .is_some_and(|s| worker::alive(s.pid, &s.start))
+            })
+            .map(|(attempt, _)| attempt.clone())
+            .collect()
     }
 
     /// Takes up this coordinator's attempts from its ledger: results are published, live
@@ -1579,7 +1613,9 @@ impl<T: Transport> Coordinator<T> {
                     .unwrap_or(Value::Null);
                 CompleteRequest {
                     evidence: json!({"error":"supervisor exited without a result",
-                                     "supervisor":supervisor}),
+                                     "supervisor":supervisor,
+                                     "supervisor_log_tail":log_tail(
+                                         &directory.join("supervisor.log"))}),
                     // Only a command that never started is known to have left nothing behind.
                     drained: !control.join("command-started").exists(),
                     ..base
@@ -1765,6 +1801,10 @@ pub fn run<T: Transport + 'static>(
     }
     // Once, with the executor lock held: a standby never moves while the active one runs.
     let cgroups = cgroup::prepare_coordinator(options.cgroups);
+    let unit = match &cgroups {
+        cgroup::Setup::Available(unit) => Some(unit.clone()),
+        cgroup::Setup::Unavailable(_) => None,
+    };
     log(
         json!({"event":"attempt_cgroups","executor":hello.executor,"cgroups":match &cgroups {
             cgroup::Setup::Available(unit) => json!({"unit":unit}),
@@ -1784,7 +1824,19 @@ pub fn run<T: Transport + 'static>(
         .measured(cgroups),
     );
     coordinator.verify(&hello.profiles);
-    for attempt in coordinator.reconcile(false)? {
+    let materialize = coordinator.reconcile(false)?;
+    // Before anything is launched: what supervisors killed outright left in the unit.
+    if let Some(unit) = &unit {
+        let live = coordinator.live_supervisors();
+        for mut swept in
+            cgroup::sweep_stale(unit, &live, std::process::id(), Duration::from_secs(2))
+        {
+            swept["event"] = json!("attempt_cgroup_swept");
+            swept["executor"] = json!(hello.executor);
+            log(swept);
+        }
+    }
+    for attempt in materialize {
         coordinator.materialize_later(attempt);
     }
     let heartbeat = {
@@ -3201,6 +3253,30 @@ mod tests {
         // Its job may have left processes or external resources: capacity stays held.
         assert!(!requests[0].drained);
         assert!(!control.join("stop").exists());
+        assert_eq!(requests[0].evidence["supervisor_log_tail"], Value::Null);
+    }
+
+    #[test]
+    fn a_lost_supervisor_carries_the_tail_of_its_log() {
+        let temp = tempfile::tempdir().unwrap();
+        let coordinator = coordinator(fake(temp.path()));
+        let control = launched(&coordinator, "a1", Some(&dead()));
+        let log = format!(
+            "{}{}",
+            "x".repeat(5000),
+            r#"{"error":"unsupported claim version 2"}"#
+        );
+        fs::write(control.parent().unwrap().join("supervisor.log"), &log).unwrap();
+        assert!(coordinator.reconcile(false).unwrap().is_empty());
+        coordinator.publish_queued().unwrap();
+        let requests = completions(&coordinator);
+        assert_eq!(requests[0].outcome, Outcome::Lost);
+        let tail = requests[0].evidence["supervisor_log_tail"]
+            .as_str()
+            .unwrap();
+        assert_eq!(tail.len(), 2048);
+        assert!(log.ends_with(tail));
+        assert!(tail.ends_with(r#"unsupported claim version 2"}"#), "{tail}");
     }
 
     #[test]

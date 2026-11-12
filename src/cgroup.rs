@@ -8,15 +8,20 @@
 //! refuse a job: anything short of a prepared unit is `Unavailable`, and jobs run without one.
 
 pub use patchweft_control::cgroup::{COORDINATOR, Setup, parse_self_cgroup, unavailable};
+use serde_json::{Value, json};
 use std::{
+    collections::BTreeSet,
     ffi::CString,
     fs, io,
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
-/// Enabled in the unit's `cgroup.subtree_control`; only `memory` is required.
-pub const CONTROLLERS: [&str; 3] = ["memory", "pids", "cpu"];
+/// Enabled in the unit's `cgroup.subtree_control`; only `memory` is required. Never `cpu`: it would
+/// share CPU between attempts by `cpu.weight`, changing their scheduling, where the promise is to
+/// measure only. `cpu.stat` (`usage_usec`) and `cpu.pressure` exist on every cgroup without it.
+pub const CONTROLLERS: [&str; 2] = ["memory", "pids"];
 
 /// `--attempt-cgroups`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,7 +106,7 @@ impl Host {
         };
         if !in_leaf && !(self.delegated)(&unit) {
             return Err(format!(
-                "{} is not delegated: the unit needs Delegate=memory pids cpu and \
+                "{} is not delegated: the unit needs Delegate=memory pids and \
                  DelegateSubgroup={COORDINATOR}",
                 unit.display()
             ));
@@ -164,9 +169,108 @@ fn write(path: &Path, text: &str) -> io::Result<()> {
     fs::write(path, text)
 }
 
+const CGROUP2_SUPER_MAGIC: i64 = 0x6367_7270;
+
+/// Whether `path` is on a cgroup2 filesystem.
+fn is_cgroup2(path: &Path) -> bool {
+    let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    // `f_type`'s width differs between architectures.
+    #[allow(clippy::unnecessary_cast)]
+    unsafe {
+        libc::statfs(path.as_ptr(), &mut stat) == 0 && stat.f_type as i64 == CGROUP2_SUPER_MAGIC
+    }
+}
+
+fn pids(path: &Path) -> Vec<u32> {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect()
+}
+
+/// A cgroup and any child cgroups a job made in it, deepest first, waiting up to `wait` for
+/// killed processes to leave. A test's fake tree holds regular files and goes at once.
+fn remove_cgroup(directory: &Path, wait: Duration) -> io::Result<()> {
+    if !is_cgroup2(directory) {
+        return fs::remove_dir_all(directory);
+    }
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            remove_cgroup(&entry.path(), wait)?;
+        }
+    }
+    let started = Instant::now();
+    loop {
+        match fs::remove_dir(directory) {
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY) && started.elapsed() < wait => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Coordinator side, at start, once its ledger is taken up and before it launches anything:
+/// each `<unit>/attempt-<id>` whose attempt is not in `live` (the attempts whose supervisors are
+/// alive) is left from a supervisor that died outright. Its processes, orphans of that job, are
+/// killed with `cgroup.kill` (this process is never in it: one holding `pid` is skipped) and the
+/// cgroup is removed. One JSON object per cgroup swept, for an `attempt_cgroup_swept` event.
+pub fn sweep_stale(unit: &Path, live: &BTreeSet<String>, pid: u32, wait: Duration) -> Vec<Value> {
+    let Ok(entries) = fs::read_dir(unit) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect();
+    names.sort();
+    let mut swept = Vec::new();
+    for name in names {
+        let Some(attempt) = name.strip_prefix("attempt-") else {
+            continue;
+        };
+        if live.contains(attempt) {
+            continue;
+        }
+        let directory = unit.join(&name);
+        let held = pids(&directory.join("cgroup.procs"));
+        let mut errors = Vec::new();
+        if held.contains(&pid) {
+            errors.push(format!("{} holds this coordinator", directory.display()));
+        } else {
+            if !held.is_empty()
+                && let Err(e) = write(&directory.join("cgroup.kill"), "1")
+            {
+                // Kernels before 5.14 have no cgroup.kill: the pids just read, one by one.
+                errors.push(format!("cgroup.kill: {e}; killed by pid"));
+                for pid in &held {
+                    unsafe {
+                        libc::kill(*pid as i32, libc::SIGKILL);
+                    }
+                }
+            }
+            if let Err(e) = remove_cgroup(&directory, wait) {
+                errors.push(format!("remove {}: {e}", directory.display()));
+            }
+        }
+        swept.push(
+            json!({"attempt":attempt,"cgroup":directory,"pids":held.len(),
+                          "errors":errors}),
+        );
+    }
+    swept
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     fn host(temp: &tempfile::TempDir, own: &str, delegated: fn(&Path) -> bool) -> Host {
         let self_cgroup = temp.path().join("self-cgroup");
@@ -196,7 +300,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(unit.join("cgroup.subtree_control")).unwrap(),
-            "+memory +pids +cpu"
+            "+memory +pids"
         );
         // Started by systemd in the leaf (DelegateSubgroup=coordinator), which only a delegated
         // unit gets: no delegation mark needed, as systemd 255's user manager sets none.
@@ -257,6 +361,63 @@ mod tests {
     }
 
     #[test]
+    fn stale_attempt_cgroups_are_swept_and_live_ones_never_touched() {
+        let temp = tempfile::tempdir().unwrap();
+        let unit = temp.path().join("pw.service");
+        let cgroup = |name: &str, procs: &str| {
+            let directory = unit.join(name);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("cgroup.procs"), procs).unwrap();
+            directory
+        };
+        cgroup(COORDINATOR, "4242\n");
+        let live = cgroup("attempt-live", "111\n");
+        // A supervisor killed outright: its job's orphans are still there.
+        let stale = cgroup("attempt-stale", "999999001\n999999002\n");
+        let empty = cgroup("attempt-empty", "");
+        let mine = cgroup("attempt-mine", "4242\n");
+        let other = cgroup("other", "");
+        let swept = sweep_stale(
+            &unit,
+            &BTreeSet::from(["live".to_string()]),
+            4242,
+            Duration::ZERO,
+        );
+        let by: BTreeMap<String, Value> = swept
+            .into_iter()
+            .map(|s| (s["attempt"].as_str().unwrap().to_owned(), s))
+            .collect();
+        assert_eq!(
+            by.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["empty", "mine", "stale"]
+        );
+        assert_eq!(by["stale"]["pids"], 2);
+        assert_eq!(by["stale"]["errors"], json!([]));
+        assert_eq!(by["empty"]["pids"], 0);
+        assert!(!stale.exists() && !empty.exists());
+        // Never a live attempt's cgroup, never one holding this coordinator.
+        assert!(live.exists() && !live.join("cgroup.kill").exists());
+        assert!(mine.exists() && !mine.join("cgroup.kill").exists());
+        assert!(
+            by["mine"]["errors"][0]
+                .as_str()
+                .unwrap()
+                .contains("holds this coordinator")
+        );
+        assert!(other.exists() && unit.join(COORDINATOR).exists());
+        // No unit, nothing to sweep.
+        assert!(
+            sweep_stale(
+                &temp.path().join("gone"),
+                &BTreeSet::new(),
+                1,
+                Duration::ZERO
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
     fn coordinator_without_memory_moves_back_and_is_unavailable() {
         let temp = tempfile::tempdir().unwrap();
         let own = "/pw.service";
@@ -280,7 +441,7 @@ mod tests {
     /// attempt side has its own, in the runner (`runner/src/cgroup.rs`).
     ///
     /// ```text
-    /// systemd-run --user --wait --pipe --quiet -p 'Delegate=memory pids cpu' \
+    /// systemd-run --user --wait --pipe --quiet -p 'Delegate=memory pids' \
     ///   -p DelegateSubgroup=coordinator -- target/debug/deps/patchweft-<hash> \
     ///   --ignored --exact cgroup::tests::on_a_real_delegated_cgroup
     /// ```
@@ -301,8 +462,36 @@ mod tests {
                 .unwrap()
                 .contains("memory")
         );
+        let controllers = fs::read_to_string(unit.join("cgroup.subtree_control")).unwrap();
+        assert!(
+            !controllers.split_whitespace().any(|c| c == "cpu"),
+            "{controllers}"
+        );
         // Why the coordinator needs its leaf: no process may join the unit's own cgroup now.
         let refused = fs::write(unit.join("cgroup.procs"), std::process::id().to_string());
         assert_eq!(refused.unwrap_err().raw_os_error(), Some(libc::EBUSY));
+        // A supervisor killed outright left its attempt's cgroup with an orphan in it.
+        let stale = unit.join("attempt-stale");
+        fs::create_dir(&stale).unwrap();
+        let mut orphan = std::process::Command::new("/usr/bin/sleep")
+            .arg("300")
+            .spawn()
+            .unwrap();
+        fs::write(stale.join("cgroup.procs"), orphan.id().to_string()).unwrap();
+        let live = unit.join("attempt-live");
+        fs::create_dir(&live).unwrap();
+        let swept = sweep_stale(
+            &unit,
+            &BTreeSet::from(["live".to_string()]),
+            std::process::id(),
+            Duration::from_secs(2),
+        );
+        assert_eq!(
+            swept,
+            [json!({"attempt":"stale","cgroup":stale,"pids":1,"errors":[]})]
+        );
+        assert!(!orphan.wait().unwrap().success(), "killed");
+        assert!(!stale.exists() && live.exists());
+        fs::remove_dir(&live).unwrap();
     }
 }

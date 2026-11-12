@@ -414,13 +414,13 @@ runner release ([the runner](#the-runner)); the preparation is not.
 
 ```ini
 [Service]
-Delegate=memory pids cpu
+Delegate=memory pids
 DelegateSubgroup=coordinator
 ```
 
 Then `systemctl --user daemon-reload` and restart the unit, drained. `DelegateSubgroup=` needs
 systemd 254 or later (`systemctl --version`): mauve and mindy run 259, pw-robin 255. The hosts
-run cgroup v2 with `cpu memory pids` in `user@1001.service`'s `cgroup.subtree_control`. Check with
+run cgroup v2 with `memory pids` in `user@1001.service`'s `cgroup.subtree_control`. Check with
 `systemctl --user show patchweft-executor -p Delegate -p DelegateSubgroup` and
 `cat /proc/$(systemctl --user show -p MainPID --value patchweft-executor)/cgroup`, which must end in
 `/coordinator`.
@@ -430,14 +430,18 @@ must be delegated: either the coordinator started in `<unit>/coordinator`, where
 only for a delegated unit with `DelegateSubgroup=coordinator`, or the unit's cgroup carries
 systemd's `user.delegate`/`trusted.delegate` mark (systemd 255's user manager sets none, so the
 drop-in's second line is what proves delegation there). A coordinator started in the unit's own
-cgroup moves itself into `<unit>/coordinator`. It then writes `+memory +pids +cpu` to the unit's
-`cgroup.subtree_control`. It logs `{"event":"attempt_cgroups",…}` with the unit, or why not, and
-passes the result to each runner it launches: `patchweft-runner _supervise ROOT ATTEMPT --cgroup
-UNIT`, or `--cgroup-unavailable WHY`. A runner given neither records `not passed by the
-coordinator`; it refuses any other argument. Once registered, each runner creates
-`<unit>/attempt-<id>`, moves itself there before the job's preparation, samples `memory.stat`
-every 5 seconds, and at the end, after the job's processes and its cleanup are gone, reads the counters, kills what is left, moves
-back to `<unit>/coordinator` and removes the attempt's cgroup.
+cgroup moves itself into `<unit>/coordinator`. It then writes `+memory +pids` to the unit's
+`cgroup.subtree_control`. Never `+cpu`: the cpu controller would share CPU between attempts by
+their equal `cpu.weight`, which changes how they are scheduled, and this measures only. Without
+it every cgroup still has `cpu.stat` (`usage_usec`) and `cpu.pressure`, which is what is read. It
+logs `{"event":"attempt_cgroups",…}` with the unit, or why not, and passes the result to each
+runner it launches: `patchweft-runner _supervise ROOT ATTEMPT --cgroup UNIT`, or
+`--cgroup-unavailable WHY`. A runner given neither records `not passed by the coordinator`; it
+refuses any other argument. Once registered, each runner creates `<unit>/attempt-<id>`, moves
+itself there before the job's preparation, samples `memory.stat` every 5 seconds, and at the end,
+after the job's processes and its cleanup are gone, reads the counters, moves back to
+`<unit>/coordinator`, confirms from `/proc/self/cgroup` that it left, kills what is left and
+removes the attempt's cgroup.
 
 The `coordinator` leaf is why `DelegateSubgroup=` is needed and not just tidy. Once the unit's
 subtree enables a controller, cgroup v2 lets no process join the unit's own cgroup (`EBUSY`). With
@@ -474,18 +478,18 @@ fails, refuses or delays a job.
 | `seconds_above_90pct` | Seconds with non-cache memory at or above 90% of the job's `memory_mb`, to one sample interval: each sample at or above counts the interval since the previous one. A spike reads about 5, a plateau its length. Null when the reservation is 0. |
 | `reservation_mb`, `sample_seconds`, `samples` | The reservation the 90% mark is from, the interval and the number of successful samples. |
 | `oom`, `oom_kill` | `memory.events`: times the cgroup hit a limit and processes the OOM killer killed in it (a host-wide OOM kill of one of its processes counts too). |
-| `cpu_usec` | `cpu.stat` `usage_usec`: CPU time used. |
+| `cpu_usec` | `cpu.stat` `usage_usec`: CPU time used (present without the cpu controller). |
 | `pids_peak` | `pids.peak` where present: most tasks (threads included) at once. |
 | `memory_pressure_full_usec` | `memory.pressure` `full total=`: microseconds every task of the cgroup stalled on memory. |
 | `cpu_pressure_some_usec` | `cpu.pressure` `some total=`: microseconds some task waited for a core, what stretches durations on a loaded host. |
 | `leftover_pids` | Present only when processes were still in the cgroup after the job, its cleanup and the supervisor's own kill of its descendants: `{"count": N, "pids": [first 10]}`. They are killed with `cgroup.kill` (by pid on kernels before 5.14). |
 | `leftover_after_kill` | Present only when some were still there 2 seconds after the kill. |
-| `errors` | Present only when leaving or removing the cgroup failed. |
+| `errors` | Present only when leaving or removing the cgroup failed. A supervisor that could not leave (its unit has no `coordinator` leaf) never writes `cgroup.kill`, which would end it too: it kills the leftovers by pid and says so here. |
 
 Unreadable or missing files give null. A job with `"uses_containers": true` (Profiles) also gets
 `"containers_unmeasured": true`.
 
-**Not measured.**
+**Not measured or enforced.**
 - *Container memory.* Containers under rootless Docker are charged to Docker's own user service,
   not to the attempt; the attempt's numbers are the job's own processes alone. Take such jobs'
   real peak from elsewhere until the daemon's cgroup parent is set per job.
@@ -499,8 +503,16 @@ Unreadable or missing files give null. A job with `"uses_containers": true` (Pro
 - *Attempts that never ran:* a supervisor stopped before registration, or a launch that failed in
   the coordinator, has no `cgroup` field.
 - *A supervisor killed outright* (SIGKILL) leaves its attempt's cgroup behind, with any orphan of
-  its job in it; nothing removes it yet. Supervisors from before v30 (the scheduler's own
-  `_supervise`) run in no attempt cgroup; drain them at the cutover.
+  its job in it, until the next coordinator starts: once its ledger is taken up and before it
+  launches anything, it kills what is in each `<unit>/attempt-<id>` whose supervisor is not
+  alive (`cgroup.kill`), removes the cgroup and logs `{"event":"attempt_cgroup_swept",…}` with
+  the count of pids. A live attempt's cgroup is never touched. Supervisors from before v30 (the
+  scheduler's own `_supervise`) run in no attempt cgroup; drain them at the cutover.
+- *A job can leave its cgroup.* A job runs as the executor's own uid, and the unit's cgroups are
+  that uid's, so a job can write its pid into `<unit>/coordinator/cgroup.procs` (or anywhere else
+  in the unit) and run on unmeasured, out of reach of the attempt's `cgroup.kill`. The trust model
+  does not cover this: jobs are trusted not to work against the executor that runs them, and the
+  cgroups measure cooperating jobs, they do not contain hostile ones.
 
 ## Failure and recovery
 

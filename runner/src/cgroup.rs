@@ -10,9 +10,7 @@
 //!
 //! Self-contained (std, libc and serde_json only); nothing of the scheduler reaches it.
 
-use patchweft_control::cgroup::COORDINATOR;
-#[cfg(test)]
-use patchweft_control::cgroup::parse_self_cgroup;
+use patchweft_control::cgroup::{COORDINATOR, parse_self_cgroup};
 use serde_json::{Map, Value, json};
 use std::{
     collections::BTreeMap,
@@ -54,6 +52,9 @@ pub struct Config {
     pub kill_wait: Duration,
     /// Refuse a unit path that is not on cgroup2; off only for a test's fake tree.
     pub require_cgroup2: bool,
+    /// `/proc/self/cgroup`, where `finish` confirms it left the attempt's cgroup before killing
+    /// what is in it; a test's fake tree names its own.
+    pub self_cgroup: PathBuf,
 }
 
 impl Default for Config {
@@ -62,6 +63,7 @@ impl Default for Config {
             interval: SAMPLE_INTERVAL,
             kill_wait: Duration::from_secs(2),
             require_cgroup2: true,
+            self_cgroup: PathBuf::from("/proc/self/cgroup"),
         }
     }
 }
@@ -355,15 +357,28 @@ impl Attempt {
             .collect();
         // Out first: `cgroup.kill` kills every process in the cgroup, this one included.
         let leaf = self.unit.join(COORDINATOR).join("cgroup.procs");
-        if let Err(e) = write(&leaf, &self.pid.to_string()) {
-            errors.push(format!("leave for {}: {e}", leaf.display()));
-        }
+        let left = match write(&leaf, &self.pid.to_string()) {
+            Ok(()) => self.left(),
+            Err(e) => {
+                errors.push(format!("leave for {}: {e}", leaf.display()));
+                false
+            }
+        };
         if !leftovers.is_empty() {
             out.insert(
                 "leftover_pids".into(),
                 json!({"count":leftovers.len(),"pids":&leftovers[..leftovers.len().min(10)]}),
             );
-            self.kill(&leftovers, &mut errors);
+            if left {
+                self.kill(&leftovers, &mut errors);
+            } else {
+                // Still inside: `cgroup.kill` would end this supervisor and its result with it.
+                errors.push(format!(
+                    "still in {}: leftovers killed by pid",
+                    directory.display()
+                ));
+                kill_each(&leftovers);
+            }
             let remaining = self.wait_empty(&leftovers);
             if remaining > 0 {
                 out.insert("leftover_after_kill".into(), json!(remaining));
@@ -378,16 +393,25 @@ impl Attempt {
         Value::Object(out)
     }
 
+    /// Whether this process's own cgroup, read again, is no longer the attempt's. Unreadable
+    /// counts as still inside.
+    fn left(&self) -> bool {
+        let Some(name) = self.directory.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        fs::read_to_string(&self.config.self_cgroup)
+            .ok()
+            .and_then(|text| parse_self_cgroup(&text).map(|own| own.to_owned()))
+            .is_some_and(|own| Path::new(&own).file_name() != Some(name.as_ref()))
+    }
+
+    /// Only once this process has left the attempt's cgroup ([`Attempt::left`]).
     fn kill(&self, leftovers: &[u32], errors: &mut Vec<String>) {
         let file = self.directory.join("cgroup.kill");
         if let Err(e) = write(&file, "1") {
             // Kernels before 5.14 have no cgroup.kill: the pids just read, one by one.
             errors.push(format!("{}: {e}; killed by pid", file.display()));
-            for pid in leftovers {
-                unsafe {
-                    libc::kill(*pid as i32, libc::SIGKILL);
-                }
-            }
+            kill_each(leftovers);
         }
     }
 
@@ -424,6 +448,15 @@ impl Attempt {
                 }
                 other => return other,
             }
+        }
+    }
+}
+
+/// SIGKILL to each of `leftovers`, which never holds this process's own pid.
+fn kill_each(leftovers: &[u32]) {
+    for pid in leftovers {
+        unsafe {
+            libc::kill(*pid as i32, libc::SIGKILL);
         }
     }
 }
@@ -527,21 +560,28 @@ mod tests {
             .path()
             .join("user.slice/user@1001.service/app.slice/pw.service");
         fs::create_dir_all(unit.join(COORDINATOR)).unwrap();
+        // Where this process is once it left: what `finish` reads back before the kill.
+        fs::write(
+            unit.with_file_name("self-cgroup"),
+            "0::/user.slice/user@1001.service/app.slice/pw.service/coordinator\n",
+        )
+        .unwrap();
         (temp, unit)
     }
 
-    fn fake_config() -> Config {
+    fn fake_config(unit: &Path) -> Config {
         Config {
             interval: Duration::from_millis(20),
             kill_wait: Duration::from_millis(60),
             require_cgroup2: false,
+            self_cgroup: unit.with_file_name("self-cgroup"),
         }
     }
 
     #[test]
     fn an_attempt_reads_its_counters_kills_leftovers_and_removes_itself() {
         let (_temp, unit) = fake_unit();
-        let attempt = enter_attempt_with(&unit, "a1b2", 1000, fake_config()).unwrap();
+        let attempt = enter_attempt_with(&unit, "a1b2", 1000, fake_config(&unit)).unwrap();
         let directory = attempt.path().to_path_buf();
         assert_eq!(directory, unit.join("attempt-a1b2"));
         let me = std::process::id();
@@ -622,7 +662,7 @@ mod tests {
     #[test]
     fn an_attempt_alone_kills_nothing() {
         let (_temp, unit) = fake_unit();
-        let attempt = enter_attempt_with(&unit, "solo", 0, fake_config()).unwrap();
+        let attempt = enter_attempt_with(&unit, "solo", 0, fake_config(&unit)).unwrap();
         let directory = attempt.path().to_path_buf();
         let evidence = attempt.finish();
         assert_eq!(evidence.get("leftover_pids"), None);
@@ -640,14 +680,47 @@ mod tests {
         assert!(!directory.exists());
     }
 
+    /// `cgroup.kill` ends every process in the attempt's cgroup: written while the supervisor is
+    /// still there, it would end the supervisor before its result. Not out, the leftovers are
+    /// killed one by one and the supervisor returns.
+    #[test]
+    fn a_supervisor_still_inside_never_writes_cgroup_kill() {
+        for case in ["no coordinator leaf", "moved but still inside"] {
+            let (_temp, unit) = fake_unit();
+            let config = fake_config(&unit);
+            if case == "no coordinator leaf" {
+                fs::remove_dir_all(unit.join(COORDINATOR)).unwrap();
+            } else {
+                fs::write(
+                    &config.self_cgroup,
+                    "0::/user.slice/user@1001.service/app.slice/pw.service/attempt-inside\n",
+                )
+                .unwrap();
+            }
+            let attempt = enter_attempt_with(&unit, "inside", 0, config).unwrap();
+            let directory = attempt.path().to_path_buf();
+            let me = std::process::id();
+            fs::write(directory.join("cgroup.procs"), format!("{me}\n999999001\n")).unwrap();
+            // Any write of cgroup.kill fails and says so in `errors`.
+            fs::create_dir(directory.join("cgroup.kill")).unwrap();
+            let evidence = attempt.finish();
+            assert_eq!(evidence["leftover_pids"]["count"], 1, "{case}: {evidence}");
+            let errors = evidence["errors"].to_string();
+            assert!(!errors.contains("cgroup.kill"), "{case}: {errors}");
+            if case == "no coordinator leaf" {
+                assert!(errors.contains("leave for"), "{case}: {errors}");
+            }
+        }
+    }
+
     #[test]
     fn entering_fails_without_side_effects() {
         let (_temp, unit) = fake_unit();
-        assert!(enter_attempt_with(&unit, "../x", 0, fake_config()).is_err());
-        assert!(enter_attempt_with(&unit, "", 0, fake_config()).is_err());
-        assert!(enter_attempt_with(Path::new("relative"), "a", 0, fake_config()).is_err());
+        assert!(enter_attempt_with(&unit, "../x", 0, fake_config(&unit)).is_err());
+        assert!(enter_attempt_with(&unit, "", 0, fake_config(&unit)).is_err());
+        assert!(enter_attempt_with(Path::new("relative"), "a", 0, fake_config(&unit)).is_err());
         let missing = unit.join("absent");
-        let error = enter_attempt_with(&missing, "a", 0, fake_config())
+        let error = enter_attempt_with(&missing, "a", 0, fake_config(&unit))
             .err()
             .unwrap();
         assert!(error.contains("create"), "{error}");
@@ -656,8 +729,8 @@ mod tests {
         assert!(error.contains("not on a cgroup2"), "{error}");
         assert!(!unit.join("attempt-a").exists());
         // The same attempt twice: an earlier cgroup's peak is never taken for this one's.
-        let first = enter_attempt_with(&unit, "twice", 0, fake_config()).unwrap();
-        assert!(enter_attempt_with(&unit, "twice", 0, fake_config()).is_err());
+        let first = enter_attempt_with(&unit, "twice", 0, fake_config(&unit)).unwrap();
+        assert!(enter_attempt_with(&unit, "twice", 0, fake_config(&unit)).is_err());
         first.finish();
     }
 
@@ -667,7 +740,7 @@ mod tests {
     /// (`patchweft`'s `cgroup::Host::prepare_coordinator`, tested on its own).
     ///
     /// ```text
-    /// systemd-run --user --wait --pipe --quiet -p 'Delegate=memory pids cpu' \
+    /// systemd-run --user --wait --pipe --quiet -p 'Delegate=memory pids' \
     ///   -p DelegateSubgroup=coordinator -- runner/target/debug/deps/patchweft_runner-<hash> \
     ///   --ignored --exact cgroup::tests::on_a_real_delegated_cgroup
     /// ```
@@ -685,7 +758,9 @@ mod tests {
             .parent()
             .unwrap()
             .to_path_buf();
-        fs::write(unit.join("cgroup.subtree_control"), "+memory +pids +cpu").unwrap();
+        // Never `+cpu`: that would weigh attempts' CPU against each other, and measuring only is the
+        // promise. `cpu.stat` and `cpu.pressure` exist on every cgroup without it.
+        fs::write(unit.join("cgroup.subtree_control"), "+memory +pids").unwrap();
         // Why the coordinator needs its leaf: no process may join the unit's own cgroup now.
         let refused = fs::write(unit.join("cgroup.procs"), std::process::id().to_string());
         assert_eq!(refused.unwrap_err().raw_os_error(), Some(libc::EBUSY));
@@ -715,6 +790,12 @@ mod tests {
         assert!(evidence["noncache_peak_at_seconds"].as_f64().unwrap() >= 0.0);
         assert!(evidence["seconds_above_90pct"].as_f64().unwrap() > 0.0);
         assert!(evidence["cpu_usec"].as_u64().unwrap() > 0);
+        assert!(evidence["cpu_pressure_some_usec"].is_u64(), "{evidence}");
+        let controllers = fs::read_to_string(unit.join("cgroup.subtree_control")).unwrap();
+        assert!(
+            !controllers.split_whitespace().any(|c| c == "cpu"),
+            "{controllers}"
+        );
         assert!(evidence["pids_peak"].as_u64().unwrap() >= 3);
         assert_eq!(evidence["oom_kill"], 0);
         assert_eq!(
@@ -729,5 +810,52 @@ mod tests {
             !Path::new(&format!("/proc/{}", leftover.id())).exists(),
             "the leftover was killed and reaped"
         );
+    }
+    /// A unit whose `coordinator` leaf is missing, on a real delegated cgroup: leaving fails, so
+    /// `finish` must kill the job's leftover by pid and return, never write `cgroup.kill` on the
+    /// cgroup it is still in (which would end this test's process). Run as
+    /// `on_a_real_delegated_cgroup` is, with `--exact cgroup::tests::a_real_unit_without_its_leaf`.
+    #[test]
+    #[ignore = "needs a delegated cgroup: run inside a transient user service (see the doc)"]
+    fn a_real_unit_without_its_leaf() {
+        let own = || {
+            parse_self_cgroup(&fs::read_to_string("/proc/self/cgroup").unwrap())
+                .unwrap()
+                .to_owned()
+        };
+        assert!(own().ends_with("/coordinator"), "not delegated: {}", own());
+        let leaf = Path::new("/sys/fs/cgroup").join(own().trim_start_matches('/'));
+        // A unit of its own under the delegated one, with no coordinator leaf.
+        let unit = leaf.parent().unwrap().join("leafless");
+        fs::create_dir(&unit).unwrap();
+        let config = Config {
+            interval: Duration::from_millis(200),
+            ..Config::default()
+        };
+        let attempt = enter_attempt_with(&unit, "p21", 0, config).unwrap();
+        assert!(own().ends_with("/leafless/attempt-p21"), "{}", own());
+        #[allow(clippy::zombie_processes)]
+        let leftover = std::process::Command::new("/usr/bin/sleep")
+            .arg("300")
+            .spawn()
+            .unwrap();
+        let evidence = attempt.finish();
+        eprintln!("{evidence:#}");
+        // Still here to assert: the supervisor was not killed with its attempt's cgroup.
+        assert_eq!(
+            evidence["leftover_pids"],
+            json!({"count":1,"pids":[leftover.id()]})
+        );
+        assert!(
+            evidence["errors"].to_string().contains("leave for"),
+            "{evidence}"
+        );
+        assert!(
+            !Path::new(&format!("/proc/{}", leftover.id())).exists(),
+            "the leftover was killed by pid and reaped"
+        );
+        fs::write(leaf.join("cgroup.procs"), std::process::id().to_string()).unwrap();
+        fs::remove_dir(unit.join("attempt-p21")).unwrap();
+        fs::remove_dir(&unit).unwrap();
     }
 }

@@ -610,12 +610,15 @@ pub fn supervise(root: &Path, attempt: &str, cgroups: &Setup) -> Result<Value> {
     let root = root.canonicalize()?;
     let directory = root.join("attempts").join(attempt);
     let control = directory.join("control");
-    let mut claim: ClaimFile = serde_json::from_slice(&fs::read(control.join("claim.json"))?)?;
+    // The version first: a newer coordinator's claim may carry fields this runner does not know,
+    // and its error must name the version, not the first such field.
+    let bytes = fs::read(control.join("claim.json"))?;
+    let version = serde_json::from_slice::<Value>(&bytes)?["version"].clone();
     ensure!(
-        claim.version == CONTROL_VERSION,
-        "unsupported claim version {}",
-        claim.version
+        version.as_u64() == Some(u64::from(CONTROL_VERSION)),
+        "unsupported claim version {version}"
     );
+    let mut claim: ClaimFile = serde_json::from_slice(&bytes)?;
     ensure!(
         claim.attempt.id == attempt && claim.root.canonicalize()? == root,
         "claim belongs to another attempt"

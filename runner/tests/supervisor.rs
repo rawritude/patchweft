@@ -659,12 +659,22 @@ fn a_claim_it_does_not_understand_fails_closed() {
     unknown["memory_limit"] = json!(1);
     let mut newer = lab.claim("touch \"$PATCHWEFT_STATE/ran\"", None, 60);
     newer.version = CONTROL_VERSION + 1;
+    // A newer claim with a field this runner does not know: the version is what it names.
+    let mut newest = lab.claim("touch \"$PATCHWEFT_STATE/ran\"", None, 60);
+    newest.version = CONTROL_VERSION + 1;
+    let mut newest_body = serde_json::to_value(&newest).unwrap();
+    newest_body["memory_limit"] = json!(1);
     for (claim, body, error) in [
         (&claim, unknown, "unknown field `memory_limit`"),
         (
             &newer,
             serde_json::to_value(&newer).unwrap(),
             "unsupported claim version",
+        ),
+        (
+            &newest,
+            newest_body,
+            &format!("unsupported claim version {}", CONTROL_VERSION + 1),
         ),
     ] {
         fs::create_dir_all(lab.control(claim)).unwrap();
