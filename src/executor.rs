@@ -1173,15 +1173,19 @@ impl<T: Transport> Coordinator<T> {
         Ok(())
     }
 
-    /// `patchweft-runner _supervise ROOT ATTEMPT`, from the runner file `launch` checked.
+    /// `patchweft-runner _supervise ROOT ATTEMPT --cgroup UNIT` (or `--cgroup-unavailable WHY`),
+    /// from the runner file `launch` checked.
     fn spawn(&self, attempt: &str, runner: runner::Opened) -> Result<Child> {
         let directory = self.transport.root().join("attempts").join(attempt);
         let log = File::create(directory.join("supervisor.log"))?;
+        let [flag, value] = self.cgroups.arguments();
         runner.spawn(
             &[
                 "_supervise".as_ref(),
                 self.transport.root().as_os_str(),
                 attempt.as_ref(),
+                &flag,
+                &value,
             ],
             log,
         )

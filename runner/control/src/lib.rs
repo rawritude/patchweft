@@ -4,6 +4,7 @@
 //! Everything here is compiled into the runner, so a change to this crate is a runner release:
 //! it changes the runner's bytes, and with them every profile id and recipe. It holds no version
 //! string and depends on nothing of the scheduler.
+pub mod cgroup;
 pub mod git;
 pub mod model;
 pub mod recipe;

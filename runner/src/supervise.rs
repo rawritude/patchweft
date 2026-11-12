@@ -1,9 +1,12 @@
 //! `_supervise ROOT ATTEMPT`: one claimed attempt, run from its control files alone. Moved from
 //! the scheduler's `worker.rs` unchanged; the scheduler no longer runs jobs.
-use crate::{api, engine, source};
+use crate::{api, cgroup, engine, source};
 use anyhow::{Context, Result, bail, ensure};
 use patchweft_control::{
-    descendants_of, evidence_identity, file_hash, host, model::*, stop_reason, write_atomically,
+    cgroup::{Setup, unavailable},
+    descendants_of, evidence_identity, file_hash, host,
+    model::*,
+    stop_reason, write_atomically,
 };
 use serde_json::{Value, json};
 use std::{
@@ -270,6 +273,7 @@ fn execute_command(
     job: &Job,
     directory: &Path,
     control: &FileControl,
+    measured: Option<&cgroup::Attempt>,
 ) -> Result<(i32, Value)> {
     let (action, profile) = (&claim.action, &claim.profile);
     let started = Instant::now();
@@ -354,6 +358,9 @@ fn execute_command(
     let command_started = Instant::now();
     let timer_seconds;
     control.command_started()?;
+    if let Some(measured) = measured {
+        measured.command_started();
+    }
     let mut child = command.spawn()?;
     let mut status = None;
     let mut terminating: Option<(Instant, String)> = None;
@@ -596,7 +603,9 @@ const REGISTRATION_SECONDS: u64 = 3600;
 
 /// `_supervise ROOT ATTEMPT`: runs one claimed attempt from its control files alone. It never
 /// opens the store and holds no credentials; its coordinator relays registration and stops.
-pub fn supervise(root: &Path, attempt: &str) -> Result<Value> {
+/// `cgroups` is what the coordinator found: the delegated unit cgroup under which this attempt
+/// gets its own, or why there is none.
+pub fn supervise(root: &Path, attempt: &str, cgroups: &Setup) -> Result<Value> {
     dedicate()?;
     let root = root.canonicalize()?;
     let directory = root.join("attempts").join(attempt);
@@ -617,13 +626,34 @@ pub fn supervise(root: &Path, attempt: &str) -> Result<Value> {
     let result = match registration(&claim, job, &control)? {
         Some(result) => result,
         None => {
-            let result =
-                execute_command(&claim, job, &directory, &FileControl { control: &control });
-            conclude(&claim, job, &directory, result)
+            let measured = match cgroups {
+                Setup::Available(unit) => {
+                    cgroup::enter_attempt(unit, attempt, claim.attempt.memory_mb)
+                }
+                Setup::Unavailable(why) => Err(why.clone()),
+            };
+            let control = FileControl { control: &control };
+            let result = execute_command(&claim, job, &directory, &control, measured.as_ref().ok());
+            let mut result = conclude(&claim, job, &directory, result);
+            measure(&mut result.evidence, job, measured);
+            result
         }
     };
     write_atomically(&control.join("result.json"), &serde_json::to_vec(&result)?)?;
     Ok(json!({"attempt":attempt,"outcome":result.outcome,"exit_code":result.exit_code}))
+}
+
+/// Adds the attempt's cgroup counters to its evidence once its processes and cleanup are gone.
+/// Measuring never changes the outcome: a cgroup that could not be entered is recorded as
+/// `{"unavailable": why}` and the job has run as it would without one.
+fn measure(evidence: &mut Value, job: &Job, measured: Result<cgroup::Attempt, String>) {
+    evidence["cgroup"] = match measured {
+        Ok(measured) => measured.finish(),
+        Err(why) => unavailable(&why),
+    };
+    if job.uses_containers {
+        evidence["containers_unmeasured"] = json!(true);
+    }
 }
 
 /// Waits until the coordinator reports the attempt registered: nothing of the job runs before
@@ -1062,7 +1092,13 @@ mod tests {
         )
         .unwrap();
         let job = engine::job(&profile, "full").unwrap();
-        let result = execute_command(&claim, job, &directory, &FileControl { control: &control });
+        let result = execute_command(
+            &claim,
+            job,
+            &directory,
+            &FileControl { control: &control },
+            None,
+        );
         let error = result.unwrap_err();
         assert_eq!(
             error
