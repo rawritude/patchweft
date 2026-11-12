@@ -134,12 +134,15 @@ fn set_with_minimum(store: &mut Store, wanted: u32, minimum: u32) -> Result<Valu
     let transaction = store.transaction()?;
     let previous = days(&transaction)?;
     let mut detail = json!({"days":wanted,"previous":previous});
-    // Setting it (again) is the operator accepting the clock as it is: a widening goes, and
-    // with it what it would have kept of anything stamped while the clock was off.
+    // Setting it (again) past the cap is the operator accepting the clock as it is: the widening
+    // goes, and with it what it would have kept of anything stamped while the clock was off. One
+    // under the cap lapses by itself and is left alone: cleared, a clock still ahead would have
+    // the next round delete on it.
     let cleared = (wanted > 0)
         .then(|| widening(&transaction))
         .transpose()?
-        .flatten();
+        .flatten()
+        .filter(|w| w.seconds > WIDENING_CAP_SECONDS);
     if let Some(cleared) = cleared {
         transaction.execute("DELETE FROM settings WHERE key='retention_widening'", [])?;
         detail["cleared_widening_seconds"] = json!(cleared.seconds);
@@ -586,12 +589,13 @@ fn widening(db: &Connection) -> Result<Option<Widening>> {
 }
 
 /// A widening past [`WIDENING_CAP_SECONDS`]: the store's times cannot be bounded, so a round
-/// refuses rather than delete on them. Setting `retention --days` again clears it.
+/// refuses rather than delete on them. Fixing the clock, then setting `retention --days` again,
+/// clears it.
 fn over_cap(widening: Option<Widening>, clock: &Clock) -> Option<Value> {
     let widening = widening.filter(|w| w.seconds > WIDENING_CAP_SECONDS)?;
     Some(
         json!({"reason":"the clock moved further than retention can correct for; \
-                set retention --days again to accept the clock as it is",
+                fix the clock first, then set retention --days again to accept it",
         "now":clock.wall,"widened_seconds":widening.seconds,"since":widening.since,
         "cap_seconds":WIDENING_CAP_SECONDS}),
     )
@@ -1884,6 +1888,47 @@ mod tests {
         let summary = lab.round_on(&clock(t0 + at, at)).unwrap();
         assert_eq!(summary.get("refused"), None, "{summary}");
         assert!(lab.deleted(&attempt) && !lab.present(&attempt));
+    }
+
+    /// Setting the retention right after a refused forward jump: the widening is under the cap,
+    /// so it stays, and the next round on the still-jumped clock deletes and retires nothing.
+    #[test]
+    fn setting_the_retention_keeps_a_widening_under_the_cap() {
+        let mut lab = Lab::new();
+        let attempt = lab.passed("a", "check", OLD);
+        let t0 = now();
+        lab.key("a", t0);
+        lab.activity(t0);
+        lab.on();
+        assert!(lab.round(t0).unwrap().get("refused").is_none());
+        let jumped = Clock {
+            wall: t0 + 60.0 * DAY + 3600.0,
+            boottime: t0 + 3600.0,
+            boot: "lab".into(),
+        };
+        lab.activity(jumped.wall - 600.0);
+        assert!(lab.round_on(&jumped).unwrap()["refused"].is_object());
+        let held = widening(lab.db()).unwrap().unwrap().seconds;
+        assert!(held > 59.0 * DAY && held < WIDENING_CAP_SECONDS, "{held}");
+        // The same N again: no change, as before any widening.
+        assert_eq!(
+            set_retention(&mut lab.store, 30).unwrap(),
+            json!({"days":30,"previous":30})
+        );
+        assert_eq!(lab.events("executor.retention").len(), 1);
+        assert_eq!(widening(lab.db()).unwrap().map(|w| w.seconds), Some(held));
+        let summary = lab
+            .round_on(&Clock {
+                wall: t0 + 60.0 * DAY + 7300.0,
+                boottime: t0 + 7300.0,
+                boot: "lab".into(),
+            })
+            .unwrap();
+        assert_eq!(summary.get("refused"), None, "{summary}");
+        assert_eq!(summary["attempts"], 0, "{summary}");
+        assert_eq!(summary["keys_retired"], 0, "{summary}");
+        assert!(lab.present(&attempt) && !lab.deleted(&attempt));
+        assert_eq!(lab.keys(), BTreeSet::from(["a".to_string()]));
     }
 
     /// A last run later than now is a clock fault, not the hourly gate: refused and logged, and
