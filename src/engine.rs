@@ -4,7 +4,7 @@ use crate::{
     file_hash, identity,
     model::*,
     now, source,
-    store::{Store, event, passed_key_of, prepare_passed_keys, record},
+    store::{Store, event, passed_key_of, prepare_passed_keys, record, touch_passed_key},
     unique,
 };
 use anyhow::{Context, Result, ensure};
@@ -582,6 +582,10 @@ fn retainable(
     let Some(evidence) = store.attempt(&attempt)?.result.filter(|_| drained) else {
         return refuse("predecessor obligation has not passed");
     };
+    // Its dependents would be handed artifacts that are gone.
+    if crate::retention::deleted(&store.db, &attempt)?.is_some() {
+        return refuse("predecessor outputs were deleted by retention");
+    }
     if identity.class != class(request.profile) {
         return refuse("evidence class differs");
     }
@@ -678,6 +682,10 @@ fn request_job(store: &mut Store, request: &mut Requester, name: &str) -> Result
                             "requesting_profile":profile.id,"executed_under":action.profile,
                             "recipe":recipe}),
                 )?;
+                if passed.is_some() {
+                    prepare_passed_keys(&transaction)?;
+                    touch_passed_key(&transaction, &action.id, now())?;
+                }
                 transaction.commit()?;
                 retention.retained.push(name.into());
                 if let Some(reused) = retention.source.reused.get(name)
@@ -695,7 +703,10 @@ fn request_job(store: &mut Store, request: &mut Requester, name: &str) -> Result
     }
     if let Some(passed) = &passed {
         prepare_passed_keys(&store.db)?;
-        if let Some(action) = reusable(&store.db, passed)? {
+        // Looked up inside the transaction that records the use, so retention never retires
+        // the key between the two (it retires keys in its own write transaction).
+        let transaction = store.transaction()?;
+        if let Some(action) = reusable(&transaction, passed)? {
             let reused = Reused {
                 action: action.id.clone(),
                 from_candidate: action
@@ -705,7 +716,6 @@ fn request_job(store: &mut Store, request: &mut Requester, name: &str) -> Result
                     .unwrap_or_default(),
                 from_revision: action.revision.clone(),
             };
-            let transaction = store.transaction()?;
             transaction.execute("INSERT INTO interests VALUES (?,?,?,1) ON CONFLICT(action,owner,context) DO UPDATE SET active=1",
                                 params![action.id, owner, context])?;
             event(
@@ -715,6 +725,7 @@ fn request_job(store: &mut Store, request: &mut Requester, name: &str) -> Result
                 &json!({"candidate":context,"owner":owner,"from":reused.from_candidate,
                         "recipe":recipe,"key":passed}),
             )?;
+            touch_passed_key(&transaction, &action.id, now())?;
             transaction.commit()?;
             request.reused.insert(name.into(), reused);
             request.requested.insert(name.into(), action.id.clone());
@@ -814,6 +825,7 @@ fn request_job(store: &mut Store, request: &mut Requester, name: &str) -> Result
         )?;
         if let Some(passed) = &passed {
             transaction.execute("INSERT INTO passed_keys VALUES (?,?)", params![id, passed])?;
+            touch_passed_key(&transaction, &id, action.created)?;
         }
         event(
             &transaction,
@@ -824,6 +836,9 @@ fn request_job(store: &mut Store, request: &mut Requester, name: &str) -> Result
     }
     transaction.execute("INSERT INTO interests VALUES (?,?,?,1) ON CONFLICT(action,owner,context) DO UPDATE SET active=1",
                         params![id, owner, context])?;
+    if shared && passed.is_some() {
+        touch_passed_key(&transaction, &id, now())?;
+    }
     event(
         &transaction,
         if shared {
@@ -1219,6 +1234,20 @@ pub fn retry_owned(
             "attempt still owns capacity; confirmed drain is required"
         );
         let mut action: Action = record(&transaction, "actions", id)?;
+        for dependency in &action.dependencies {
+            let producer: Option<String> = transaction.query_row(
+                "SELECT attempt FROM actions WHERE id=?",
+                [dependency],
+                |r| r.get(0),
+            )?;
+            if let Some(producer) = producer {
+                ensure!(
+                    crate::retention::deleted(&transaction, &producer)?.is_none(),
+                    "{name}'s dependency {dependency} has its outputs deleted by retention; \
+                     submit the revision again"
+                );
+            }
+        }
         if action.identity.is_some() {
             // The retrying candidate's reservation applies, e.g. an OOM fix on a shared action.
             let requirement = Reservation::from(job(&profile, name)?);
@@ -2644,6 +2673,152 @@ mod declared_tests {
         assert_eq!(
             check.declared_inputs, None,
             "no passed key, no PATCHWEFT_INPUTS"
+        );
+    }
+
+    fn last_used(lab: &Lab, action: &str) -> Option<f64> {
+        lab.store
+            .db
+            .query_row(
+                "SELECT last_used FROM passed_key_uses WHERE action=?",
+                [action],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    /// Candidates and their uses dated long ago, so only the rule under test keeps anything.
+    fn age(lab: &Lab) {
+        lab.store
+            .db
+            .execute_batch(
+                "UPDATE candidates SET body=json_set(body,'$.created',1.0);
+                 UPDATE passed_key_uses SET last_used=1.0;",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_submit_records_each_passed_keys_use_and_a_retired_key_runs_cold() {
+        let mut lab = Lab::new();
+        let profile = lab.profile();
+        let first = lab.commit(&[(FILE, Some(DECLARATIONS))]);
+        let a = lab.submit(&first, &profile);
+        let solo = a.required["solo"].clone();
+        let created = lab.store.action(&solo).unwrap().created;
+        assert_eq!(
+            last_used(&lab, &solo),
+            Some(created),
+            "a new key is used when made"
+        );
+        assert_eq!(
+            last_used(&lab, &a.required["census"]),
+            None,
+            "census has no key"
+        );
+        lab.pass_all(&a);
+        age(&lab);
+        let revision = lab.commit(&[("README", Some("one"))]);
+        let b = lab.submit(&revision, &profile);
+        assert_eq!(b.required["solo"], solo);
+        let reused = last_used(&lab, &solo).unwrap();
+        assert!(reused >= created, "a reuse is a use");
+        lab.pass_all(&b);
+        crate::retention::set_retention(&mut lab.store, 30).unwrap();
+        lab.store
+            .db
+            .execute(
+                "UPDATE candidates SET body=json_set(body,'$.created',1.0)",
+                [],
+            )
+            .unwrap();
+        let start = now();
+        let kept = crate::retention::round(&mut lab.store, start)
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept["kept"]["reused_key"], 3, "{kept}");
+        let attempt = lab.store.action(&solo).unwrap();
+        let attempt: String = lab
+            .store
+            .db
+            .query_row(
+                "SELECT attempt FROM actions WHERE id=?",
+                [&attempt.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            crate::retention::deleted(&lab.store.db, &attempt)
+                .unwrap()
+                .is_none()
+        );
+        // Unused for longer than the retention: the key retires with its attempt.
+        age(&lab);
+        let summary = crate::retention::round(&mut lab.store, start + 3600.0)
+            .unwrap()
+            .unwrap();
+        assert!(summary["keys_retired"].as_u64().unwrap() >= 3, "{summary}");
+        assert!(
+            crate::retention::deleted(&lab.store.db, &attempt)
+                .unwrap()
+                .is_some()
+        );
+        let revision = lab.commit(&[("README", Some("two"))]);
+        let c = lab.submit(&revision, &profile);
+        assert_ne!(c.required["solo"], solo, "an identical request runs cold");
+        assert!(c.reused.is_empty());
+        // The receipt that reused it still checks against its key.
+        assert!(passed_key_of(&lab.store.db, &solo).unwrap().is_some());
+        // Retaining from a candidate whose outputs are gone runs cold too.
+        let retained = submit_retaining(
+            &mut lab.store,
+            &first.id,
+            &profile.id,
+            "agent",
+            vec![],
+            Some(&a.id),
+        )
+        .unwrap();
+        assert!(retained.retained.is_empty());
+        assert_eq!(
+            retained.not_retained["solo"],
+            "predecessor outputs were deleted by retention"
+        );
+    }
+
+    #[test]
+    fn retry_refuses_a_job_whose_dependency_outputs_retention_deleted() {
+        let mut lab = Lab::new();
+        let profile = lab.profile();
+        let revision = lab.commit(&[(FILE, Some(DECLARATIONS))]);
+        let candidate = lab.submit(&revision, &profile);
+        lab.pass(&candidate.required["prep"]);
+        lab.set(&candidate.required["check"], "failed");
+        let producer: String = lab
+            .store
+            .db
+            .query_row(
+                "SELECT attempt FROM actions WHERE id=?",
+                [&candidate.required["prep"]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        crate::retention::prepare(&lab.store.db).unwrap();
+        lab.store
+            .db
+            .execute(
+                "INSERT INTO retention_deleted VALUES (?,'local',1.0,30,1.0)",
+                [&producer],
+            )
+            .unwrap();
+        let error = retry(&mut lab.store, &candidate.id, &["check".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("deleted by retention"), "{error}");
+        assert_eq!(
+            action_state(&lab.store.db, &candidate.required["check"]).unwrap(),
+            "failed"
         );
     }
 }

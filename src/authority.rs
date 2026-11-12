@@ -1309,6 +1309,7 @@ pub fn claim_for(
             claim: None,
             fenced: None,
             unverified: Vec::new(),
+            retire: Vec::new(),
         });
     }
     let capacity = capacity(&transaction, &record)?;
@@ -1405,6 +1406,7 @@ pub fn claim_for(
             claim: None,
             fenced: None,
             unverified,
+            retire: Vec::new(),
         });
     };
     let lent = current.lends(&choice, admission.left());
@@ -1464,6 +1466,7 @@ pub fn claim_for(
         claim: Some(claim),
         fenced: None,
         unverified,
+        retire: Vec::new(),
     })
 }
 
@@ -2302,6 +2305,7 @@ fn replay(
         claim,
         fenced,
         unverified: Vec::new(),
+        retire: Vec::new(),
     }))
 }
 

@@ -780,6 +780,7 @@ const PURGE_INTERVAL: Duration = Duration::from_secs(600);
 /// worker's view of time must never expire another host's work.
 fn maintain(mut store: Store, started: f64, stop: &AtomicBool) {
     let mut purged: Option<Instant> = None;
+    let mut retaining: Option<std::thread::JoinHandle<()>> = None;
     while !stop.load(Ordering::Relaxed) {
         if let Err(error) = authority::expire(&mut store, crate::now(), started) {
             eprintln!("Patchweft lease expiry failed: {error:#}");
@@ -789,6 +790,22 @@ fn maintain(mut store: Store, started: f64, stop: &AtomicBool) {
                 Ok(0) => {}
                 Ok(removed) => eprintln!("{}", json!({"event":"uploads_purged","removed":removed})),
                 Err(error) => eprintln!("Patchweft upload purge failed: {error:#}"),
+            }
+            // Gated on its setting (off by default) and at most hourly by the store's own clock;
+            // on its own thread and connection, so deleting many trees never delays lease expiry.
+            if retaining.as_ref().is_none_or(|round| round.is_finished()) {
+                let root = store.root.clone();
+                retaining = Some(std::thread::spawn(move || {
+                    let round = Store::open(&root)
+                        .and_then(|mut store| crate::retention::round(&mut store, crate::now()));
+                    match round {
+                        Ok(Some(summary)) => {
+                            eprintln!("{}", json!({"event":"retention_deleted","summary":summary}))
+                        }
+                        Ok(None) => {}
+                        Err(error) => eprintln!("Patchweft retention failed: {error:#}"),
+                    }
+                }));
             }
             purged = Some(Instant::now());
         }
