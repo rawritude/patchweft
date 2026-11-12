@@ -657,16 +657,26 @@ is retried next round. Each round logs and records `retention.deleted` with coun
 kept reasons and any failures.
 
 **A clock it cannot trust deletes nothing.** Every cutoff is the clock minus N days, so a clock
-jumped forward would make every key look unused and every attempt old. Before it deletes, a round
-compares the clock with the newest time the store recorded: attempts' `created`, `started` and
-`ended`, events' `time` (other than retention's own) and candidates' `created`. More than a day
-ahead of it (`RETENTION_CLOCK_SLACK_SECONDS`, 86400: a quiet store may record nothing for a day),
-the round refuses: it deletes and retires nothing, records `retention.refused` with both times
-and logs `{"event":"retention_refused",…}`, and leaves the hourly gate as it was, so a round under
-the true clock runs as if it never came. A last run recorded later than the clock (the clock went
-back, or an older binary ran under a clock ahead) is refused the same way and the last run is
-reset to the clock, so the gate counts from there. `--dry` reports the same refusal under
-`refused`. A store idle for more than a day refuses until it records something again.
+jumped forward would make every key look unused and every attempt old, and the authority's own
+writes at the jumped time (lease expiry runs every second) follow at once, so the store's newest
+record proves nothing. Each round that runs or refuses records its clocks with
+`retention_last_run`: the wall clock, `CLOCK_BOOTTIME` (monotonic, counting suspend) and the boot
+id. The next round compares: the wall clock must have moved as boottime did, within five minutes
+(`RETENTION_CLOCK_SLACK_SECONDS`, 300: NTP slews at most 500 ppm). With no reading from this boot
+(after a reboot, or the first round ever), the anchor is the reading `serve` took at start, before
+it wrote anything, and that is trusted only if the store had recorded something within a day of
+it then: attempts' `created`, `started` and `ended`, events' `time` (other than retention's own)
+and candidates' `created`. A last run recorded later than the clock is a fault too.
+
+On a fault the round refuses: it deletes and retires nothing, records `retention.refused` with the
+times it compared and logs `{"event":"retention_refused",…}`. It records its own clocks as the
+last run, so the next round checks against them and the hourly gate counts from there, and it
+widens every later cutoff by how far the clock moved (`widened_seconds`). Times recorded around a
+fault may be off by that much either way: a key used while the clock was behind is stamped early,
+so after the clock is corrected it would look unused. Each fault adds its size to the widening,
+which lapses once N days and the widening itself have passed on a clock that agreed with boottime;
+the round's summary and `--dry` carry `widened_seconds` while it holds. `--dry` reports a fault
+under `refused`, and records nothing.
 
 The attempt row stays, with its evidence, so history, durations and certificates keep
 working; its body gains `deleted_by_retention` and `retention_days`. Reading what is gone says so:

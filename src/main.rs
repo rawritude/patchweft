@@ -551,9 +551,12 @@ fn run(cli: Cli) -> Result<Value> {
             &executor,
             model::Reservation { slots, memory_mb },
         )?,
-        Operation::Retention { days, dry: true } => {
-            patchweft::retention::dry_run(&store, days, patchweft::now())?
-        }
+        Operation::Retention { days, dry: true } => patchweft::retention::dry_run(
+            &store,
+            &patchweft::retention::Start::read(&store.db)?,
+            days,
+            &patchweft::retention::Clock::read(),
+        )?,
         Operation::Retention { days, dry: false } => {
             patchweft::retention::set_retention(&mut store, days)?
         }

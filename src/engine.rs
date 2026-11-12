@@ -2670,7 +2670,7 @@ mod declared_tests {
             )
             .unwrap();
         let start = now();
-        let kept = crate::retention::round(&mut lab.store, start)
+        let kept = crate::retention::round_at(&mut lab.store, start)
             .unwrap()
             .unwrap();
         assert_eq!(kept["kept"]["reused_key"], 3, "{kept}");
@@ -2691,7 +2691,7 @@ mod declared_tests {
         );
         // Unused for longer than the retention: the key retires with its attempt.
         age(&lab);
-        let summary = crate::retention::round(&mut lab.store, start + 3600.0)
+        let summary = crate::retention::round_at(&mut lab.store, start + 3600.0)
             .unwrap()
             .unwrap();
         assert!(summary["keys_retired"].as_u64().unwrap() >= 3, "{summary}");
@@ -2737,7 +2737,7 @@ mod declared_tests {
         let observed = std::rc::Rc::clone(&ran);
         BETWEEN_CHECK_AND_RETAIN.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(move |store: &mut Store| {
-                let summary = crate::retention::round(store, now()).unwrap().unwrap();
+                let summary = crate::retention::round_at(store, now()).unwrap().unwrap();
                 assert!(summary["attempts"].as_u64().unwrap() > 0, "{summary}");
                 observed.set(true);
             }))

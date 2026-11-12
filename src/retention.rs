@@ -18,6 +18,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -38,10 +39,13 @@ const RETIRE_BATCH: i64 = 256;
 const RETIRE_SENDS: i64 = 3;
 /// Where the authority renames an attempt's directory before deleting it.
 const ASIDE: &str = ".retention-";
-/// How far the clock may run past the newest time the store recorded before a round refuses: a
-/// quiet store may sit a day with nothing recorded, and a clock further ahead than that is taken
-/// for a jump, under which every cutoff would be wrong.
-pub const RETENTION_CLOCK_SLACK_SECONDS: f64 = 86400.0;
+/// How far the wall clock may move against `CLOCK_BOOTTIME` between two rounds before a round
+/// refuses: NTP slews at most 500 ppm (under 2 s an hour), so five minutes passes an honest clock
+/// while any step that could move a 30-day cutoff by a day is caught.
+pub const RETENTION_CLOCK_SLACK_SECONDS: f64 = 300.0;
+/// With no reading from this boot to compare with, how far the clock at process start may run
+/// past the newest time the store recorded: a quiet store may sit a day with nothing recorded.
+const NEWEST_RECORD_SLACK_SECONDS: f64 = 86400.0;
 
 /// Additive and idempotent. Keys recorded before uses were (or by a v29 binary since) count as
 /// last used when they were created, or at their latest recorded reuse when that is later.
@@ -195,8 +199,7 @@ struct Considered {
 
 /// The keep-rules, over the whole store at once. Read inside the deleting transaction, so what it
 /// lets go is what that transaction deletes.
-fn consider(db: &Connection, now: f64, days: u32) -> Result<Vec<Considered>> {
-    let cutoff = now - f64::from(days) * DAY;
+fn consider(db: &Connection, cutoff: f64) -> Result<Vec<Considered>> {
     let deleted: BTreeSet<String> = strings(db, "SELECT attempt FROM retention_deleted", ())?;
     // Each passed action's current attempt: the one its dependents are handed.
     let mut passing: BTreeMap<String, String> = BTreeMap::new();
@@ -442,52 +445,186 @@ fn newest_recorded(db: &Connection) -> Result<Option<f64>> {
     )?)
 }
 
-fn last_run(db: &Connection) -> Result<Option<f64>> {
+fn setting(db: &Connection, key: &str) -> Result<Option<String>> {
     Ok(db
-        .query_row(
-            "SELECT value FROM settings WHERE key='retention_last_run'",
-            [],
-            |r| r.get::<_, String>(0),
-        )
-        .optional()?
-        .and_then(|v| v.parse().ok()))
+        .query_row("SELECT value FROM settings WHERE key=?", [key], |r| {
+            r.get(0)
+        })
+        .optional()?)
 }
 
-/// Why `now` is not to be trusted for a cutoff, if it is not: the last run is later than it (the
-/// clock went back, or an earlier round ran under a clock ahead), or it is more than
-/// [`RETENTION_CLOCK_SLACK_SECONDS`] past everything the store recorded (it jumped forward).
-fn clock_fault(db: &Connection, now: f64) -> Result<Option<Value>> {
-    if let Some(last) = last_run(db)?
-        && last > now
-    {
-        return Ok(Some(
-            json!({"reason":"the last run is later than now","now":now,"last_run":last}),
-        ));
+fn set_setting(db: &Connection, key: &str, value: &str) -> Result<()> {
+    db.execute(
+        "INSERT INTO settings VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
+fn last_run(db: &Connection) -> Result<Option<f64>> {
+    Ok(setting(db, "retention_last_run")?.and_then(|v| v.parse().ok()))
+}
+
+/// One reading of the clocks a round's `now` is checked against.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Clock {
+    /// The wall clock, seconds since the epoch: the round's `now`.
+    pub wall: f64,
+    /// `CLOCK_BOOTTIME` in seconds: monotonic, never stepped, and counting suspend, so a resumed
+    /// host's sleep is elapsed time on both clocks.
+    pub boottime: f64,
+    /// The boot's id (`/proc/sys/kernel/random/boot_id`): boottimes compare within one boot only.
+    pub boot: String,
+}
+
+impl Clock {
+    pub fn read() -> Self {
+        let mut spec = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: a valid timespec to write into. It cannot fail for CLOCK_BOOTTIME on Linux;
+        // were it to, boottime 0 reads as another boot (`anchor`), so a round falls back to the
+        // start check rather than trusting it.
+        unsafe {
+            libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut spec);
+        }
+        Self {
+            wall: crate::now(),
+            boottime: spec.tv_sec as f64 + f64::from(spec.tv_nsec as u32) / 1e9,
+            boot: fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .map(|id| id.trim().to_owned())
+                .unwrap_or_default(),
+        }
     }
-    if let Some(newest) = newest_recorded(db)?
-        && now - newest > RETENTION_CLOCK_SLACK_SECONDS
+}
+
+/// What a process read before it wrote anything to the store: its clocks and the newest time the
+/// store had recorded. Its rounds check against it until there is a reading from this boot.
+#[derive(Debug, Clone)]
+pub struct Start {
+    clock: Clock,
+    newest: Option<f64>,
+}
+
+impl Start {
+    /// Read before this process writes anything: once it has, the newest record is its own and
+    /// proves nothing about its clock.
+    pub fn read(db: &Connection) -> Result<Self> {
+        Self::at(db, Clock::read())
+    }
+
+    fn at(db: &Connection, clock: Clock) -> Result<Self> {
+        Ok(Self {
+            clock,
+            newest: newest_recorded(db)?,
+        })
+    }
+}
+
+/// The clocks of the last round that ran or refused, recorded with `retention_last_run`.
+fn recorded_clock(db: &Connection) -> Result<Option<Clock>> {
+    Ok(setting(db, "retention_clock")?.and_then(|v| serde_json::from_str(&v).ok()))
+}
+
+/// After a clock fault, how far every cutoff moves back, and from when. Times the store recorded
+/// around a fault may be off by as much as the clock moved, in either direction, so each fault
+/// adds its size; it lapses once N days and that much more have passed on a clock that agreed with
+/// boottime since.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct Widening {
+    seconds: f64,
+    since: f64,
+}
+
+fn widening(db: &Connection) -> Result<Option<Widening>> {
+    Ok(setting(db, "retention_widening")?.and_then(|v| serde_json::from_str(&v).ok()))
+}
+
+/// The cutoff for `days` under `clock`: N days back, and further while a widening holds.
+fn cutoff(widening: Option<Widening>, clock: &Clock, days: u32) -> (f64, f64) {
+    let base = clock.wall - f64::from(days) * DAY;
+    match widening {
+        Some(w) if clock.wall - w.since <= f64::from(days) * DAY + w.seconds => {
+            (base - w.seconds, w.seconds)
+        }
+        _ => (base, 0.0),
+    }
+}
+
+/// Why `clock.wall` is not to be trusted for a cutoff, if it is not, and by how much it moved.
+struct Fault {
+    detail: Value,
+    seconds: f64,
+}
+
+/// Compares `clock` with the last recorded round's clocks when that was in this boot: the wall
+/// clock must have moved as boottime did, within [`RETENTION_CLOCK_SLACK_SECONDS`]. A fault either
+/// way refuses: ahead, every cutoff is late; behind, what the store records meanwhile is dated
+/// early. With no reading from this boot (the first round after a reboot or ever), the anchor is
+/// the process's own start, trusted only if the store had recorded something within a day of it
+/// before the process wrote anything. Then the last run must not be later than now.
+fn clock_fault(db: &Connection, start: &Start, clock: &Clock) -> Result<Option<Fault>> {
+    let anchor = match recorded_clock(db)? {
+        Some(recorded) if recorded.boot == clock.boot && recorded.boottime <= clock.boottime => {
+            recorded
+        }
+        _ => {
+            if let Some(newest) = start.newest
+                && start.clock.wall - newest > NEWEST_RECORD_SLACK_SECONDS
+            {
+                return Ok(Some(Fault {
+                    seconds: start.clock.wall - newest,
+                    detail: json!({
+                        "reason":"at start the clock was past the newest recorded time by more \
+                                  than a day","now":clock.wall,"started":start.clock.wall,
+                        "newest_recorded":newest,"slack_seconds":NEWEST_RECORD_SLACK_SECONDS}),
+                }));
+            }
+            start.clock.clone()
+        }
+    };
+    let moved = (clock.wall - anchor.wall) - (clock.boottime - anchor.boottime);
+    if moved.abs() > RETENTION_CLOCK_SLACK_SECONDS {
+        return Ok(Some(Fault {
+            seconds: moved.abs(),
+            detail: json!({"reason":"the wall clock moved against boottime by more than the slack",
+                "now":clock.wall,"since":anchor.wall,"moved_seconds":moved,
+                "slack_seconds":RETENTION_CLOCK_SLACK_SECONDS}),
+        }));
+    }
+    if let Some(last) = last_run(db)?
+        && last > clock.wall
     {
-        return Ok(Some(
-            json!({"reason":"now is past the newest recorded time by more than the slack",
-            "now":now,"newest_recorded":newest,"slack_seconds":RETENTION_CLOCK_SLACK_SECONDS}),
-        ));
+        return Ok(Some(Fault {
+            seconds: last - clock.wall,
+            detail: json!({"reason":"the last run is later than now","now":clock.wall,
+                           "last_run":last}),
+        }));
     }
     Ok(None)
 }
 
+/// What a round leaves for the next one to check against: these clocks, as the last run.
+fn record_clock(db: &Connection, clock: &Clock) -> Result<()> {
+    set_setting(db, "retention_last_run", &clock.wall.to_string())?;
+    set_setting(db, "retention_clock", &serde_json::to_string(clock)?)
+}
+
 /// `patchweft retention --days N --dry`: what N days would delete now, and its bytes, split by
 /// the passed-key rule, per executor and per job. Deletes and records nothing.
-pub fn dry_run(store: &Store, days: u32, now: f64) -> Result<Value> {
+pub fn dry_run(store: &Store, start: &Start, days: u32, clock: &Clock) -> Result<Value> {
     ensure!(days > 0, "a dry run needs --days of 1 or more");
     prepare(&store.db)?;
     // What a round would refuse now, it reports instead of a list made from that clock.
-    if let Some(refused) = clock_fault(&store.db, now)? {
+    if let Some(fault) = clock_fault(&store.db, start, clock)? {
         return Ok(
             json!({"dry":true,"days":days,"setting":self::days(&store.db)?,
-                         "refused":refused}),
+                         "refused":fault.detail}),
         );
     }
-    let considered = consider(&store.db, now, days)?;
+    let (cutoff, widened) = cutoff(widening(&store.db)?, clock, days);
+    let considered = consider(&store.db, cutoff)?;
     let mut split: BTreeMap<&str, (Tally, Tally, BTreeMap<String, Tally>)> = BTreeMap::new();
     let (mut total, mut keys) = (Tally::default(), 0);
     let (mut executors, mut jobs) = (BTreeMap::new(), BTreeMap::new());
@@ -526,36 +663,47 @@ pub fn dry_run(store: &Store, days: u32, now: f64) -> Result<Value> {
                    "kept":tallies(&kept)}),
         );
     }
-    Ok(
-        json!({"dry":true,"days":days,"setting":self::days(&store.db)?,
-        "cutoff":now - f64::from(days) * DAY,"split":classes,
+    let mut dry = json!({"dry":true,"days":days,"setting":self::days(&store.db)?,
+        "cutoff":cutoff,"split":classes,
         "delete":{"attempts":total.attempts,"bytes":total.bytes,"keys_retired":keys},
-        "by_executor":tallies(&executors),"by_job":tallies(&jobs),"attempts":listed}),
-    )
+        "by_executor":tallies(&executors),"by_job":tallies(&jobs),"attempts":listed});
+    if widened > 0.0 {
+        dry["widened_seconds"] = json!(widened);
+    }
+    Ok(dry)
 }
 
 /// The real deletion, behind its own gate: only with the setting on, at most once an hour, and
 /// never under a clock it cannot trust (`clock_fault`): then it deletes nothing, records
-/// `retention.refused` with both times and returns `{"refused": …}`. The attempts it lets go are
-/// marked and their unused keys retired in one transaction; their directories go after it
-/// commits, and a removal that fails is retried next round. Logs a `retention.deleted` summary.
-/// None when the gate is shut.
-pub fn round(store: &mut Store, now: f64) -> Result<Option<Value>> {
+/// `retention.refused` with the times it compared and returns `{"refused": …}`. A refusal records
+/// this round's clocks, so the next round checks against them, and widens every later cutoff by
+/// how far the clock moved (`Widening`). The attempts it lets go are marked and their unused keys
+/// retired in one transaction; their directories go after it commits, and a removal that fails
+/// is retried next round. Logs a `retention.deleted` summary. None when the gate is shut.
+///
+/// `start` is what this process read before it wrote anything ([`Start::read`]); `clock` is now.
+pub fn round(store: &mut Store, start: &Start, clock: &Clock) -> Result<Option<Value>> {
     prepare(&store.db)?;
     let Some(days) = days(&store.db)? else {
         return Ok(None);
     };
+    let now = clock.wall;
     let transaction = store.transaction()?;
-    if let Some(refused) = clock_fault(&transaction, now)? {
-        // A last run later than now is not the hourly gate: it is recorded as now, so the gate
-        // counts from a time this clock reached and a later round can run. A jump forward
-        // records nothing, so a round under the true clock runs as if this one never came.
-        if last_run(&transaction)?.is_some_and(|last| last > now) {
-            transaction.execute(
-                "UPDATE settings SET value=? WHERE key='retention_last_run'",
-                [now.to_string()],
-            )?;
-        }
+    if let Some(fault) = clock_fault(&transaction, start, clock)? {
+        // Recorded as the last run, so the hourly gate counts from a time this clock reached and
+        // the next check compares with this reading, not with one from before the move.
+        record_clock(&transaction, clock)?;
+        let seconds = widening(&transaction)?.map_or(0.0, |w| w.seconds) + fault.seconds;
+        set_setting(
+            &transaction,
+            "retention_widening",
+            &serde_json::to_string(&Widening {
+                seconds,
+                since: now,
+            })?,
+        )?;
+        let mut refused = fault.detail;
+        refused["widened_seconds"] = json!(seconds);
         event(&transaction, "retention.refused", "retention", &refused)?;
         transaction.commit()?;
         return Ok(Some(json!({"days":days,"refused":refused})));
@@ -563,12 +711,13 @@ pub fn round(store: &mut Store, now: f64) -> Result<Option<Value>> {
     if last_run(&transaction)?.is_some_and(|last| now - last < INTERVAL) {
         return Ok(None);
     }
-    transaction.execute(
-        "INSERT INTO settings VALUES ('retention_last_run',?)
-         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        [now.to_string()],
-    )?;
-    let considered = consider(&transaction, now, days)?;
+    record_clock(&transaction, clock)?;
+    let held = widening(&transaction)?;
+    let (cutoff, widened) = cutoff(held, clock, days);
+    if held.is_some() && widened == 0.0 {
+        transaction.execute("DELETE FROM settings WHERE key='retention_widening'", [])?;
+    }
+    let considered = consider(&transaction, cutoff)?;
     let mut marked = Vec::new();
     let mut keys = 0;
     for item in considered.iter().filter(|item| item.kept.is_none()) {
@@ -633,12 +782,30 @@ pub fn round(store: &mut Store, now: f64) -> Result<Option<Value>> {
         .keys()
         .filter(|attempt| !now_marked.contains(attempt.as_str()))
         .count();
-    let summary = json!({"days":days,"attempts":total.attempts,"bytes":total.bytes,
+    let mut summary = json!({"days":days,"attempts":total.attempts,"bytes":total.bytes,
         "keys_retired":keys,"split":tallies(&split),"kept":kept,
         "by_executor":tallies(&executors),"by_job":tallies(&jobs),
         "removed_from_earlier_rounds":earlier,"failed":removal.failed});
+    if widened > 0.0 {
+        summary["widened_seconds"] = json!(widened);
+    }
     event(&store.db, "retention.deleted", "retention", &summary)?;
     Ok(Some(summary))
+}
+
+/// A round under a clock that agrees with boottime, for the crate's other tests.
+#[cfg(test)]
+pub(crate) fn round_at(store: &mut Store, now: f64) -> Result<Option<Value>> {
+    let clock = Clock {
+        wall: now,
+        boottime: now,
+        boot: "test".into(),
+    };
+    let start = Start {
+        clock: clock.clone(),
+        newest: None,
+    };
+    round(store, &start, &clock)
 }
 
 struct Removal {
@@ -786,6 +953,16 @@ mod tests {
     struct Lab {
         _temp: tempfile::TempDir,
         store: Store,
+        start: Start,
+    }
+
+    /// Clocks that agree: boottime moves as the wall clock does.
+    fn at(wall: f64) -> Clock {
+        Clock {
+            wall,
+            boottime: wall,
+            boot: "lab".into(),
+        }
     }
 
     impl Lab {
@@ -815,7 +992,12 @@ mod tests {
                     {"name":"check","command":["sh"],"reuse":"declared"},
                     {"name":"pinned","command":["sh"],"reuse":"exact"}]}});
             crate::store::insert(&store.db, "profiles", "f", &profile).unwrap();
-            Self { _temp: temp, store }
+            let start = Start::at(&store.db, at(now())).unwrap();
+            Self {
+                _temp: temp,
+                store,
+                start,
+            }
         }
 
         fn db(&self) -> &Connection {
@@ -905,8 +1087,16 @@ mod tests {
             set_with_minimum(&mut self.store, 30, MIN_DAYS).unwrap();
         }
 
-        fn round(&mut self, at: f64) -> Option<Value> {
-            round(&mut self.store, at).unwrap()
+        fn round(&mut self, wall: f64) -> Option<Value> {
+            self.round_on(&at(wall))
+        }
+
+        fn round_on(&mut self, clock: &Clock) -> Option<Value> {
+            round(&mut self.store, &self.start, clock).unwrap()
+        }
+
+        fn dry(&self, days: u32, wall: f64) -> Result<Value> {
+            dry_run(&self.store, &self.start, days, &at(wall))
         }
 
         fn present(&self, attempt: &str) -> bool {
@@ -1021,7 +1211,7 @@ mod tests {
     #[test]
     fn the_dry_run_splits_three_ways_and_deletes_nothing() {
         let lab = split_lab();
-        let dry = dry_run(&lab.store, 30, now()).unwrap();
+        let dry = lab.dry(30, now()).unwrap();
         let split = &dry["split"];
         // 15 bytes per attempt: a 10-byte log and a 5-byte artifact.
         assert_eq!(
@@ -1076,17 +1266,14 @@ mod tests {
             BTreeSet::new()
         );
         // A dry run needs no setting and may look at any horizon; it changes nothing either.
-        assert_eq!(
-            dry_run(&lab.store, 400_000, now()).unwrap()["delete"]["attempts"],
-            0
-        );
-        assert!(dry_run(&lab.store, 0, now()).is_err());
+        assert_eq!(lab.dry(400_000, now()).unwrap()["delete"]["attempts"], 0);
+        assert!(lab.dry(0, now()).is_err());
     }
 
     #[test]
     fn the_round_deletes_what_the_dry_run_listed_and_logs_a_summary() {
         let mut lab = split_lab();
-        let listed = dry_run(&lab.store, 30, now()).unwrap();
+        let listed = lab.dry(30, now()).unwrap();
         lab.on();
         let summary = lab.round(now()).unwrap();
         assert_eq!(
@@ -1286,47 +1473,166 @@ mod tests {
     }
 
     /// A forward clock jump would put every cutoff in the future: the passing attempt of a key
-    /// reused just now would look unused for years and go with its key.
+    /// reused just now would look unused for years and go with its key. The server's own writes
+    /// at the jumped time (lease expiry, a claim) come first and prove nothing.
     #[test]
-    fn a_clock_far_ahead_of_the_store_deletes_nothing() {
+    fn a_forward_jump_with_a_write_at_the_jumped_time_deletes_nothing() {
         let mut lab = Lab::new();
         let attempt = lab.passed("a", "check", OLD);
-        // A fresh reuse: the key was used now, and the store recorded it.
-        lab.key("a", now());
-        lab.activity(now());
+        let t0 = now();
+        lab.key("a", t0);
+        lab.activity(t0);
         lab.on();
-        let ahead = now() + 10.0 * 365.0 * DAY;
-        let refused = lab.round(ahead).unwrap();
+        assert_eq!(lab.round(t0).unwrap()["kept"], json!({"reused_key":1}));
+        let keyless = lab.passed("b", "build", OLD);
+        // Sixty days ahead a minute later, by boottime; the authority writes there at once.
+        let ahead = Clock {
+            wall: t0 + 60.0 * DAY,
+            boottime: t0 + 60.0,
+            boot: "lab".into(),
+        };
+        lab.activity(ahead.wall);
+        let refused = lab.round_on(&ahead).unwrap();
         assert_eq!(
             refused["refused"]["reason"],
-            "now is past the newest recorded time by more than the slack",
+            "the wall clock moved against boottime by more than the slack",
             "{refused}"
         );
-        assert_eq!(refused["refused"]["now"], ahead);
-        assert!(refused["refused"]["newest_recorded"].as_f64().unwrap() <= now());
+        assert_eq!(refused["refused"]["now"], ahead.wall);
+        assert!(refused["refused"]["moved_seconds"].as_f64().unwrap() > 59.0 * DAY);
         assert!(lab.present(&attempt) && !lab.deleted(&attempt));
+        assert!(lab.present(&keyless) && !lab.deleted(&keyless));
         assert_eq!(
             lab.keys(),
             BTreeSet::from(["a".to_string()]),
             "no key retired"
         );
-        assert!(lab.events("retention.deleted").is_empty());
+        assert_eq!(
+            lab.events("retention.deleted").len(),
+            1,
+            "only the first round's"
+        );
         let logged = lab.events("retention.refused");
         assert_eq!(logged.len(), 1);
-        assert_eq!(logged[0]["detail"]["now"], ahead);
-        // The dry run reports the same refusal and lists nothing.
-        let dry = dry_run(&lab.store, 30, ahead).unwrap();
-        assert_eq!(dry["refused"]["reason"], refused["refused"]["reason"]);
-        assert_eq!(dry.get("attempts"), None);
-        // The jump left no last run behind: the true clock's round runs at once, and keeps the
-        // reused key's attempt.
-        assert_eq!(last_run(lab.db()).unwrap(), None);
-        let summary = lab.round(now()).unwrap();
+        assert_eq!(logged[0]["detail"]["now"], ahead.wall);
+        // The refusal took this reading: a dry run under it lists with the cutoff moved back.
+        let dry = dry_run(&lab.store, &lab.start, 30, &ahead).unwrap();
+        assert_eq!(dry.get("refused"), None, "{dry}");
+        assert_eq!(dry["delete"]["attempts"], 1, "{dry}");
+        assert!(dry["widened_seconds"].as_f64().unwrap() > 59.0 * DAY);
+        // The jumped clock runs on, agreeing with boottime from the refusal: the next round runs,
+        // with every cutoff moved back by the jump, so the key reused at t0 is still in use.
+        let later = Clock {
+            wall: ahead.wall + 2.0 * INTERVAL,
+            boottime: ahead.boottime + 2.0 * INTERVAL,
+            boot: "lab".into(),
+        };
+        let summary = lab.round_on(&later).unwrap();
         assert_eq!(summary.get("refused"), None, "{summary}");
+        assert!(summary["widened_seconds"].as_f64().unwrap() > 59.0 * DAY);
         assert_eq!(summary["kept"], json!({"reused_key":1}));
+        assert_eq!(summary["keys_retired"], 0);
         assert!(lab.present(&attempt) && !lab.deleted(&attempt));
-        // Its own refusal events never count as the store's newest time.
-        assert!(lab.round(ahead).unwrap().get("refused").is_some());
+        assert!(
+            !lab.present(&keyless) && lab.deleted(&keyless),
+            "keyless and old: it ran"
+        );
+        // Once N days and the jump have passed on that clock, the widening lapses: a key unused
+        // since t0 is unused, and retires.
+        let lapsed = Clock {
+            wall: ahead.wall + 91.0 * DAY,
+            boottime: ahead.boottime + 91.0 * DAY,
+            boot: "lab".into(),
+        };
+        let summary = lab.round_on(&lapsed).unwrap();
+        assert_eq!(summary.get("widened_seconds"), None, "{summary}");
+        assert_eq!(summary["keys_retired"], 1);
+        assert_eq!(widening(lab.db()).unwrap().map(|w| w.seconds), None);
+    }
+
+    /// The twin: the clock steps back, a key is used and stamped behind, and the clock is then
+    /// corrected. That key was used within N days, though its stamp says otherwise.
+    #[test]
+    fn a_backward_step_then_its_correction_keeps_a_key_used_meanwhile() {
+        let mut lab = Lab::new();
+        lab.on();
+        let t0 = now();
+        assert!(lab.round(t0).unwrap().get("refused").is_none());
+        let attempt = lab.passed("a", "check", OLD);
+        let behind = Clock {
+            wall: t0 + 600.0 - 40.0 * DAY,
+            boottime: t0 + 600.0,
+            boot: "lab".into(),
+        };
+        lab.key("a", behind.wall);
+        let refused = lab.round_on(&behind).unwrap();
+        assert!(refused["refused"]["moved_seconds"].as_f64().unwrap() < -39.0 * DAY);
+        // Corrected: a move forward against the reading the refusal took, refused too.
+        let corrected = at(t0 + 1200.0);
+        assert!(lab.round_on(&corrected).unwrap().get("refused").is_some());
+        let summary = lab.round(t0 + 1200.0 + INTERVAL).unwrap();
+        assert_eq!(summary.get("refused"), None, "{summary}");
+        assert_eq!(summary["kept"], json!({"reused_key":1}), "{summary}");
+        assert_eq!(summary["keys_retired"], 0);
+        assert!(lab.present(&attempt) && !lab.deleted(&attempt));
+        assert_eq!(lab.keys(), BTreeSet::from(["a".to_string()]));
+    }
+
+    /// With no reading from this boot, a process's first round checks the clock it started under
+    /// against the newest time the store recorded before that process wrote anything.
+    #[test]
+    fn the_first_round_after_a_reboot_checks_the_store_as_it_was_at_start() {
+        let mut lab = Lab::new();
+        let attempt = lab.passed("a", "check", OLD);
+        let t0 = now();
+        lab.key("a", t0);
+        lab.activity(t0);
+        lab.on();
+        assert!(lab.round(t0).unwrap().get("refused").is_none());
+        // Rebooted under a clock 60 days ahead: another boot, so the recorded reading is no anchor.
+        let booted = Clock {
+            wall: t0 + 60.0 * DAY,
+            boottime: 30.0,
+            boot: "next".into(),
+        };
+        lab.start = Start::at(lab.db(), booted.clone()).unwrap();
+        // The process's own first write, at the jumped time, after its start reading.
+        lab.activity(booted.wall + 1.0);
+        let first = Clock {
+            wall: booted.wall + 5.0,
+            boottime: 35.0,
+            boot: "next".into(),
+        };
+        let refused = lab.round_on(&first).unwrap();
+        assert_eq!(
+            refused["refused"]["reason"],
+            "at start the clock was past the newest recorded time by more than a day",
+            "{refused}"
+        );
+        assert!(lab.present(&attempt) && !lab.deleted(&attempt));
+        assert_eq!(lab.keys().len(), 1);
+        // An honest restart: the store recorded something an hour before; nothing is refused,
+        // whatever boottime reads in the new boot.
+        let mut lab = Lab::new();
+        lab.activity(t0 - 3600.0);
+        lab.on();
+        lab.start = Start::at(
+            lab.db(),
+            Clock {
+                wall: t0,
+                boottime: 12.0,
+                boot: "fresh".into(),
+            },
+        )
+        .unwrap();
+        let summary = lab
+            .round_on(&Clock {
+                wall: t0 + 60.0,
+                boottime: 72.0,
+                boot: "fresh".into(),
+            })
+            .unwrap();
+        assert_eq!(summary.get("refused"), None, "{summary}");
     }
 
     /// A last run later than now is a clock fault, not the hourly gate: refused and logged, and
@@ -1349,7 +1655,7 @@ mod tests {
             "the last run is later than now"
         );
         assert_eq!(
-            dry_run(&lab.store, 30, start).unwrap()["refused"]["reason"],
+            lab.dry(30, start).unwrap()["refused"]["reason"],
             Value::Null,
             "already counted from now"
         );
