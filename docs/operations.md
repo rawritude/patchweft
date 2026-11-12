@@ -264,8 +264,8 @@ latency guarantees are not implemented.
 
 ## Executors
 
-Each executor runs one coordinator, which launches one supervisor per attempt.
-`worker` is the coordinator of the `local` executor on the store's host; `executor`
+Each executor runs one coordinator, which launches one supervisor per attempt: the runner,
+`patchweft-runner _supervise` (see [the runner](#the-runner)). `worker` is the coordinator of the `local` executor on the store's host; `executor`
 runs a remote one, which reaches the store only through the API. Both claim, renew,
 complete and verify the same way. A second coordinator for the same executor
 waits as a standby until the first exits.
@@ -398,6 +398,12 @@ Each attempt runs in its own cgroup v2, and its evidence records what the kernel
 so reservations can be set from measured peaks. Nothing is enforced: no `memory.max`, no CPU
 limit; `memory_mb` stays an admission unit.
 
+The work is split as the binaries are. The coordinator (`patchweft worker` or `executor`)
+prepares the executor unit's cgroup once at start and hands the result to every runner it
+launches; the runner (`patchweft-runner`) enters the attempt's own cgroup, measures it and writes
+the numbers into the evidence. The measuring is part of the runner's bytes, so changing it is a
+runner release ([the runner](#the-runner)); the preparation is not.
+
 **Setup, per host.** The coordinator's user unit needs a drop-in, applied as the executor account
 (no sudo):
 
@@ -413,8 +419,8 @@ DelegateSubgroup=coordinator
 ```
 
 Then `systemctl --user daemon-reload` and restart the unit, drained. `DelegateSubgroup=` needs
-systemd 254 or later (`systemctl --version`); the hosts run cgroup v2 with `cpu memory pids` in
-`user@1001.service`'s `cgroup.subtree_control`. Check with
+systemd 254 or later (`systemctl --version`): mauve and mindy run 259, pw-robin 255. The hosts
+run cgroup v2 with `cpu memory pids` in `user@1001.service`'s `cgroup.subtree_control`. Check with
 `systemctl --user show patchweft-executor -p Delegate -p DelegateSubgroup` and
 `cat /proc/$(systemctl --user show -p MainPID --value patchweft-executor)/cgroup`, which must end in
 `/coordinator`.
@@ -426,10 +432,11 @@ systemd's `user.delegate`/`trusted.delegate` mark (systemd 255's user manager se
 drop-in's second line is what proves delegation there). A coordinator started in the unit's own
 cgroup moves itself into `<unit>/coordinator`. It then writes `+memory +pids +cpu` to the unit's
 `cgroup.subtree_control`. It logs `{"event":"attempt_cgroups",…}` with the unit, or why not, and
-passes the result to each supervisor it launches (`_supervise … --cgroup UNIT` or
-`--cgroup-unavailable WHY`). Once registered, each supervisor creates `<unit>/attempt-<id>`, moves
-itself there before the job's preparation, samples `memory.stat` every 5 seconds, and at the end,
-after the job's processes and its cleanup are gone, reads the counters, kills what is left, moves
+passes the result to each runner it launches: `patchweft-runner _supervise ROOT ATTEMPT --cgroup
+UNIT`, or `--cgroup-unavailable WHY`. A runner given neither records `not passed by the
+coordinator`; it refuses any other argument. Once registered, each runner creates
+`<unit>/attempt-<id>`, moves itself there before the job's preparation, samples `memory.stat`
+every 5 seconds, and at the end, after the job's processes and its cleanup are gone, reads the counters, kills what is left, moves
 back to `<unit>/coordinator` and removes the attempt's cgroup.
 
 The `coordinator` leaf is why `DelegateSubgroup=` is needed and not just tidy. Once the unit's
@@ -439,7 +446,8 @@ could not start the new coordinator in the unit's cgroup; with `DelegateSubgroup
 starts it in the leaf.
 
 `--attempt-cgroups auto|off` on `worker` and `executor` (default `auto`). `off`, an undelegated
-unit, a missing memory controller, or any failure to create or enter the attempt's cgroup records
+unit, a missing memory controller, or any failure of the runner to create or enter the attempt's
+cgroup records
 `"cgroup": {"unavailable": "<why>"}` and the job runs exactly as without cgroups: measuring never
 fails, refuses or delays a job.
 
@@ -481,7 +489,7 @@ Unreadable or missing files give null. A job with `"uses_containers": true` (Pro
 - *Container memory.* Containers under rootless Docker are charged to Docker's own user service,
   not to the attempt; the attempt's numbers are the job's own processes alone. Take such jobs'
   real peak from elsewhere until the daemon's cgroup parent is set per job.
-- *Supervisor overhead is included, not excluded.* The supervisor runs in the attempt's cgroup
+- *Supervisor overhead is included, not excluded.* The runner runs in the attempt's cgroup
   with the job, so the numbers include it (a few MiB, and its threads in `pids_peak`), as well as
   the attempt's preparation (checkout, dependency copies, mostly page cache) and its external
   cleanup. Putting the job alone in a child cgroup would need the move between `fork` and `exec`
@@ -491,8 +499,8 @@ Unreadable or missing files give null. A job with `"uses_containers": true` (Pro
 - *Attempts that never ran:* a supervisor stopped before registration, or a launch that failed in
   the coordinator, has no `cgroup` field.
 - *A supervisor killed outright* (SIGKILL) leaves its attempt's cgroup behind, with any orphan of
-  its job in it; nothing removes it yet. Supervisors from before v30 run in no attempt cgroup;
-  drain them at the cutover.
+  its job in it; nothing removes it yet. Supervisors from before v30 (the scheduler's own
+  `_supervise`) run in no attempt cgroup; drain them at the cutover.
 
 ## Failure and recovery
 
@@ -595,20 +603,68 @@ promotion checks them against their original key. They are never shared or
 retained, so the first run of each profile after an upgrade executes every job.
 
 Logs, revisions, events, attempts and artifacts are retained in the store.
-`serve` deletes uploads nobody consumed within 24 hours; other automatic retention
-and garbage collection are not implemented. Monitor disk space. Deleting files
-inside the state store can invalidate evidence or replay; there is no supported
-selective pruning command. Nothing prunes the store, on NG's hosts or elsewhere. A future pruner
-is handed off and gated on its own, and may delete only an attempt's directory that is drained,
-past its retention, and neither a dependency of a live action nor a reused result: `logs` reads
-`attempts/<id>/output.log`, and a `local` claim reads its dependencies' artifacts from
-`attempts/<producer>/artifacts`.
+`serve` deletes uploads nobody consumed within 24 hours. Old attempts' logs and artifacts go only
+under [retention](#retention), which is off by default; nothing else prunes the store, and
+revisions, events and attempt rows are never deleted. Monitor disk space. Deleting files inside
+the state store by hand can invalidate evidence or replay.
+
+### Retention
+
+`patchweft --state DIR retention --days N` turns on attempt-store retention: the authority deletes
+the logs and artifacts (the whole `attempts/<id>` directory) of attempts that ended more than N
+days ago and that nothing can use any more. N is at least 30, since job logs are read up to three
+weeks back; `--days 0` turns it off again. With no setting, which is the default, nothing is ever
+deleted. The setting is store state with an `executor.retention` event, like `reserve` and `share`.
+
+`patchweft --state DIR retention --days N --dry` deletes and records nothing. It lists what N
+days would delete now, with its bytes, per executor and per job, split by the passed-key rule
+below: `reused_key` (used within N days, kept), `unused_key` (retires with its attempt) and
+`no_key`. Run it before setting N.
+
+An attempt's outputs go only when it has drained, ended more than N days ago, and is none of
+these (the `kept` reasons):
+
+- `reused_key`: the passing attempt behind a passed key used within N days. Every request that
+  resolves to a key records a use: created, reused, shared or retained. Keys from before v30
+  count as used when they were created, or at their latest recorded reuse when that is later. A key
+  unused for N days retires with its attempt: it is never reused again, so an identical request
+  runs cold, but receipts that reused it still read it.
+- `live_dependency`: an artifact source of a queued, running or stopping action. A `local` claim
+  reads its dependencies' artifacts from `attempts/<producer>/artifacts`.
+- `open_candidate`: an attempt of an action a candidate still open requires.
+- `frontier`: an attempt of an action the validated frontier requires, or one its certificate
+  names.
+- `action_key`: the passing attempt of an `exact` or `files` job, which a request shares by its
+  action key.
+
+Only `serve` deletes, in its maintenance loop, at most once an hour by the store's clock, and on
+its own thread, so deleting many trees never delays lease expiry. One transaction marks the
+attempts and retires their unused keys; their directories are renamed aside and deleted after it
+commits, and a removal that fails is retried next round. Each round logs and records
+`retention.deleted` with counts, bytes, the kept reasons and any failures.
+
+The attempt row stays, with its evidence, so history, durations and certificates keep
+working; its body gains `deleted_by_retention` and `retention_days`. Reading what is gone says so:
+`logs` (CLI) and the `logs` query answer "deleted by retention after N days" (HTTP 410
+`log_deleted`); the artifact manifest is 410 `artifacts_deleted` and `deliver` refuses. Nothing
+hands out missing artifacts: `--retain-from` a candidate whose outputs were deleted leaves that
+job `not_retained` ("predecessor outputs were deleted by retention"), so it runs again, and `retry`
+of a job whose dependency's outputs were deleted refuses: submit the revision again.
+
+A remote executor deletes its own copy of an attempt once it is acknowledged and drained (see
+[executors](#executors)); for any `attempts/<id>` still left there, each claim response carries
+`retire`, the ids of that executor's attempts whose outputs the authority deleted, each sent at
+most three times. The coordinator renames each such `attempts/<id>` into `tmp/` (which every start
+clears) and deletes it off its claim loop, never one its ledger holds or held. An executor that
+predates the field ignores it. Retention is all scheduler-side, in `serve` and the coordinator; the
+runner takes no part and never opens the store.
 
 ### The runner
 
 Patchweft is two binaries. `patchweft` serves the API, schedules, and coordinates executors. It
 never runs a job: it has no command that executes one. `patchweft-runner` runs jobs. A coordinator
-launches it once per attempt, as `patchweft-runner _supervise ROOT ATTEMPT`, and it reads only that
+launches it once per attempt, as `patchweft-runner _supervise ROOT ATTEMPT --cgroup UNIT` (or
+`--cgroup-unavailable WHY`, see [attempt cgroups](#attempt-cgroups)), and it reads only that
 attempt's control files. A profile's `engine` (and every job recipe, through it) is the sha256 of
 the runner, never of `patchweft`, so a scheduler, API or admission change leaves every profile id,
 recipe and passed key as it was.

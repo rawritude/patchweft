@@ -10,8 +10,9 @@ macOS; supervised job execution requires Linux and refuses to start elsewhere.
 
 This is a single-store service for cooperating agents. Its scoped network API does
 not isolate executed code: trusted registered profiles still run with the executing
-account's Unix privileges. Automatic store retention, replication, OAuth
-provisioning and a hostile-code sandbox are not implemented.
+account's Unix privileges. Replication, OAuth provisioning and a hostile-code sandbox
+are not implemented; store retention is an operator setting, off by default
+([retention](operations.md#retention)).
 
 ## Start a connection
 
