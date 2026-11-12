@@ -217,6 +217,15 @@ pub fn capacity(db: &Connection) -> Result<(u32, u32)> {
     Ok((get("slots")?, get("memory_mb")?))
 }
 
+/// Whether the store has the table: one an older binary never made, or a later one added.
+pub fn table_exists(db: &Connection, name: &str) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT COUNT(*)>0 FROM sqlite_master WHERE type='table' AND name=?",
+        [name],
+        |r| r.get(0),
+    )?)
+}
+
 /// Passed keys of declared jobs' actions. Additive and idempotent; the store schema itself is
 /// unchanged. `passed_keys` keeps its v29 shape, so a v29 binary still reads and writes it after
 /// a rollback; when each key was last used, and the keys retention retired, are side tables.
@@ -246,14 +255,7 @@ pub fn touch_passed_key(db: &Connection, action: &str, time: f64) -> Result<()> 
 /// declared path, and in a store that has none. A key retention retired still answers here: it
 /// is never reused again, but it stays the identity a reused receipt is checked against.
 pub fn passed_key_of(db: &Connection, action: &str) -> Result<Option<String>> {
-    let table = |name: &str| -> Result<bool> {
-        Ok(db.query_row(
-            "SELECT COUNT(*)>0 FROM sqlite_master WHERE type='table' AND name=?",
-            [name],
-            |r| r.get(0),
-        )?)
-    };
-    if !table("passed_keys")? {
+    if !table_exists(db, "passed_keys")? {
         return Ok(None);
     }
     let key: Option<String> = db
@@ -263,7 +265,7 @@ pub fn passed_key_of(db: &Connection, action: &str) -> Result<Option<String>> {
             |r| r.get(0),
         )
         .optional()?;
-    if key.is_some() || !table("retired_keys")? {
+    if key.is_some() || !table_exists(db, "retired_keys")? {
         return Ok(key);
     }
     Ok(db

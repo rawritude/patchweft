@@ -4,7 +4,7 @@ use crate::{
     api, engine,
     model::*,
     now, source,
-    store::{self, Store, event, record},
+    store::{self, Store, event, record, table_exists},
     unique,
 };
 use anyhow::{Context, Result, ensure};
@@ -126,15 +126,6 @@ pub fn default_record(id: &str) -> ExecutorRecord {
         observed: Observed::default(),
         holding: None,
     }
-}
-
-fn table_exists(db: &Connection, name: &str) -> Result<bool> {
-    let count: i64 = db.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
-        [name],
-        |r| r.get(0),
-    )?;
-    Ok(count > 0)
 }
 
 /// A store not yet prepared knows only the local executor.

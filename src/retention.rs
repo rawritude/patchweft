@@ -14,7 +14,7 @@
 use crate::{
     authority::LOCAL,
     model::{Candidate, RegisteredProfile, Reuse},
-    store::{Store, event, prepare_passed_keys, record},
+    store::{Store, event, prepare_passed_keys, record, table_exists},
     unique,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -101,14 +101,6 @@ pub fn prepare(db: &Connection) -> Result<()> {
         set_setting(db, "retention_uses_seen", &newest.to_string())?;
     }
     Ok(())
-}
-
-fn table_exists(db: &Connection, name: &str) -> Result<bool> {
-    Ok(db.query_row(
-        "SELECT COUNT(*)>0 FROM sqlite_master WHERE type='table' AND name=?",
-        [name],
-        |r| r.get(0),
-    )?)
 }
 
 /// The retention in days, None when it is off (the default).
