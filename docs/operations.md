@@ -686,6 +686,15 @@ which lapses once N days and the widening itself have passed on a clock that agr
 the round's summary and `--dry` carry `widened_seconds` while it holds. `--dry` reports a fault
 under `refused`, and records nothing.
 
+The widening is capped at a year (`WIDENING_CAP_SECONDS`): a clock off by more is a reset (a dead
+RTC battery, a firmware epoch), not a step the store's times can be corrected for. Past the cap
+every round refuses, once an hour, with `cap_seconds` in its `retention.refused`, rather than run
+and delete nothing for decades. Setting the retention again, `retention --days N` with N of 30 or
+more (the same N will do), is the operator accepting the clock as it is: it clears the widening
+and records `cleared_widening_seconds` in its `executor.retention` event. Anything stamped while
+the clock was off is then dated by it, so a key used then may retire. `--days 0` keeps the
+widening.
+
 The attempt row stays, with its evidence, so history, durations and certificates keep
 working; its body gains `deleted_by_retention` and `retention_days`. Reading what is gone says so:
 `logs` (CLI) and the `logs` query answer "deleted by retention after N days" (HTTP 410

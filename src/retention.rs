@@ -47,6 +47,10 @@ pub const RETENTION_CLOCK_SLACK_SECONDS: f64 = 300.0;
 /// With no reading from this boot to compare with, how far the boot's start may lie past the
 /// newest time the store recorded before it: a host may be down, or the store quiet, for a day.
 const NEWEST_RECORD_SLACK_SECONDS: f64 = 86400.0;
+/// The most a widening may hold: a clock off by more than a year is a reset (a dead RTC battery, a
+/// firmware epoch), not a step the store's times can be corrected for. Past it every round refuses
+/// and says so, until an operator sets `retention --days` again.
+const WIDENING_CAP_SECONDS: f64 = 365.0 * DAY;
 
 /// Additive and idempotent. Keys recorded before uses were (or by a v29 binary since) count as
 /// last used when they were created, or at their latest recorded reuse when that is later. A key
@@ -129,8 +133,18 @@ fn set_with_minimum(store: &mut Store, wanted: u32, minimum: u32) -> Result<Valu
     prepare(&store.db)?;
     let transaction = store.transaction()?;
     let previous = days(&transaction)?;
-    let detail = json!({"days":wanted,"previous":previous});
-    if previous == (wanted > 0).then_some(wanted) {
+    let mut detail = json!({"days":wanted,"previous":previous});
+    // Setting it (again) is the operator accepting the clock as it is: a widening goes, and
+    // with it what it would have kept of anything stamped while the clock was off.
+    let cleared = (wanted > 0)
+        .then(|| widening(&transaction))
+        .transpose()?
+        .flatten();
+    if let Some(cleared) = cleared {
+        transaction.execute("DELETE FROM settings WHERE key='retention_widening'", [])?;
+        detail["cleared_widening_seconds"] = json!(cleared.seconds);
+    }
+    if previous == (wanted > 0).then_some(wanted) && cleared.is_none() {
         // Nothing changes: no row or event.
         return Ok(detail);
     }
@@ -571,6 +585,18 @@ fn widening(db: &Connection) -> Result<Option<Widening>> {
     Ok(setting(db, "retention_widening")?.and_then(|v| serde_json::from_str(&v).ok()))
 }
 
+/// A widening past [`WIDENING_CAP_SECONDS`]: the store's times cannot be bounded, so a round
+/// refuses rather than delete on them. Setting `retention --days` again clears it.
+fn over_cap(widening: Option<Widening>, clock: &Clock) -> Option<Value> {
+    let widening = widening.filter(|w| w.seconds > WIDENING_CAP_SECONDS)?;
+    Some(
+        json!({"reason":"the clock moved further than retention can correct for; \
+                set retention --days again to accept the clock as it is",
+        "now":clock.wall,"widened_seconds":widening.seconds,"since":widening.since,
+        "cap_seconds":WIDENING_CAP_SECONDS}),
+    )
+}
+
 /// The cutoff for `days` under `clock`: N days back, and further while a widening holds.
 fn cutoff(widening: Option<Widening>, clock: &Clock, days: u32) -> (f64, f64) {
     let base = clock.wall - f64::from(days) * DAY;
@@ -656,7 +682,13 @@ pub fn dry_run(store: &Store, start: &Start, days: u32, clock: &Clock) -> Result
                          "refused":fault.detail}),
         );
     }
-    let (cutoff, widened) = cutoff(widening(&store.db)?, clock, days);
+    let held = widening(&store.db)?;
+    if let Some(refused) = over_cap(held, clock) {
+        return Ok(
+            json!({"dry":true,"days":days,"setting":self::days(&store.db)?,"refused":refused}),
+        );
+    }
+    let (cutoff, widened) = cutoff(held, clock, days);
     let considered = consider(&store.db, cutoff)?;
     let mut split: BTreeMap<&str, (Tally, Tally, BTreeMap<String, Tally>)> = BTreeMap::new();
     let (mut total, mut keys) = (Tally::default(), 0);
@@ -746,6 +778,12 @@ pub fn round(store: &mut Store, start: &Start, clock: &Clock) -> Result<Option<V
     }
     record_clock(&transaction, clock)?;
     let held = widening(&transaction)?;
+    if let Some(refused) = over_cap(held, clock) {
+        // Once an hour, by the gate above, until an operator decides.
+        event(&transaction, "retention.refused", "retention", &refused)?;
+        transaction.commit()?;
+        return Ok(Some(json!({"days":days,"refused":refused})));
+    }
     let (cutoff, widened) = cutoff(held, clock, days);
     if held.is_some() && widened == 0.0 {
         transaction.execute("DELETE FROM settings WHERE key='retention_widening'", [])?;
@@ -1772,6 +1810,80 @@ mod tests {
             })
             .unwrap();
         assert_eq!(summary.get("refused"), None, "{summary}");
+    }
+
+    /// An RTC reset decades back, then NTP stepping it forward: both refuse, and the widening is
+    /// past the cap. Every round then refuses and says so, until an operator sets the retention
+    /// again, which clears the widening and is recorded.
+    #[test]
+    fn a_widening_past_the_cap_refuses_until_the_retention_is_set_again() {
+        let mut lab = Lab::new();
+        lab.activity(now());
+        lab.on();
+        let t0 = now();
+        assert!(lab.round(t0).unwrap().get("refused").is_none());
+        let attempt = lab.passed("a", "build", OLD);
+        let reset = t0 - 25.0 * 365.0 * DAY;
+        lab.start = Start::at(
+            lab.db(),
+            Clock {
+                wall: reset,
+                boottime: 10.0,
+                boot: "reset".into(),
+            },
+        )
+        .unwrap();
+        let clock = |wall: f64, boottime: f64| Clock {
+            wall,
+            boottime,
+            boot: "reset".into(),
+        };
+        assert!(lab.round_on(&clock(reset + 5.0, 15.0)).unwrap()["refused"].is_object());
+        assert!(lab.round_on(&clock(t0 + 600.0, 600.0)).unwrap()["refused"].is_object());
+        let held = widening(lab.db()).unwrap().unwrap().seconds;
+        assert!(held > WIDENING_CAP_SECONDS, "{held}");
+        // The clock agrees with boottime from here on, and stays refused, an hour apart.
+        let mut at = 600.0 + INTERVAL;
+        for _ in 0..3 {
+            let refused = lab.round_on(&clock(t0 + at, at)).unwrap();
+            assert_eq!(
+                refused["refused"]["cap_seconds"], WIDENING_CAP_SECONDS,
+                "{refused}"
+            );
+            assert_eq!(
+                lab.round_on(&clock(t0 + at + 60.0, at + 60.0)),
+                None,
+                "hourly"
+            );
+            at += INTERVAL;
+        }
+        let dry = dry_run(&lab.store, &lab.start, 30, &clock(t0 + at, at)).unwrap();
+        assert_eq!(dry["refused"]["cap_seconds"], WIDENING_CAP_SECONDS, "{dry}");
+        assert!(lab.present(&attempt) && !lab.deleted(&attempt));
+        // Turning it off keeps the widening; setting it again, to the same days, clears it.
+        set_with_minimum(&mut lab.store, 0, MIN_DAYS).unwrap();
+        assert!(widening(lab.db()).unwrap().is_some());
+        set_with_minimum(&mut lab.store, 30, MIN_DAYS).unwrap();
+        let set = set_with_minimum(&mut lab.store, 30, MIN_DAYS);
+        assert_eq!(
+            set.unwrap(),
+            json!({"days":30,"previous":30}),
+            "nothing left to clear"
+        );
+        lab.db()
+            .execute(
+                "INSERT INTO settings VALUES ('retention_widening',?)",
+                [json!({"seconds":held,"since":t0}).to_string()],
+            )
+            .unwrap();
+        let set = set_with_minimum(&mut lab.store, 30, MIN_DAYS).unwrap();
+        assert_eq!(set["cleared_widening_seconds"], held, "{set}");
+        let events = lab.events("executor.retention");
+        assert_eq!(events.last().unwrap()["detail"], set);
+        assert!(widening(lab.db()).unwrap().is_none());
+        let summary = lab.round_on(&clock(t0 + at, at)).unwrap();
+        assert_eq!(summary.get("refused"), None, "{summary}");
+        assert!(lab.deleted(&attempt) && !lab.present(&attempt));
     }
 
     /// A last run later than now is a clock fault, not the hourly gate: refused and logged, and
