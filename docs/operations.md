@@ -766,6 +766,33 @@ leases. So a scheduler-only release restarts `worker`, `executor` and `serve` wi
 running attempts, as long as each coordinator is back within its executor's lease. Under the
 default `KillMode=control-group`, stopping the unit would kill every attempt.
 
+### Rolling back v30
+
+v30 changes no existing table's shape: it adds tables (`passed_key_uses`, `retired_keys`,
+`retention_deleted`, `retention_retire`) and settings, which v29 ignores, and `passed_keys` keeps
+its shape. So a v29 binary opens a store v30 ran, with these differences:
+
+1. **Clear retention first**, while still on v30: `patchweft --state DIR retention --days 0`.
+   v29 never deletes, but a setting left behind would start deleting again on the next upgrade
+   without anyone deciding it.
+2. **Drain**, as for an upgrade: finish or drain every active attempt, so no v30 runner is left
+   running under a v29 coordinator.
+3. **Profiles.** A v30 profile's `engine` is the runner's sha256, a v29 one's is `patchweft`'s own,
+   so v29 refuses v30 profiles and their queued actions as drifted. v29's own profile, still
+   registered from before the upgrade, is the one to use: grant it again where v30's took its
+   place. A profile registered under v30 with `"uses_containers": true` does not even parse in v29
+   (`deny_unknown_fields`): cancel or resubmit its queued work before rolling back.
+4. **Retired keys run cold.** Keys retention retired are gone from `passed_keys`, so under v29 an
+   identical request runs again instead of reusing.
+5. **No deleted check.** v29 does not know what retention deleted. Once a round has run, do not
+   `--retain-from` a candidate older than the retention, and do not `retry` a job whose
+   dependencies' outputs were deleted: v29 would hand out artifacts that are gone. Submit the
+   revision again instead. `logs` of a deleted attempt fails to read the file instead of saying
+   it was deleted.
+
+The cgroups drop-in can stay: a v29 coordinator starts in `<unit>/coordinator` and its
+supervisors run there with it, unmeasured.
+
 ### Cutover of the lent reserve (lumenloop-ng#4204)
 
 The change adds an optional `lent` key to attempt bodies, read as false where it is missing, and
