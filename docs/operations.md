@@ -639,7 +639,7 @@ these (the `kept` reasons):
 - `reused_key`: the passing attempt behind a passed key used within N days. Every request that
   resolves to a key records a use: created, reused, shared or retained. Keys from before v30
   count as used when they were created, or at their latest recorded reuse when that is later, and a
-key a v29 binary reused after a rollback counts as used at that reuse once v30 runs again. A key
+  key a v29 binary reused after a rollback counts as used at that reuse once v30 runs again. A key
   unused for N days retires with its attempt: it is never reused again, so an identical request
   runs cold, but receipts that reused it still read it.
 - `live_dependency`: an artifact source of a queued, running or stopping action. A `local` claim
@@ -735,6 +735,11 @@ an in-place rewrite of the file can change what runs. Its argv[0] is still the r
 runner replaced since the start is refused like drifted tools: the attempt ends
 `runtime-mismatch`, not started, and the profile is refused on that executor. The runner checks
 itself again before the job, hashing the content of `/proc/self/exe`.
+
+The memfd is made with `MFD_EXEC`, so a host with `vm.memfd_noexec=1` still executes it; a kernel
+before 6.3 refuses that flag with EINVAL, and the memfd is made again without it (memfds are
+always executable there). Under `vm.memfd_noexec=2` no memfd may be executed and every launch
+fails, so leave it at 0 or 1 on executors.
 
 A runner checks a claim's control `version` before anything else in it, so one written by a
 newer coordinator fails as `unsupported claim version N`. A supervisor that ends without a result

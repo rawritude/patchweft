@@ -15,7 +15,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use patchweft_control::{file_hash, reader_hash};
 use std::{
-    ffi::{CString, OsStr},
+    ffi::{CStr, CString, OsStr},
     fs::{self, File},
     io,
     os::{
@@ -157,17 +157,43 @@ impl Runner {
     }
 }
 
+/// `memfd_create(2)`, or a test's stand-in for it.
+type CreateMemfd = fn(&CStr, libc::c_uint) -> io::Result<RawFd>;
+
+fn create_memfd(name: &CStr, flags: libc::c_uint) -> io::Result<RawFd> {
+    // SAFETY: a valid C string.
+    let fd = unsafe { libc::memfd_create(name.as_ptr(), flags) };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(fd)
+    }
+}
+
+/// A new memfd that may be executed, sealable and close-on-exec. `MFD_EXEC` asks for execution
+/// explicitly, which a host with `vm.memfd_noexec=1` needs: there a memfd made without it is
+/// sealed non-executable and `fexecve` fails with EACCES. Kernels before 6.3 know no `MFD_EXEC`
+/// and refuse it with EINVAL; their memfds are always executable, so on EINVAL alone it is made
+/// again without it. (`vm.memfd_noexec=2` refuses `MFD_EXEC` with EACCES: no runner can launch.)
+fn executable_memfd(name: &CStr, create: CreateMemfd) -> io::Result<RawFd> {
+    let flags = libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING;
+    match create(name, flags | libc::MFD_EXEC) {
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => create(name, flags),
+        made => made,
+    }
+}
+
 /// `source`'s bytes in a new memfd, sealed against any write, growth or shrinking (and against
 /// new seals), read-only and positioned at its start. Close-on-exec, which `fexecve` of an ELF
 /// file allows.
 fn sealed_copy(source: &mut File) -> io::Result<File> {
+    sealed_copy_with(source, create_memfd)
+}
+
+fn sealed_copy_with(source: &mut File, create: CreateMemfd) -> io::Result<File> {
     let name = CString::new(BINARY).expect("static name");
-    // SAFETY: a valid C string; the descriptor returned is owned by the File made from it.
-    let fd =
-        unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    let fd = executable_memfd(&name, create)?;
+    // SAFETY: a new descriptor, owned by the File made from it.
     let mut memfd = unsafe { File::from_raw_fd(fd) };
     io::copy(source, &mut memfd)?;
     let seals = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
@@ -327,6 +353,89 @@ mod tests {
         let log = File::create(temp.path().join("log")).unwrap();
         let mut child = opened.spawn(&[], log).unwrap();
         assert!(child.wait().unwrap().success(), "true ran, not false");
+    }
+
+    thread_local! {
+        static FLAGS: std::cell::RefCell<Vec<libc::c_uint>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// A kernel before 6.3: `MFD_EXEC` is an unknown flag.
+    fn before_6_3(name: &CStr, flags: libc::c_uint) -> io::Result<RawFd> {
+        FLAGS.with(|seen| seen.borrow_mut().push(flags));
+        if flags & libc::MFD_EXEC != 0 {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        create_memfd(name, flags)
+    }
+
+    fn refusing(_: &CStr, flags: libc::c_uint) -> io::Result<RawFd> {
+        FLAGS.with(|seen| seen.borrow_mut().push(flags));
+        Err(io::Error::from_raw_os_error(libc::EACCES))
+    }
+
+    #[test]
+    fn the_memfd_asks_for_exec_and_without_it_only_where_the_kernel_knows_no_such_flag() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(BINARY);
+        program("/usr/bin/true", &path);
+        let base = libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING;
+        // EINVAL: asked again without MFD_EXEC, and what it makes runs.
+        let copy = sealed_copy_with(&mut File::open(&path).unwrap(), before_6_3).unwrap();
+        assert_eq!(
+            FLAGS.with(|seen| seen.take()),
+            [base | libc::MFD_EXEC, base]
+        );
+        assert_eq!(reader_hash(&copy).unwrap(), file_hash(&path).unwrap());
+        let opened = Opened {
+            file: copy,
+            path: path.clone(),
+        };
+        let log = File::create(temp.path().join("log")).unwrap();
+        assert!(opened.spawn(&[], log).unwrap().wait().unwrap().success());
+        // Any other refusal is the error: never retried without the flag.
+        let error = sealed_copy_with(&mut File::open(&path).unwrap(), refusing).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+        assert_eq!(FLAGS.with(|seen| seen.take()), [base | libc::MFD_EXEC]);
+    }
+
+    /// Each materialization launches from its own thread: a fork while another thread holds its
+    /// writable memfd copies that descriptor into the child, which must never make an exec fail
+    /// (ETXTBSY).
+    #[test]
+    fn concurrent_launches_from_many_threads_all_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(BINARY);
+        program("/usr/bin/true", &path);
+        let runner = Runner::at(&path).unwrap();
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let runner = runner.clone();
+                std::thread::spawn(move || {
+                    let mut failures = Vec::new();
+                    for _ in 0..25 {
+                        let log = tempfile::tempfile().unwrap();
+                        match runner
+                            .open(&runner.sha256)
+                            .and_then(|opened| opened.spawn(&[], log))
+                        {
+                            Ok(mut child) => assert!(child.wait().unwrap().success()),
+                            Err(error) => failures.push(format!("{error:#}")),
+                        }
+                    }
+                    failures
+                })
+            })
+            .collect();
+        let failures: Vec<String> = threads
+            .into_iter()
+            .flat_map(|thread| thread.join().unwrap())
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "{} failed: {:?}",
+            failures.len(),
+            failures.first()
+        );
     }
 
     #[test]
