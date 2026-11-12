@@ -1317,13 +1317,12 @@ fn upload_path(store: &Store, principal: &str, sha256: &str) -> PathBuf {
 }
 pub const MAX_BUNDLE: usize = 1024 * 1024 * 1024;
 pub const MAX_RETAINED_UPLOADS: u64 = 4 * MAX_BUNDLE as u64;
-/// Per artifact or log file, so a result recorded on one host is deliverable from every host.
-pub const MAX_ARTIFACT_BYTES: u64 = MAX_BUNDLE as u64;
-/// Per attempt: artifacts and logs together.
-pub const MAX_ATTEMPT_OUTPUT_BYTES: u64 = MAX_RETAINED_UPLOADS;
-/// A result's artifact manifest, serialized; every host enforces it at capture, so a result that
-/// passes locally is deliverable from a remote executor too (review P2-3).
-pub const MAX_MANIFEST_BYTES: u64 = 12 * 1024 * 1024;
+/// The output limits the runner enforces at capture, shared so the API accepts what it captured.
+pub use patchweft_control::{MAX_ARTIFACT_BYTES, MAX_ATTEMPT_OUTPUT_BYTES, MAX_MANIFEST_BYTES};
+// Per artifact or log file a bundle's size; per attempt what retained uploads may hold.
+const _: () = assert!(
+    MAX_ARTIFACT_BYTES == MAX_BUNDLE as u64 && MAX_ATTEMPT_OUTPUT_BYTES == MAX_RETAINED_UPLOADS
+);
 /// The one limit on JSON either side reads (gate P2-1): `executor/complete` requests, which carry
 /// a manifest twice, and responses such as claims, which inline their dependencies' manifests.
 pub const MAX_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;

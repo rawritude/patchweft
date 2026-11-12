@@ -1,5 +1,7 @@
 //! Remote executors end to end: the API process, a remote coordinator (`mindy`) with its own work
 //! directory, and the local worker, all against one store on this host.
+#[path = "support/runner.rs"]
+mod support;
 use patchweft::{
     client::{Refused, Remote},
     model::{ClaimRequest, ClaimResponse, CompleteRequest, CompleteResponse, Outcome},
@@ -14,8 +16,8 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use support::patchweft;
 
-const AW: &str = env!("CARGO_BIN_EXE_patchweft");
 const BUILD: &str = "mkdir dist; echo built > dist/out";
 
 fn parsed(output: Output) -> Value {
@@ -254,7 +256,7 @@ impl Lab {
     }
 
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(AW);
+        let mut command = patchweft();
         command.arg("--state").arg(&self.state).args(args);
         command
     }
@@ -404,7 +406,7 @@ impl Lab {
     /// The remote client CLI with mindy's credential.
     fn remote(&self, args: &[&str]) -> Value {
         parsed(
-            Command::new(AW)
+            patchweft()
                 .args([
                     "remote",
                     "--endpoint",
@@ -428,7 +430,7 @@ impl Lab {
 
     /// mindy's coordinator as `executor` runs it on a host, loopback check included.
     fn checked_executor(&self, work: &Path, args: &[&str]) -> Command {
-        let mut command = Command::new(AW);
+        let mut command = patchweft();
         command
             .args([
                 "executor",

@@ -1,7 +1,8 @@
 use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};
 use patchweft::{
-    api, authority, client, engine, executor, http, mcp, model, source, store::Store, worker,
+    api, authority, client, engine, executor, http, mcp, model, runner, source, store::Store,
+    worker,
 };
 use serde_json::{Value, json};
 use std::{
@@ -23,6 +24,10 @@ const GIB: u64 = 1024 * 1024 * 1024;
 struct Cli {
     #[arg(long, global = true, default_value = ".state")]
     state: PathBuf,
+    /// The runner (`patchweft-runner`) to register profiles for and launch, instead of the one
+    /// installed beside this binary as `runner/<sha256>/patchweft-runner`.
+    #[arg(long, global = true)]
+    runner: Option<PathBuf>,
     #[command(subcommand)]
     command: Operation,
 }
@@ -312,9 +317,6 @@ enum Operation {
         #[arg(value_parser=["projects","revisions","workspaces","profiles"])]
         kind: String,
     },
-    /// Supervise one claimed attempt from its control files; never opens the store.
-    #[command(name = "_supervise", hide = true)]
-    Supervise { root: PathBuf, attempt: String },
 }
 
 #[derive(Args)]
@@ -423,6 +425,9 @@ fn remote(connection: &Connection, operation: &RemoteOperation) -> Result<Value>
 }
 
 fn run(cli: Cli) -> Result<Value> {
+    if let Some(path) = &cli.runner {
+        runner::set_override(path)?;
+    }
     match &cli.command {
         Operation::Serve {
             listen,
@@ -444,7 +449,6 @@ fn run(cli: Cli) -> Result<Value> {
             connection,
             operation,
         } => return remote(connection, operation),
-        Operation::Supervise { root, attempt } => return worker::supervise(root, attempt),
         Operation::Executor {
             connection,
             work,
@@ -486,8 +490,7 @@ fn run(cli: Cli) -> Result<Value> {
         Operation::Serve { .. }
         | Operation::Remote { .. }
         | Operation::Mcp { .. }
-        | Operation::Executor { .. }
-        | Operation::Supervise { .. } => unreachable!(),
+        | Operation::Executor { .. } => unreachable!(),
         Operation::Grant {
             policy,
             credential_file,

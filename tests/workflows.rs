@@ -1,3 +1,5 @@
+#[path = "support/runner.rs"]
+mod support;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -7,8 +9,8 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use support::patchweft;
 
-const AW: &str = env!("CARGO_BIN_EXE_patchweft");
 /// Deadline for event-driven waits. Generous because a loaded host stalls workers for seconds;
 /// waits poll for the event, so a long deadline costs nothing when the host is idle.
 const PATIENCE: Duration = Duration::from_secs(60);
@@ -74,7 +76,7 @@ impl Lab {
         git(&repo, &["commit", "--quiet", "-m", "fixture"]);
         let state = temp.path().join("state");
         parsed(
-            Command::new(AW)
+            patchweft()
                 .arg("--state")
                 .arg(&state)
                 .args(["init", "--slots", "2", "--memory-mb", "4096"])
@@ -82,7 +84,7 @@ impl Lab {
                 .unwrap(),
         );
         let base = parsed(
-            Command::new(AW)
+            patchweft()
                 .arg("--state")
                 .arg(&state)
                 .args(["import", "--name", "fixture", "--repo"])
@@ -102,7 +104,7 @@ impl Lab {
         }
     }
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(AW);
+        let mut command = patchweft();
         command.arg("--state").arg(&self.state).args(args);
         // These jobs run no containers and this lab has no rootless daemon to inspect.
         if args.first() == Some(&"worker") {
@@ -2684,4 +2686,227 @@ fn absent_or_invalid_declarations_behave_like_inflight() {
         assert!(!environment.contains("PATCHWEFT_INPUTS"));
     }
     assert_eq!(lab.count("action.reused"), 0);
+}
+
+fn sha256(path: &Path) -> String {
+    format!("{:x}", Sha256::digest(fs::read(path).unwrap()))
+}
+
+/// A release directory laid out as installed: `patchweft`, with `marker` appended to its bytes
+/// (a scheduler-only change: other main bytes, same behavior), and `runner` copied to
+/// `runner/<sha256>/patchweft-runner`. Returns the release's `patchweft`.
+fn release(lab: &Lab, name: &str, marker: &[u8], runner: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = lab.state.parent().unwrap().join("releases").join(name);
+    let installed = directory.join("runner").join(sha256(runner));
+    fs::create_dir_all(&installed).unwrap();
+    fs::copy(runner, installed.join("patchweft-runner")).unwrap();
+    let mut bytes = fs::read(env!("CARGO_BIN_EXE_patchweft")).unwrap();
+    bytes.extend_from_slice(marker);
+    let binary = directory.join("patchweft");
+    fs::write(&binary, bytes).unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+    binary
+}
+
+/// A runner release: the runner under test with other bytes.
+fn other_runner(lab: &Lab) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = lab.state.parent().unwrap().join("other-runner");
+    let mut bytes = fs::read(support::runner()).unwrap();
+    bytes.extend_from_slice(b"runner release");
+    fs::write(&path, bytes).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+impl Lab {
+    /// `binary ARGS` as an installed release runs it: no `--runner`.
+    fn installed(&self, binary: &Path, args: &[&str]) -> Command {
+        let mut command = Command::new(binary);
+        command.arg("--state").arg(&self.state).args(args);
+        if args.first() == Some(&"worker") {
+            command.arg("--no-loopback-check");
+        }
+        command
+    }
+    fn installed_call(&self, binary: &Path, args: &[&str]) -> Value {
+        parsed(self.installed(binary, args).output().unwrap())
+    }
+    fn fixture_profile(&self, jobs: Value) -> PathBuf {
+        let path = self.state.join("release-profile.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({"version":1,"name":"release","certifying":true,
+                "tools":{"sh":"/usr/bin/sh"},"jobs":jobs}))
+            .unwrap(),
+        )
+        .unwrap();
+        path
+    }
+}
+
+#[test]
+fn the_engine_is_the_runners_hash_so_a_scheduler_only_release_keeps_profiles_and_recipes() {
+    let lab = Lab::new();
+    let runner = support::runner();
+    let first = release(&lab, "first", b"", runner);
+    let second = release(&lab, "second", b"scheduler-only change", runner);
+    assert_ne!(sha256(&first), sha256(&second));
+    let runner_release = release(&lab, "third", b"", &other_runner(&lab));
+    let path = lab.fixture_profile(json!([
+        job(
+            "build",
+            "mkdir dist; echo built > dist/out",
+            json!({"artifacts":["dist"]})
+        ),
+        job("test", "true", json!({"dependencies":["build"]}))
+    ]));
+    let path = path.to_str().unwrap();
+    let registered = |binary: &Path| -> patchweft::model::RegisteredProfile {
+        serde_json::from_value(lab.installed_call(binary, &["register", path])).unwrap()
+    };
+    let (a, b, c) = (
+        registered(&first),
+        registered(&second),
+        registered(&runner_release),
+    );
+    // The engine is the runner's hash, never the main binary's.
+    assert_eq!(a.engine, sha256(runner));
+    assert_ne!(a.engine, sha256(&first));
+    // Other main bytes over the same runner: the same profile and the same recipes.
+    assert_eq!((&a.id, &a.engine), (&b.id, &b.engine));
+    let recipes = |p| patchweft::engine::recipes(p).unwrap();
+    assert_eq!(recipes(&a), recipes(&b));
+    // `--runner` naming the same bytes registers the same profile.
+    assert_eq!(lab.call(&["register", path])["id"], json!(a.id));
+    // A runner release changes the profile and every recipe.
+    assert_eq!(c.engine, sha256(&other_runner(&lab)));
+    assert_ne!(c.id, a.id);
+    let (old, new) = (recipes(&a), recipes(&c));
+    assert!(old.keys().all(|job| old[job] != new[job]));
+    // The main binary has no way left to run a job itself.
+    lab.refuses(
+        &["_supervise", lab.state.to_str().unwrap(), "attempt"],
+        "unrecognized subcommand",
+    );
+}
+
+#[test]
+fn a_scheduler_only_release_restarts_the_coordinator_without_ending_its_attempt() {
+    // Units run KillMode=process: stopping the coordinator leaves its supervisors running, and
+    // the next coordinator, a different main binary over the same runner, adopts them.
+    let lab = Lab::new();
+    let first = release(&lab, "first", b"", support::runner());
+    let second = release(&lab, "second", b"scheduler-only change", support::runner());
+    let path = lab.fixture_profile(json!([job(
+        "survivor",
+        "touch \"$PATCHWEFT_STATE/started\"; \
+         while ! test -f \"$PATCHWEFT_STATE/release\"; do sleep 0.05; done; \
+         mkdir dist; echo result > dist/value",
+        json!({"artifacts":["dist"]})
+    )]));
+    let profile = lab.installed_call(&first, &["register", path.to_str().unwrap()])["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let candidate = lab.submit(&lab.base, &profile, "agent");
+    let mut coordinator = lab
+        .installed(&first, &["worker"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_until("the job", || lab.state.join("started").exists());
+    let attempt = lab.events_of("attempt.started")[0]["subject"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let control = lab.state.join("attempts").join(&attempt).join("control");
+    let supervisor: Value =
+        serde_json::from_slice(&fs::read(control.join("supervisor.json")).unwrap()).unwrap();
+    let pid = supervisor["pid"].as_u64().unwrap();
+    // The supervisor is the installed runner, not the main binary.
+    let runner = first
+        .parent()
+        .unwrap()
+        .join("runner")
+        .join(sha256(support::runner()))
+        .join("patchweft-runner");
+    assert_eq!(
+        fs::read_link(format!("/proc/{pid}/exe")).unwrap(),
+        runner.canonicalize().unwrap()
+    );
+    coordinator.kill().unwrap();
+    coordinator.wait().unwrap();
+    assert!(
+        Path::new(&format!("/proc/{pid}")).exists(),
+        "the job outlives its coordinator"
+    );
+    let next = lab
+        .installed(&second, &["worker", "--drain"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fs::write(lab.state.join("release"), "go").unwrap();
+    let drained = parsed(next.wait_with_output().unwrap());
+    assert_eq!(drained["launched"], 0, "adopted, not launched again");
+    assert_eq!(lab.state(&candidate), "passed");
+    assert_eq!(lab.count("attempt.started"), 1);
+    assert_eq!(lab.row("attempts", &attempt), ("passed".into(), true));
+}
+
+#[test]
+fn a_runner_replaced_after_the_coordinator_started_is_refused_at_launch() {
+    let lab = Lab::new();
+    let installed = release(&lab, "first", b"", support::runner());
+    let path = lab.fixture_profile(json!([
+        job(
+            "first",
+            "touch \"$PATCHWEFT_STATE/first-started\"; \
+             while ! test -f \"$PATCHWEFT_STATE/release\"; do sleep 0.05; done",
+            json!({})
+        ),
+        job("second", "true", json!({"dependencies":["first"]}))
+    ]));
+    let profile = lab.installed_call(&installed, &["register", path.to_str().unwrap()])["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let candidate = lab.submit(&lab.base, &profile, "agent");
+    let coordinator = lab
+        .installed(&installed, &["worker", "--drain"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_until("the first job", || lab.state.join("first-started").exists());
+    // Other bytes renamed over the hash-named path the coordinator located at start.
+    let target = installed
+        .parent()
+        .unwrap()
+        .join("runner")
+        .join(sha256(support::runner()))
+        .join("patchweft-runner");
+    let staged = target.with_file_name("staged");
+    fs::copy(other_runner(&lab), &staged).unwrap();
+    fs::rename(&staged, &target).unwrap();
+    fs::write(lab.state.join("release"), "go").unwrap();
+    parsed(coordinator.wait_with_output().unwrap());
+    let first = candidate["required"]["first"].as_str().unwrap();
+    let second = candidate["required"]["second"].as_str().unwrap();
+    assert_eq!(lab.row("actions", first).0, "passed");
+    assert_eq!(lab.row("actions", second).0, "queued");
+    let launch = lab.events_of("attempt.launch_failed");
+    assert_eq!(launch.len(), 1);
+    assert_eq!(launch[0]["detail"]["reason"], "runtime-mismatch");
+    let attempt = launch[0]["subject"].as_str().unwrap();
+    assert_eq!(lab.row("attempts", attempt), ("interrupted".into(), true));
+    assert_eq!(lab.count("attempt.started"), 1);
+    let error = refused(&lab)[&profile].as_str().unwrap().to_owned();
+    assert!(
+        error.contains("not the profile's engine") && error.contains("refusing to launch"),
+        "{error}"
+    );
 }

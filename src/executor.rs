@@ -1,13 +1,14 @@
 //! The coordinator of one executor. `worker` runs it for the local executor; a remote executor
 //! runs the same code over another transport. It claims work, keeps the leases of its attempts,
-//! launches `_supervise`, relays stops in both directions and publishes results. Its supervisors
-//! reach it only through files in their attempt's `control/` directory.
+//! launches the runner's `_supervise`, relays stops in both directions and publishes results. Its
+//! supervisors reach it only through files in their attempt's `control/` directory.
 use crate::{
     api::{self, MAX_HAVES, MAX_RETAINED_UPLOADS, TRANSFER_TIMEOUT_SECONDS},
     authority::{self, AuthorityError, LOCAL, MAX_LEASES, Outputs, REFUSE_ALL, Scope},
     client::{Refused, Remote},
     engine, file_hash,
     model::*,
+    runner::{self, Runner},
     source,
     store::Store,
     unique,
@@ -22,12 +23,9 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, ErrorKind},
     net::{IpAddr, Ipv6Addr, SocketAddr},
-    os::unix::{
-        fs::{MetadataExt, PermissionsExt},
-        process::CommandExt,
-    },
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Component, Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::Child,
     sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -479,8 +477,10 @@ pub struct Coordinator<T> {
     transport: T,
     executor: String,
     options: Options,
-    /// sha256 of this binary, the runner every profile run here must have been registered with.
+    /// sha256 of the runner, which every profile run here must have been registered with.
     engine: String,
+    /// The runner this coordinator launches; none in tests that never launch.
+    runner: Option<Runner>,
     host: Option<String>,
     guards: Guards,
     state: Mutex<State>,
@@ -528,6 +528,7 @@ impl<T: Transport> Coordinator<T> {
             executor,
             options,
             engine,
+            runner: None,
             host: worker::host(),
             guards: Guards::default(),
             state: Mutex::new(State {
@@ -556,6 +557,13 @@ impl<T: Transport> Coordinator<T> {
 
     fn guarded(mut self, guards: Guards) -> Self {
         self.guards = guards;
+        self
+    }
+
+    /// Launches `runner`, whose hash is this coordinator's engine.
+    fn launching(mut self, runner: Runner) -> Self {
+        self.engine = runner.sha256.clone();
+        self.runner = Some(runner);
         self
     }
 
@@ -1071,8 +1079,20 @@ impl<T: Transport> Coordinator<T> {
                 error: None,
             });
         }
+        // The bytes to execute, hashed from the open file that is executed: a runner replaced
+        // since this coordinator started is refused like drifted tools.
+        let runner = self
+            .runner
+            .as_ref()
+            .context("this coordinator has no runner")
+            .and_then(|runner| runner.open(&claim.profile.engine))
+            .map_err(|error| {
+                let error = format!("{error:#}");
+                self.refuse(&mut self.lock(), &claim.profile.id, error.clone());
+                not_started("runtime-mismatch", error)
+            })?;
         let child = self
-            .spawn(attempt)
+            .spawn(attempt, runner)
             .map_err(|error| give_up("launch-failed", format!("{error:#}")))?;
         let pid = child.id();
         // A supervisor that already exited is reported lost by the next poll.
@@ -1100,20 +1120,18 @@ impl<T: Transport> Coordinator<T> {
         Ok(())
     }
 
-    fn spawn(&self, attempt: &str) -> Result<Child> {
+    /// `patchweft-runner _supervise ROOT ATTEMPT`, from the runner file `launch` checked.
+    fn spawn(&self, attempt: &str, runner: runner::Opened) -> Result<Child> {
         let directory = self.transport.root().join("attempts").join(attempt);
         let log = File::create(directory.join("supervisor.log"))?;
-        Ok(Command::new(std::env::current_exe()?)
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .arg("_supervise")
-            .arg(self.transport.root())
-            .arg(attempt)
-            .stdin(Stdio::null())
-            .stdout(log.try_clone()?)
-            .stderr(log)
-            .process_group(0)
-            .spawn()?)
+        runner.spawn(
+            &[
+                "_supervise".as_ref(),
+                self.transport.root().as_os_str(),
+                attempt.as_ref(),
+            ],
+            log,
+        )
     }
 
     /// Transient failures are retried with backoff; any other ends the attempt.
@@ -1654,7 +1672,8 @@ pub fn run<T: Transport + 'static>(
     guards: Guards,
 ) -> Result<Value> {
     fs::create_dir_all(transport.control().join("ledger"))?;
-    let engine = file_hash(&std::env::current_exe()?)?;
+    let runner = Runner::locate()?;
+    let engine = runner.sha256.clone();
     // MUST-FIX 8: nothing registers while job containers could reach an unlisted listener.
     if let Some(reason) =
         guards.loopback_refusal(&|| live_supervisors(transport.root(), transport.control()))
@@ -1695,7 +1714,8 @@ pub fn run<T: Transport + 'static>(
             options,
             engine,
         )
-        .guarded(guards),
+        .guarded(guards)
+        .launching(runner),
     );
     coordinator.verify(&hello.profiles);
     for attempt in coordinator.reconcile(false)? {
@@ -2722,6 +2742,7 @@ fn socket_address(text: &str) -> Option<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::{Command, Stdio};
 
     #[derive(Debug, Clone)]
     enum Call {

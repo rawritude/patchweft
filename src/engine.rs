@@ -1,13 +1,17 @@
 use crate::{
     authority,
     declared::{self, Declared},
-    file_hash, identity,
+    identity,
     model::*,
-    now, source,
+    now, runner, source,
     store::{Store, event, passed_key_of, prepare_passed_keys, record},
     unique,
 };
+// Job identity is shared with the runner, which recomputes a job's recipe before it runs it.
 use anyhow::{Context, Result, ensure};
+pub use patchweft_control::recipe::{
+    job, platform, recipes_for, tool_identity, verify_runtime_for,
+};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::{
@@ -15,14 +19,6 @@ use std::{
     fs,
     path::Path,
 };
-
-pub fn tool_identity(profile: &Profile) -> Result<BTreeMap<String, String>> {
-    profile
-        .tools
-        .iter()
-        .map(|(name, path)| Ok((name.clone(), file_hash(path)?)))
-        .collect()
-}
 
 pub fn validate_profile(profile: &Profile, capacity: (u32, u32)) -> Result<()> {
     ensure!(
@@ -149,7 +145,8 @@ pub fn register(store: &mut Store, path: &Path) -> Result<RegisteredProfile> {
     }
     validate_profile(&definition, store.capacity()?)?;
     let tools = tool_identity(&definition)?;
-    let engine = file_hash(&std::env::current_exe()?)?;
+    // The runner's bytes, not this binary's: a scheduler-only release keeps every profile id.
+    let engine = runner::Runner::locate()?.sha256;
     let platform = platform();
     let id = profile_id(&definition, &tools, &engine, &platform)?;
     let profile = RegisteredProfile {
@@ -174,10 +171,6 @@ pub fn register(store: &mut Store, path: &Path) -> Result<RegisteredProfile> {
     Ok(profile)
 }
 
-pub fn platform() -> String {
-    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
-}
-
 pub fn profile_id(
     definition: &Profile,
     tools: &BTreeMap<String, String>,
@@ -187,25 +180,9 @@ pub fn profile_id(
     identity(&json!({"definition":definition,"tools":tools,"engine":engine,"platform":platform}))
 }
 
+/// Checks the profile against this host's tools, platform and installed runner.
 pub fn verify_runtime(profile: &RegisteredProfile) -> Result<()> {
-    verify_runtime_for(profile, &file_hash(&std::env::current_exe()?)?)
-}
-
-/// `engine` is the sha256 of the runner binary that will execute the profile's jobs.
-pub fn verify_runtime_for(profile: &RegisteredProfile, engine: &str) -> Result<()> {
-    ensure!(
-        tool_identity(&profile.definition)? == profile.tools,
-        "declared tool bytes changed; register a new profile"
-    );
-    ensure!(
-        engine == profile.engine,
-        "runner binary changed; register a new profile"
-    );
-    ensure!(
-        profile.platform == platform(),
-        "platform changed; register a new profile"
-    );
-    Ok(())
+    verify_runtime_for(profile, &runner::Runner::locate()?.sha256)
 }
 
 pub fn class(profile: &RegisteredProfile) -> &'static str {
@@ -218,104 +195,6 @@ pub fn class(profile: &RegisteredProfile) -> &'static str {
 
 pub fn recipes(profile: &RegisteredProfile) -> Result<BTreeMap<String, String>> {
     recipes_for(profile, JOB_RECIPE)
-}
-
-/// Promote and the worker recompute recorded recipes, so the builder for a tag never changes.
-pub fn recipes_for(profile: &RegisteredProfile, version: &str) -> Result<BTreeMap<String, String>> {
-    ensure!(
-        version == JOB_RECIPE,
-        "unknown job recipe version: {version}"
-    );
-    // Exhaustive destructuring: a new field fails to compile here until it is classified as
-    // identity or as metadata that never reaches a job's execution.
-    let RegisteredProfile {
-        id: _,
-        definition,
-        tools: tool_hashes,
-        engine,
-        platform,
-    } = profile;
-    let Profile {
-        version: _,
-        name: _,
-        certifying: _,
-        tools: tool_paths,
-        environment: profile_environment,
-        jobs,
-        inputs_file,
-    } = definition;
-    // Every tool directory is on every job's PATH, so every tool is part of every recipe.
-    let tools = tool_paths
-        .iter()
-        .map(|(name, path)| {
-            let sha256 = tool_hashes.get(name).context("tool identity missing")?;
-            Ok((name.clone(), json!({"path":path,"sha256":sha256})))
-        })
-        .collect::<Result<BTreeMap<_, _>>>()?;
-    let mut memo: BTreeMap<String, String> = BTreeMap::new();
-    while memo.len() < jobs.len() {
-        let before = memo.len();
-        for job in jobs {
-            let Job {
-                name,
-                command,
-                dependencies,
-                slots,
-                // Reservations: scheduling only, never seen by the job.
-                memory_mb: _,
-                // In the action key, not the recipe (decision D6).
-                timeout_seconds: _,
-                reuse,
-                inputs,
-                // Why reuse is sound; wording is not identity.
-                audit: _,
-                environment: job_environment,
-                artifacts,
-                cleanup,
-                report,
-                export_slots,
-            } = job;
-            let Report {
-                kind,
-                path,
-                minimum,
-                allow_skips,
-            } = report;
-            if memo.contains_key(name) || !dependencies.iter().all(|d| memo.contains_key(d)) {
-                continue;
-            }
-            let mut environment = profile_environment.clone();
-            environment.extend(job_environment.clone());
-            let dependencies: BTreeMap<_, _> = dependencies
-                .iter()
-                .map(|d| (d.clone(), memo[d].clone()))
-                .collect();
-            let mut recipe = json!({
-                "recipe": JOB_RECIPE,
-                "job": name,
-                "command": command,
-                "cleanup": cleanup,
-                "tools": tools,
-                "environment": environment,
-                "report": {"kind":kind,"path":path,"minimum":minimum,"allow_skips":allow_skips},
-                "artifacts": artifacts,
-                "reuse": reuse,
-                "inputs": inputs,
-                "slots": if *export_slots { Some(*slots) } else { None },
-                "dependencies": dependencies,
-                "engine": engine,
-                "platform": platform,
-            });
-            // Only when set, so every recipe recorded under this tag before it existed still holds.
-            if let Some(file) = inputs_file {
-                recipe["inputs_file"] = json!(file);
-            }
-            let recipe = identity(&recipe)?;
-            memo.insert(name.clone(), recipe);
-        }
-        ensure!(memo.len() != before, "profile contains a dependency cycle");
-    }
-    Ok(memo)
 }
 
 pub fn action_key(
@@ -431,15 +310,6 @@ fn legacy_key(
 ) -> Result<String> {
     identity(&json!({"project":project,"profile":profile,"job":job,
                           "inputs":inputs, "dependencies":dependencies}))
-}
-
-pub fn job<'a>(profile: &'a RegisteredProfile, name: &str) -> Result<&'a Job> {
-    profile
-        .definition
-        .jobs
-        .iter()
-        .find(|j| j.name == name)
-        .context("unknown job")
 }
 
 /// The profile's declarations at the revision, read only when one of its jobs is declared.
@@ -1766,7 +1636,7 @@ mod identity_tests {
                 "tools":{},"jobs":[{"name":"j","command":["x"]}]}))
             .unwrap(),
             tools: BTreeMap::new(),
-            engine: file_hash(&std::env::current_exe().unwrap()).unwrap(),
+            engine: runner::Runner::locate().unwrap().sha256,
             platform: platform(),
         };
         verify_runtime(&profile).unwrap();

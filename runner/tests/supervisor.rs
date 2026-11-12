@@ -2,13 +2,13 @@
 //! and a hand-written `claim.json`, never a `state.sqlite`. The supervisor runs as its own
 //! process, as in production: it adopts and signals every descendant of its process, which
 //! inside the test harness would include other tests' children.
-use patchweft::{
-    engine, file_hash,
+use patchweft_control::{
+    file_hash,
     model::{
         Action, ActionIdentity, CONTROL_VERSION, ClaimFile, DependencyFile, Grant, JOB_RECIPE, Job,
         Outcome, Profile, RegisteredProfile, Reservation, RevisionRef, SupervisorResult,
     },
-    unique,
+    recipe as engine,
 };
 use serde_json::{Value, json};
 use std::{
@@ -22,7 +22,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-const AW: &str = env!("CARGO_BIN_EXE_patchweft");
+const AW: &str = env!("CARGO_BIN_EXE_patchweft-runner");
+
+/// A fresh attempt id.
+fn unique() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::SeqCst)
+    )
+}
 
 fn engine_hash() -> &'static str {
     static HASH: OnceLock<String> = OnceLock::new();
@@ -199,16 +210,14 @@ impl Lab {
         .unwrap();
     }
 
-    /// Spawns `_supervise` as the coordinator does: cleared environment, own process group.
-    /// `--state` names the root, which has no store: a supervisor must never need one.
+    /// Spawns `_supervise` as the coordinator does: cleared environment, own process group. The
+    /// root has no store: a supervisor must never need one.
     fn spawn(&self, claim: &ClaimFile) -> Supervisor {
         let log = fs::File::create(self.directory(claim).join("supervisor.log")).unwrap();
         Supervisor(
             Command::new(AW)
                 .env_clear()
                 .env("PATH", "/usr/bin:/bin")
-                .arg("--state")
-                .arg(&self.root)
                 .arg("_supervise")
                 .arg(&self.root)
                 .arg(&claim.attempt.id)
@@ -632,4 +641,38 @@ fn runtime_mismatch_is_not_started() {
     // Past registration, external cleanup still runs before the result.
     assert!(lab.root.join("cleaned").exists());
     assert!(result.drained);
+}
+
+#[test]
+fn a_claim_it_does_not_understand_fails_closed() {
+    // A coordinator newer than this runner may write fields or a control version it does not
+    // know: the runner must refuse the claim, run nothing and write no result.
+    let lab = Lab::new();
+    let claim = lab.claim("touch \"$PATCHWEFT_STATE/ran\"", None, 60);
+    let mut unknown = serde_json::to_value(&claim).unwrap();
+    unknown["memory_limit"] = json!(1);
+    let mut newer = lab.claim("touch \"$PATCHWEFT_STATE/ran\"", None, 60);
+    newer.version = CONTROL_VERSION + 1;
+    for (claim, body, error) in [
+        (&claim, unknown, "unknown field `memory_limit`"),
+        (
+            &newer,
+            serde_json::to_value(&newer).unwrap(),
+            "unsupported claim version",
+        ),
+    ] {
+        fs::create_dir_all(lab.control(claim)).unwrap();
+        fs::write(
+            lab.control(claim).join("claim.json"),
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap();
+        lab.register(claim);
+        let mut supervisor = lab.spawn(claim);
+        assert!(!supervisor.0.wait().unwrap().success());
+        let log = fs::read_to_string(lab.directory(claim).join("supervisor.log")).unwrap();
+        assert!(log.contains(error), "{log}");
+        assert!(!lab.control(claim).join("result.json").exists());
+    }
+    assert!(!lab.root.join("ran").exists());
 }
