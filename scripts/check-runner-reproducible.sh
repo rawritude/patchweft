@@ -10,6 +10,11 @@ set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd -P)
 root=$(cd "${1:-$here/..}" && pwd -P)
+# The same refusal as build-runner.sh, for the checkout itself and the cargo home, before copying:
+# a config file here would not reach the copies, so both would agree and prove nothing.
+# shellcheck source=scripts/runner-cargo-config.sh
+source "$here/runner-cargo-config.sh"
+refuse_cargo_config "$root/runner"
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/runner-reproducible.XXXXXX")
 trap 'rm -rf "$scratch"' EXIT
 

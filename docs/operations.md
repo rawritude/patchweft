@@ -723,6 +723,12 @@ scripts/build-runner.sh        # prints the runner's sha256
 
 It builds release, offline and locked, with the toolchain `rust-toolchain.toml` pins, and remaps the
 checkout and the cargo home out of its bytes. It carries no version string, commit or build path.
+No cargo config file may reach the build: it refuses, naming the file, when a `.cargo/config.toml`
+or `.cargo/config` is in `runner/` or any directory above it, or a `config.toml` or `config` in the
+cargo home (`$CARGO_HOME`, default `~/.cargo`); move it aside to build. The cargo home itself is
+used, for its registry. It also passes the release profile explicitly (`opt-level`, `debug`, `lto`,
+`codegen-units`, `panic`, `strip`, `incremental`, as `runner/Cargo.toml` and cargo's defaults have
+them). `scripts/test-runner-cargo-config.sh` checks the refusals.
 `scripts/check-runner-reproducible.sh` copies the runner's sources into two different temporary
 directories, builds each with that command and fails unless the two are byte-equal.
 
