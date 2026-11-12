@@ -638,7 +638,8 @@ these (the `kept` reasons):
 
 - `reused_key`: the passing attempt behind a passed key used within N days. Every request that
   resolves to a key records a use: created, reused, shared or retained. Keys from before v30
-  count as used when they were created, or at their latest recorded reuse when that is later. A key
+  count as used when they were created, or at their latest recorded reuse when that is later, and a
+key a v29 binary reused after a rollback counts as used at that reuse once v30 runs again. A key
   unused for N days retires with its attempt: it is never reused again, so an identical request
   runs cold, but receipts that reused it still read it.
 - `live_dependency`: an artifact source of a queued, running or stopping action. A `local` claim

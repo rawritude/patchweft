@@ -49,7 +49,9 @@ pub const RETENTION_CLOCK_SLACK_SECONDS: f64 = 300.0;
 const NEWEST_RECORD_SLACK_SECONDS: f64 = 86400.0;
 
 /// Additive and idempotent. Keys recorded before uses were (or by a v29 binary since) count as
-/// last used when they were created, or at their latest recorded reuse when that is later.
+/// last used when they were created, or at their latest recorded reuse when that is later. A key
+/// reused by a v29 binary records an `action.reused` (or `action.retained`) event and no use, so
+/// every event since the last prepare raises its key's use to the event's time.
 pub fn prepare(db: &Connection) -> Result<()> {
     prepare_passed_keys(db)?;
     db.execute_batch(
@@ -78,6 +80,25 @@ pub fn prepare(db: &Connection) -> Result<()> {
              WHERE NOT EXISTS (SELECT 1 FROM passed_key_uses u WHERE u.action=p.action)",
             [],
         )?;
+    }
+    // Only the events after the last one read, so a prepare reads each event once.
+    let seen: i64 = setting(db, "retention_uses_seen")?
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let newest: i64 = db.query_row("SELECT COALESCE(MAX(seq),0) FROM events", [], |r| r.get(0))?;
+    if newest > seen {
+        // `WHERE true` tells SQLite's parser the upsert's ON CONFLICT is not the join's ON.
+        db.execute(
+            "INSERT INTO passed_key_uses
+             SELECT p.action, e.time FROM passed_keys p
+             JOIN (SELECT subject, MAX(time) AS time FROM events
+                   WHERE seq>? AND seq<=? AND kind IN ('action.reused','action.retained')
+                   GROUP BY subject) e ON e.subject=p.action
+             WHERE true
+             ON CONFLICT(action) DO UPDATE SET last_used=MAX(last_used,excluded.last_used)",
+            params![seen, newest],
+        )?;
+        set_setting(db, "retention_uses_seen", &newest.to_string())?;
     }
     Ok(())
 }
@@ -1911,6 +1932,36 @@ mod tests {
         expected[0].1 = 7.0;
         expected.insert(2, ("c".to_string(), 0.0));
         assert_eq!(uses(&store.db), expected);
+        // A key reused by a v29 binary after a rollback: an event, no use. Rolled forward, its
+        // use is the reuse, not the stale one it had; an older event never lowers a use.
+        for (subject, time, kind) in [
+            ("a", 9000.0, "action.reused"),
+            ("b", 300.0, "action.reused"),
+            ("c", 800.0, "action.retained"),
+            ("c", 9500.0, "action.queued"),
+        ] {
+            store
+                .db
+                .execute(
+                    "INSERT INTO events(time,kind,subject,detail) VALUES (?,?,?,'{}')",
+                    params![time, kind, subject],
+                )
+                .unwrap();
+        }
+        prepare(&store.db).unwrap();
+        expected[0].1 = 9000.0;
+        expected[2].1 = 800.0;
+        assert_eq!(uses(&store.db), expected);
+        // Each event is read once: a use lowered since (as no binary does) stays lowered.
+        store
+            .db
+            .execute(
+                "UPDATE passed_key_uses SET last_used=5.0 WHERE action='a'",
+                [],
+            )
+            .unwrap();
+        prepare(&store.db).unwrap();
+        assert_eq!(uses(&store.db)[0].1, 5.0);
         // The v29 shape of passed_keys itself is unchanged: its two-column insert still works.
         store
             .db
