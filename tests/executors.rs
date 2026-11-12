@@ -1328,6 +1328,23 @@ fn retention_deletes_old_outputs_on_the_authority_and_what_its_executor_left() {
              UPDATE candidates SET body=json_set(body,'$.created',1.0);",
         )
         .unwrap();
+    // A store in use recorded something shortly before this host booted: what vouches for the
+    // clock when there is no reading from this boot (every record here is from since the boot).
+    let mut boottime = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    assert_eq!(
+        unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut boottime) },
+        0
+    );
+    let booted = patchweft::now() - boottime.tv_sec as f64;
+    lab.database()
+        .execute(
+            "INSERT INTO events(time,kind,subject,detail) VALUES (?,'test.before_boot','t','{}')",
+            [booted - 3600.0],
+        )
+        .unwrap();
     let short = lab.command(&["retention", "--days", "7"]).output().unwrap();
     assert!(!short.status.success());
     assert!(String::from_utf8_lossy(&short.stderr).contains("at least 30 days"));
