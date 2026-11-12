@@ -837,6 +837,8 @@ its shape. So a v29 binary opens a store v30 ran, with these differences:
      because it reads every candidate, and candidates are never deleted. **There is no way around
      this one.** Until a rollback to v29 is ruled out, register no profile with
      `uses_containers`.
+
+   **Registering a profile with `uses_containers` is the point of no return for a v29 rollback.**
 4. **Retired keys run cold.** Keys retention retired are gone from `passed_keys`, so under v29 an
    identical request runs again instead of reusing.
 5. **No deleted check.** v29 does not know what retention deleted. Once a round has run, do not
