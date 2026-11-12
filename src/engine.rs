@@ -1732,6 +1732,7 @@ mod identity_tests {
 
     #[test]
     fn platform_mismatch_refuses_at_prepare() {
+        runner::stand_in_for_tests();
         let mut profile = RegisteredProfile {
             id: "fixture".into(),
             definition: serde_json::from_value(json!({"version":1,"name":"p",
@@ -1760,6 +1761,7 @@ mod identity_tests {
 
     impl Lab {
         fn new() -> Self {
+            runner::stand_in_for_tests();
             let temp = tempfile::tempdir().unwrap();
             let repo = temp.path().join("repo");
             fs::create_dir(&repo).unwrap();
@@ -1932,6 +1934,7 @@ mod declared_tests {
 
     impl Lab {
         fn new() -> Self {
+            runner::stand_in_for_tests();
             let temp = tempfile::tempdir().unwrap();
             let repo = temp.path().join("repo");
             fs::create_dir(&repo).unwrap();

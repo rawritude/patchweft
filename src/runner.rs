@@ -51,12 +51,14 @@ pub fn path() -> Result<PathBuf> {
     if let Some(path) = OVERRIDE.get() {
         return Ok(path.clone());
     }
-    // A unit-test harness has no runner beside it; its own bytes stand in, as this binary's did
-    // before the split. Nothing in the library's unit tests launches a runner.
-    if cfg!(test) {
-        return Ok(std::env::current_exe()?);
-    }
     installed(&std::env::current_exe()?)
+}
+
+/// For the library's unit tests, which have no runner installed beside their harness: the
+/// harness's own bytes stand in. Nothing in them launches a runner.
+#[cfg(test)]
+pub(crate) fn stand_in_for_tests() {
+    set_override(&std::env::current_exe().expect("test harness path")).expect("one stand-in");
 }
 
 /// `<directory of exe>/runner/<sha256>/patchweft-runner`, the one hash directory there.
