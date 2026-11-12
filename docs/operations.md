@@ -652,8 +652,21 @@ these (the `kept` reasons):
 Only `serve` deletes, in its maintenance loop, at most once an hour by the store's clock, and on
 its own thread, so deleting many trees never delays lease expiry. One transaction marks the
 attempts and retires their unused keys; their directories are renamed aside and deleted after it
-commits, and a removal that fails is retried next round. Each round logs and records
-`retention.deleted` with counts, bytes, the kept reasons and any failures.
+commits (deleted in place when the rename crosses filesystems, `EXDEV`), and a removal that fails
+is retried next round. Each round logs and records `retention.deleted` with counts, bytes, the
+kept reasons and any failures.
+
+**A clock it cannot trust deletes nothing.** Every cutoff is the clock minus N days, so a clock
+jumped forward would make every key look unused and every attempt old. Before it deletes, a round
+compares the clock with the newest time the store recorded: attempts' `created`, `started` and
+`ended`, events' `time` (other than retention's own) and candidates' `created`. More than a day
+ahead of it (`RETENTION_CLOCK_SLACK_SECONDS`, 86400: a quiet store may record nothing for a day),
+the round refuses: it deletes and retires nothing, records `retention.refused` with both times
+and logs `{"event":"retention_refused",…}`, and leaves the hourly gate as it was, so a round under
+the true clock runs as if it never came. A last run recorded later than the clock (the clock went
+back, or an older binary ran under a clock ahead) is refused the same way and the last run is
+reset to the clock, so the gate counts from there. `--dry` reports the same refusal under
+`refused`. A store idle for more than a day refuses until it records something again.
 
 The attempt row stays, with its evidence, so history, durations and certificates keep
 working; its body gains `deleted_by_retention` and `retention_days`. Reading what is gone says so:
@@ -661,13 +674,16 @@ working; its body gains `deleted_by_retention` and `retention_days`. Reading wha
 `log_deleted`); the artifact manifest is 410 `artifacts_deleted` and `deliver` refuses. Nothing
 hands out missing artifacts: `--retain-from` a candidate whose outputs were deleted leaves that
 job `not_retained` ("predecessor outputs were deleted by retention"), so it runs again, and `retry`
-of a job whose dependency's outputs were deleted refuses: submit the revision again.
+of a job whose dependency's outputs were deleted refuses: submit the revision again. The
+`--retain-from` check is made again in the transaction that records the retention, so a round
+that runs between the two still leaves the job `not_retained`.
 
 A remote executor deletes its own copy of an attempt once it is acknowledged and drained (see
 [executors](#executors)); for any `attempts/<id>` still left there, each claim response carries
 `retire`, the ids of that executor's attempts whose outputs the authority deleted, each sent at
 most three times. The coordinator renames each such `attempts/<id>` into `tmp/` (which every start
-clears) and deletes it off its claim loop, never one its ledger holds or held. An executor that
+clears; across filesystems it deletes it in place) and deletes it off its claim loop, never one
+its ledger holds or held. An executor that
 predates the field ignores it. Retention is all scheduler-side, in `serve` and the coordinator; the
 runner takes no part and never opens the store.
 

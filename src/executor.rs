@@ -920,16 +920,28 @@ impl<T: Transport> Coordinator<T> {
                 .parent()
                 .context("tmp directory")
                 .and_then(|tmp| Ok(fs::create_dir_all(tmp)?))
-                .and_then(|()| Ok(fs::rename(&directory, &aside)?));
-            if let Err(error) = moved {
-                log(
-                    json!({"event":"retention_retire_failed","executor":self.executor,
-                           "attempt":attempt,"error":format!("{error:#}")}),
-                );
-                continue;
-            }
+                .and_then(|()| {
+                    Ok(crate::retention::set_aside(
+                        &directory,
+                        &aside,
+                        |from, to| fs::rename(from, to),
+                    )?)
+                });
+            // `tmp/` on another filesystem than `attempts/`: deleted where it is.
+            let doomed = match moved {
+                Ok(crate::retention::Aside::Missing) => continue,
+                Ok(crate::retention::Aside::Renamed) => aside,
+                Ok(crate::retention::Aside::CrossDevice) => directory,
+                Err(error) => {
+                    log(
+                        json!({"event":"retention_retire_failed","executor":self.executor,
+                               "attempt":attempt,"error":format!("{error:#}")}),
+                    );
+                    continue;
+                }
+            };
             let (executor, attempt) = (self.executor.clone(), attempt.clone());
-            thread::spawn(move || match remove_tree(&aside) {
+            thread::spawn(move || match remove_tree(&doomed) {
                 Ok(()) => log(json!({"event":"retention_retired","executor":executor,
                                      "attempt":attempt})),
                 Err(error) => log(

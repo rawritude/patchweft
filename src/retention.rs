@@ -38,6 +38,10 @@ const RETIRE_BATCH: i64 = 256;
 const RETIRE_SENDS: i64 = 3;
 /// Where the authority renames an attempt's directory before deleting it.
 const ASIDE: &str = ".retention-";
+/// How far the clock may run past the newest time the store recorded before a round refuses: a
+/// quiet store may sit a day with nothing recorded, and a clock further ahead than that is taken
+/// for a jump, under which every cutoff would be wrong.
+pub const RETENTION_CLOCK_SLACK_SECONDS: f64 = 86400.0;
 
 /// Additive and idempotent. Keys recorded before uses were (or by a v29 binary since) count as
 /// last used when they were created, or at their latest recorded reuse when that is later.
@@ -422,11 +426,67 @@ fn tallies(map: &BTreeMap<String, Tally>) -> Value {
     map.iter().map(|(k, v)| (k.clone(), v.value())).collect()
 }
 
+/// The newest time the store recorded: attempts' `created`, `started` and `ended`, events' `time`
+/// (retention's own left out, as they carry the very clock under test) and candidates'
+/// `created`. None for an empty store.
+fn newest_recorded(db: &Connection) -> Result<Option<f64>> {
+    Ok(db.query_row(
+        "SELECT MAX(t) FROM (
+          SELECT MAX(MAX(COALESCE(json_extract(body,'$.created'),0),
+                         COALESCE(json_extract(body,'$.started'),0),
+                         COALESCE(json_extract(body,'$.ended'),0))) AS t FROM attempts
+          UNION ALL SELECT MAX(time) FROM events WHERE kind NOT LIKE 'retention.%'
+          UNION ALL SELECT MAX(json_extract(body,'$.created')) FROM candidates)",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
+fn last_run(db: &Connection) -> Result<Option<f64>> {
+    Ok(db
+        .query_row(
+            "SELECT value FROM settings WHERE key='retention_last_run'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|v| v.parse().ok()))
+}
+
+/// Why `now` is not to be trusted for a cutoff, if it is not: the last run is later than it (the
+/// clock went back, or an earlier round ran under a clock ahead), or it is more than
+/// [`RETENTION_CLOCK_SLACK_SECONDS`] past everything the store recorded (it jumped forward).
+fn clock_fault(db: &Connection, now: f64) -> Result<Option<Value>> {
+    if let Some(last) = last_run(db)?
+        && last > now
+    {
+        return Ok(Some(
+            json!({"reason":"the last run is later than now","now":now,"last_run":last}),
+        ));
+    }
+    if let Some(newest) = newest_recorded(db)?
+        && now - newest > RETENTION_CLOCK_SLACK_SECONDS
+    {
+        return Ok(Some(
+            json!({"reason":"now is past the newest recorded time by more than the slack",
+            "now":now,"newest_recorded":newest,"slack_seconds":RETENTION_CLOCK_SLACK_SECONDS}),
+        ));
+    }
+    Ok(None)
+}
+
 /// `patchweft retention --days N --dry`: what N days would delete now, and its bytes, split by
 /// the passed-key rule, per executor and per job. Deletes and records nothing.
 pub fn dry_run(store: &Store, days: u32, now: f64) -> Result<Value> {
     ensure!(days > 0, "a dry run needs --days of 1 or more");
     prepare(&store.db)?;
+    // What a round would refuse now, it reports instead of a list made from that clock.
+    if let Some(refused) = clock_fault(&store.db, now)? {
+        return Ok(
+            json!({"dry":true,"days":days,"setting":self::days(&store.db)?,
+                         "refused":refused}),
+        );
+    }
     let considered = consider(&store.db, now, days)?;
     let mut split: BTreeMap<&str, (Tally, Tally, BTreeMap<String, Tally>)> = BTreeMap::new();
     let (mut total, mut keys) = (Tally::default(), 0);
@@ -474,25 +534,33 @@ pub fn dry_run(store: &Store, days: u32, now: f64) -> Result<Value> {
     )
 }
 
-/// The real deletion, behind its own gate: only with the setting on, at most once an hour. The
-/// attempts it lets go are marked and their unused keys retired in one transaction; their
-/// directories go after it commits, and a removal that fails is retried next round. Logs a
-/// `retention.deleted` summary. None when the gate is shut.
+/// The real deletion, behind its own gate: only with the setting on, at most once an hour, and
+/// never under a clock it cannot trust (`clock_fault`): then it deletes nothing, records
+/// `retention.refused` with both times and returns `{"refused": …}`. The attempts it lets go are
+/// marked and their unused keys retired in one transaction; their directories go after it
+/// commits, and a removal that fails is retried next round. Logs a `retention.deleted` summary.
+/// None when the gate is shut.
 pub fn round(store: &mut Store, now: f64) -> Result<Option<Value>> {
     prepare(&store.db)?;
     let Some(days) = days(&store.db)? else {
         return Ok(None);
     };
     let transaction = store.transaction()?;
-    let last: Option<f64> = transaction
-        .query_row(
-            "SELECT value FROM settings WHERE key='retention_last_run'",
-            [],
-            |r| r.get::<_, String>(0),
-        )
-        .optional()?
-        .and_then(|v| v.parse().ok());
-    if last.is_some_and(|last| now - last < INTERVAL) {
+    if let Some(refused) = clock_fault(&transaction, now)? {
+        // A last run later than now is not the hourly gate: it is recorded as now, so the gate
+        // counts from a time this clock reached and a later round can run. A jump forward
+        // records nothing, so a round under the true clock runs as if this one never came.
+        if last_run(&transaction)?.is_some_and(|last| last > now) {
+            transaction.execute(
+                "UPDATE settings SET value=? WHERE key='retention_last_run'",
+                [now.to_string()],
+            )?;
+        }
+        event(&transaction, "retention.refused", "retention", &refused)?;
+        transaction.commit()?;
+        return Ok(Some(json!({"days":days,"refused":refused})));
+    }
+    if last_run(&transaction)?.is_some_and(|last| now - last < INTERVAL) {
         return Ok(None);
     }
     transaction.execute(
@@ -579,9 +647,48 @@ struct Removal {
     failed: Vec<Value>,
 }
 
+/// What [`set_aside`] did with a directory.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Aside {
+    /// There was none.
+    Missing,
+    Renamed,
+    /// `aside` is on another filesystem (`EXDEV`): the directory is where it was, to be deleted
+    /// in place.
+    CrossDevice,
+}
+
+/// Renames `directory` to `aside` through `rename` (`fs::rename`; a test injects a failure).
+pub(crate) fn set_aside(
+    directory: &Path,
+    aside: &Path,
+    rename: fn(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<Aside> {
+    match rename(directory, aside) {
+        Ok(()) => Ok(Aside::Renamed),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(Aside::Missing),
+        Err(error) if error.raw_os_error() == Some(libc::EXDEV) => Ok(Aside::CrossDevice),
+        Err(error) => Err(error),
+    }
+}
+
+fn rename(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::rename(from, to)
+}
+
 /// Deletes the directories of attempts marked deleted whose removal has not finished: renamed
-/// aside first, so a crash mid-delete leaves a name the next round knows.
+/// aside first, so a crash mid-delete leaves a name the next round knows. Across filesystems (an
+/// `attempts/` mounted apart from the store), deleted in place; recorded as failed only when that
+/// fails too.
 fn remove_pending(store: &Store, now: f64) -> Result<Removal> {
+    remove_pending_with(store, now, rename)
+}
+
+fn remove_pending_with(
+    store: &Store,
+    now: f64,
+    rename: fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<Removal> {
     let root = &store.root;
     for entry in fs::read_dir(root)?.flatten() {
         if entry.file_name().to_string_lossy().starts_with(ASIDE) {
@@ -605,11 +712,14 @@ fn remove_pending(store: &Store, now: f64) -> Result<Removal> {
             let directory = root.join("attempts").join(&attempt);
             let bytes = size(&directory);
             let aside = root.join(format!("{ASIDE}{}", unique()));
-            match fs::rename(&directory, &aside) {
-                Err(error) if error.kind() == ErrorKind::NotFound => return Ok(0),
-                result => result.with_context(|| format!("{}", directory.display()))?,
+            match set_aside(&directory, &aside, rename)
+                .with_context(|| format!("{}", directory.display()))?
+            {
+                Aside::Missing => return Ok(0),
+                Aside::Renamed => crate::executor::remove_tree(&aside)?,
+                Aside::CrossDevice => crate::executor::remove_tree(&directory)
+                    .with_context(|| format!("{} (in place)", directory.display()))?,
             }
-            crate::executor::remove_tree(&aside)?;
             Ok(bytes)
         })();
         match removed {
@@ -781,6 +891,16 @@ mod tests {
             crate::store::insert(self.db(), "candidates", id, &candidate).unwrap();
         }
 
+        /// Something recorded at `at`, as a busy store records every hour.
+        fn activity(&self, at: f64) {
+            self.db()
+                .execute(
+                    "INSERT INTO events(time,kind,subject,detail) VALUES (?,'test.activity','t','{}')",
+                    [at],
+                )
+                .unwrap();
+        }
+
         fn on(&mut self) {
             set_with_minimum(&mut self.store, 30, MIN_DAYS).unwrap();
         }
@@ -881,7 +1001,7 @@ mod tests {
     /// that ended too recently.
     fn split_lab() -> Lab {
         let lab = Lab::new();
-        let recent = now() - 86400.0;
+        let recent = now() - 3600.0;
         lab.passed("used", "check", OLD);
         lab.key("used", recent);
         lab.passed("stale", "check", OLD);
@@ -1024,7 +1144,8 @@ mod tests {
         assert_eq!(lab.round(now()).unwrap()["attempts"], 0);
         assert!(lab.present(&attempt) && !lab.deleted(&attempt));
         assert_eq!(lab.keys(), BTreeSet::from(["a".to_string()]));
-        // Unused for longer than N days, it goes with its key.
+        // Unused for longer than N days, it goes with its key, on a store still in use then.
+        lab.activity(now() + 2.0 * DAY);
         assert_eq!(lab.round(now() + 2.0 * DAY).unwrap()["keys_retired"], 1);
         assert!(!lab.present(&attempt) && lab.deleted(&attempt));
     }
@@ -1164,6 +1285,83 @@ mod tests {
         assert!(!lab.present("lapsed") && lab.deleted("lapsed"));
     }
 
+    /// A forward clock jump would put every cutoff in the future: the passing attempt of a key
+    /// reused just now would look unused for years and go with its key.
+    #[test]
+    fn a_clock_far_ahead_of_the_store_deletes_nothing() {
+        let mut lab = Lab::new();
+        let attempt = lab.passed("a", "check", OLD);
+        // A fresh reuse: the key was used now, and the store recorded it.
+        lab.key("a", now());
+        lab.activity(now());
+        lab.on();
+        let ahead = now() + 10.0 * 365.0 * DAY;
+        let refused = lab.round(ahead).unwrap();
+        assert_eq!(
+            refused["refused"]["reason"],
+            "now is past the newest recorded time by more than the slack",
+            "{refused}"
+        );
+        assert_eq!(refused["refused"]["now"], ahead);
+        assert!(refused["refused"]["newest_recorded"].as_f64().unwrap() <= now());
+        assert!(lab.present(&attempt) && !lab.deleted(&attempt));
+        assert_eq!(
+            lab.keys(),
+            BTreeSet::from(["a".to_string()]),
+            "no key retired"
+        );
+        assert!(lab.events("retention.deleted").is_empty());
+        let logged = lab.events("retention.refused");
+        assert_eq!(logged.len(), 1);
+        assert_eq!(logged[0]["detail"]["now"], ahead);
+        // The dry run reports the same refusal and lists nothing.
+        let dry = dry_run(&lab.store, 30, ahead).unwrap();
+        assert_eq!(dry["refused"]["reason"], refused["refused"]["reason"]);
+        assert_eq!(dry.get("attempts"), None);
+        // The jump left no last run behind: the true clock's round runs at once, and keeps the
+        // reused key's attempt.
+        assert_eq!(last_run(lab.db()).unwrap(), None);
+        let summary = lab.round(now()).unwrap();
+        assert_eq!(summary.get("refused"), None, "{summary}");
+        assert_eq!(summary["kept"], json!({"reused_key":1}));
+        assert!(lab.present(&attempt) && !lab.deleted(&attempt));
+        // Its own refusal events never count as the store's newest time.
+        assert!(lab.round(ahead).unwrap().get("refused").is_some());
+    }
+
+    /// A last run later than now is a clock fault, not the hourly gate: refused and logged, and
+    /// the gate counts from now again.
+    #[test]
+    fn a_last_run_in_the_future_is_refused_then_counted_from_now() {
+        let mut lab = Lab::new();
+        lab.passed("a", "build", OLD);
+        lab.on();
+        let start = now();
+        lab.db()
+            .execute(
+                "INSERT INTO settings VALUES ('retention_last_run',?)",
+                [(start + 30.0 * DAY).to_string()],
+            )
+            .unwrap();
+        let refused = lab.round(start).unwrap();
+        assert_eq!(
+            refused["refused"]["reason"],
+            "the last run is later than now"
+        );
+        assert_eq!(
+            dry_run(&lab.store, 30, start).unwrap()["refused"]["reason"],
+            Value::Null,
+            "already counted from now"
+        );
+        assert!(lab.present("a-t") && !lab.deleted("a-t"));
+        assert_eq!(lab.events("retention.refused").len(), 1);
+        assert_eq!(last_run(lab.db()).unwrap(), Some(start));
+        assert_eq!(lab.round(start + INTERVAL - 1.0), None, "the hourly gate");
+        lab.activity(start + INTERVAL);
+        assert_eq!(lab.round(start + INTERVAL).unwrap()["attempts"], 1);
+        assert!(!lab.present("a-t"));
+    }
+
     #[test]
     fn the_real_deletion_runs_at_most_once_an_hour() {
         let mut lab = Lab::new();
@@ -1196,6 +1394,74 @@ mod tests {
         assert_eq!(summary["attempts"], 0);
         assert_eq!(summary["removed_from_earlier_rounds"], 1);
         assert!(!lab.present("a-t") && !aside.exists());
+    }
+
+    #[test]
+    fn a_rename_across_filesystems_deletes_in_place() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut lab = Lab::new();
+        lab.passed("a", "build", OLD);
+        lab.passed("b", "build", OLD);
+        lab.on();
+        let mark = |attempt: &str| {
+            lab.db()
+                .execute(
+                    "INSERT INTO retention_deleted VALUES (?,'local',1.0,30,NULL)",
+                    [attempt],
+                )
+                .unwrap();
+        };
+        let removed = |attempt: &str| -> Option<f64> {
+            lab.db()
+                .query_row(
+                    "SELECT removed FROM retention_deleted WHERE attempt=?",
+                    [attempt],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        fn cross_device(_: &Path, _: &Path) -> std::io::Result<()> {
+            Err(std::io::Error::from_raw_os_error(libc::EXDEV))
+        }
+        mark("a-t");
+        let removal = remove_pending_with(&lab.store, now(), cross_device).unwrap();
+        assert!(!lab.present("a-t"), "deleted in place");
+        assert_eq!(removal.bytes.get("a-t"), Some(&15));
+        assert!(removal.failed.is_empty(), "{:?}", removal.failed);
+        assert!(removed("a-t").is_some());
+        // Not deletable in place either (`attempts/` is read-only): failed, retried next round.
+        mark("b-t");
+        let attempts = lab.store.root.join("attempts");
+        fs::set_permissions(&attempts, fs::Permissions::from_mode(0o555)).unwrap();
+        let removal = remove_pending_with(&lab.store, now(), cross_device).unwrap();
+        fs::set_permissions(&attempts, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(removal.failed.len(), 1, "{:?}", removal.failed);
+        assert_eq!(removal.failed[0]["attempt"], "b-t");
+        assert!(removed("b-t").is_none());
+        assert!(lab.present("b-t"));
+        // Any other rename failure is a failure.
+        fn denied(_: &Path, _: &Path) -> std::io::Result<()> {
+            Err(std::io::Error::from_raw_os_error(libc::EACCES))
+        }
+        let b = attempts.join("b-t");
+        assert_eq!(
+            set_aside(&b, &lab.store.root.join("x"), denied)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EACCES)
+        );
+        assert_eq!(
+            set_aside(
+                &lab.store.root.join("gone"),
+                &lab.store.root.join("x"),
+                rename
+            )
+            .unwrap(),
+            Aside::Missing
+        );
+        // The real rename, on one filesystem, sets aside.
+        let removal = remove_pending(&lab.store, now()).unwrap();
+        assert!(removal.failed.is_empty() && !lab.present("b-t"));
     }
 
     #[test]

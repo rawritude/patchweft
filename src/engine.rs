@@ -500,6 +500,35 @@ fn retainable(
     Ok(Ok(action))
 }
 
+/// What of `retainable` can change between its check and the retention itself: the action still
+/// passed, and retention has not deleted its attempt's outputs. Read in the transaction that
+/// records the retention.
+fn still_retainable(db: &Connection, action: &str) -> Result<Result<(), String>> {
+    let attempt: Option<String> = db
+        .query_row(
+            "SELECT attempt FROM actions WHERE id=? AND state='passed'",
+            [action],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    let Some(attempt) = attempt else {
+        return Ok(Err("predecessor obligation has not passed".into()));
+    };
+    if crate::retention::deleted(db, &attempt)?.is_some() {
+        return Ok(Err("predecessor outputs were deleted by retention".into()));
+    }
+    Ok(Ok(()))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Runs once between `retainable`'s check and the transaction that retains, as another
+    /// writer could.
+    static BETWEEN_CHECK_AND_RETAIN: std::cell::RefCell<Option<Box<dyn FnOnce(&mut Store)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn request_job(store: &mut Store, request: &mut Requester, name: &str) -> Result<String> {
     if let Some(id) = request.requested.get(name) {
         return Ok(id.clone());
@@ -539,9 +568,25 @@ fn request_job(store: &mut Store, request: &mut Requester, name: &str) -> Result
         None => None,
     };
     if let (Some(outcome), Some(retention)) = (outcome, request.retention.as_mut()) {
+        #[cfg(test)]
+        if outcome.is_ok()
+            && let Some(between) = BETWEEN_CHECK_AND_RETAIN.with(|hook| hook.borrow_mut().take())
+        {
+            between(store);
+        }
+        // Checked again where the interest is recorded: a retention round may have deleted the
+        // predecessor's outputs since `retainable` looked, and the job would run on missing
+        // artifacts.
+        let transaction = store.transaction()?;
+        let outcome = match outcome {
+            Ok(action) => match still_retainable(&transaction, &action.id)? {
+                Ok(()) => Ok(action),
+                Err(reason) => Err(reason),
+            },
+            refused => refused,
+        };
         match outcome {
             Ok(action) => {
-                let transaction = store.transaction()?;
                 transaction.execute("INSERT INTO interests VALUES (?,?,?,1) ON CONFLICT(action,owner,context) DO UPDATE SET active=1",
                                     params![action.id, owner, context])?;
                 event(
@@ -567,6 +612,7 @@ fn request_job(store: &mut Store, request: &mut Requester, name: &str) -> Result
                 return Ok(action.id);
             }
             Err(reason) => {
+                drop(transaction);
                 retention.not_retained.insert(name.into(), reason);
             }
         }
@@ -2672,6 +2718,45 @@ mod declared_tests {
             retained.not_retained["solo"],
             "predecessor outputs were deleted by retention"
         );
+    }
+
+    #[test]
+    fn retaining_rechecks_retention_where_it_records_the_interest() {
+        let mut lab = Lab::new();
+        let profile = lab.profile();
+        let first = lab.commit(&[(FILE, Some(DECLARATIONS))]);
+        let a = lab.submit(&first, &profile);
+        lab.pass_all(&a);
+        crate::retention::set_retention(&mut lab.store, 30).unwrap();
+        age(&lab);
+        // A round between the check and the retention deletes every pass of `a`.
+        let ran = std::rc::Rc::new(std::cell::Cell::new(false));
+        let observed = std::rc::Rc::clone(&ran);
+        BETWEEN_CHECK_AND_RETAIN.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |store: &mut Store| {
+                let summary = crate::retention::round(store, now()).unwrap().unwrap();
+                assert!(summary["attempts"].as_u64().unwrap() > 0, "{summary}");
+                observed.set(true);
+            }))
+        });
+        let retained = submit_retaining(
+            &mut lab.store,
+            &first.id,
+            &profile.id,
+            "agent",
+            vec![],
+            Some(&a.id),
+        )
+        .unwrap();
+        assert!(ran.get(), "the round ran between the two");
+        assert!(retained.retained.is_empty(), "{:?}", retained.retained);
+        assert!(!retained.not_retained.is_empty());
+        for (job, reason) in &retained.not_retained {
+            assert_eq!(
+                reason, "predecessor outputs were deleted by retention",
+                "{job}"
+            );
+        }
     }
 
     #[test]

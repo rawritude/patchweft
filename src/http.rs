@@ -799,6 +799,9 @@ fn maintain(mut store: Store, started: f64, stop: &AtomicBool) {
                     let round = Store::open(&root)
                         .and_then(|mut store| crate::retention::round(&mut store, crate::now()));
                     match round {
+                        Ok(Some(summary)) if summary.get("refused").is_some() => {
+                            eprintln!("{}", json!({"event":"retention_refused","summary":summary}))
+                        }
                         Ok(Some(summary)) => {
                             eprintln!("{}", json!({"event":"retention_deleted","summary":summary}))
                         }
