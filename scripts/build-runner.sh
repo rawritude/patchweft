@@ -14,6 +14,12 @@
 # the file, when one is in the runner's directory or an ancestor, or in the cargo home. The cargo
 # home itself stays, since an offline build reads its registry. The release profile is passed
 # explicitly too, matching runner/Cargo.toml, so nothing else can change it.
+#
+# Nor does the caller's environment: cargo runs under `env -i` with PATH, HOME, CARGO_HOME and
+# RUSTUP_HOME alone, so no CARGO_BUILD_TARGET, CARGO_PROFILE_RELEASE_*, CARGO_TARGET_<triple>_*,
+# RUSTC_WRAPPER or the like can change the bytes or where cargo puts them. CARGO_BUILD_JOBS is
+# passed on as --jobs: parallelism never changes the bytes of one codegen unit under full LTO.
+# The hash printed is of the executable cargo reports it built, which must be the one above.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd -P)
@@ -26,17 +32,22 @@ toolchain=$(sed -n 's/^channel *= *"\(.*\)"$/\1/p' "$root/rust-toolchain.toml")
 [[ -n "$toolchain" ]] || { echo "no toolchain channel in $root/rust-toolchain.toml" >&2; exit 1; }
 target="$root/runner/target"
 
-# Nothing from the caller's environment reaches the compiler: only these flags.
-unset CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR \
-  RUSTC_WRAPPER CARGO_BUILD_RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER RUSTC RUSTDOCFLAGS \
-  CARGO_PROFILE_RELEASE_LTO CARGO_PROFILE_RELEASE_CODEGEN_UNITS CARGO_PROFILE_RELEASE_STRIP \
-  CARGO_PROFILE_RELEASE_OPT_LEVEL CARGO_PROFILE_RELEASE_DEBUG CARGO_PROFILE_RELEASE_PANIC \
-  CARGO_PROFILE_RELEASE_INCREMENTAL
+# Nothing else from the caller's environment reaches cargo.
+clean=(env -i "PATH=$PATH" "HOME=${HOME:?}" "CARGO_HOME=$cargo_home")
+if [[ -n "${RUSTUP_HOME:-}" ]]; then
+  clean+=("RUSTUP_HOME=$RUSTUP_HOME")
+fi
 # Panic locations name source files; remapped, they name neither the checkout nor the cargo home.
 # Cargo leaves remap flags out of its metadata hashes, and hashes the shared runner/control by its
 # path inside this workspace, so nothing path-dependent reaches the bytes.
-export RUSTFLAGS="--remap-path-prefix=$root=/patchweft --remap-path-prefix=$cargo_home=/cargo"
-export CARGO_INCREMENTAL=0
+clean+=("RUSTFLAGS=--remap-path-prefix=$root=/patchweft --remap-path-prefix=$cargo_home=/cargo"
+  "CARGO_INCREMENTAL=0")
+jobs=()
+if [[ -n "${CARGO_BUILD_JOBS:-}" ]]; then
+  [[ "$CARGO_BUILD_JOBS" =~ ^[1-9][0-9]*$ ]] ||
+    { echo "CARGO_BUILD_JOBS must be a positive number, not $CARGO_BUILD_JOBS" >&2; exit 1; }
+  jobs=(--jobs "$CARGO_BUILD_JOBS")
+fi
 
 # runner/Cargo.toml's [profile.release] with cargo's defaults for what it leaves out, pinned.
 profile=(
@@ -51,6 +62,14 @@ profile=(
 # From the runner's own directory: cargo finds config files from its working directory, and the
 # check above covered that directory's ancestors.
 cd "$root/runner"
-cargo "+$toolchain" build --release --offline --locked --quiet "${profile[@]}" \
-  --manifest-path "$root/runner/Cargo.toml" --target-dir "$target"
-sha256sum "$target/release/patchweft-runner" | cut -d' ' -f1
+built=$("${clean[@]}" cargo "+$toolchain" build --release --offline --locked --quiet \
+  --message-format=json-render-diagnostics "${jobs[@]}" "${profile[@]}" \
+  --manifest-path "$root/runner/Cargo.toml" --target-dir "$target" |
+  sed -n 's/.*"executable":"\([^"]*\)".*/\1/p')
+binary="$target/release/patchweft-runner"
+if [[ "$built" != "$binary" ]]; then
+  echo "cargo built ${built:-no executable}, not $binary: refusing to print a hash of" \
+    "anything but what it just built" >&2
+  exit 1
+fi
+sha256sum "$binary" | cut -d' ' -f1

@@ -764,7 +764,13 @@ or `.cargo/config` is in `runner/` or any directory above it, or a `config.toml`
 cargo home (`$CARGO_HOME`, default `~/.cargo`); move it aside to build. The cargo home itself is
 used, for its registry. It also passes the release profile explicitly (`opt-level`, `debug`, `lto`,
 `codegen-units`, `panic`, `strip`, `incremental`, as `runner/Cargo.toml` and cargo's defaults have
-them). `scripts/test-runner-cargo-config.sh` checks the refusals.
+them). Cargo runs under `env -i` with only `PATH`, `HOME`, `CARGO_HOME` and `RUSTUP_HOME` from the
+caller, so `CARGO_BUILD_TARGET`, `CARGO_PROFILE_RELEASE_*`, `CARGO_TARGET_<triple>_*`,
+`RUSTC_WRAPPER` and the like never reach it; `CARGO_BUILD_JOBS` is passed on as `--jobs`, which
+does not change the bytes. The sha256 it prints is of the executable cargo reports it just built,
+at `runner/target/release/patchweft-runner`; any other path is refused, so neither it nor
+`scripts/install-runner.sh` can name a stale runner. `scripts/test-runner-cargo-config.sh` checks
+the refusals and the environment, with a stand-in for cargo.
 `scripts/check-runner-reproducible.sh` copies the runner's sources into two different temporary
 directories, builds each with that command and fails unless the two are byte-equal.
 
