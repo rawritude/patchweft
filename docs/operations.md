@@ -487,7 +487,8 @@ fails, refuses or delays a job.
 | `errors` | Present only when leaving or removing the cgroup failed. A supervisor that could not leave (its unit has no `coordinator` leaf) never writes `cgroup.kill`, which would end it too: it kills the leftovers by pid and says so here. |
 
 Unreadable or missing files give null. A job with `"uses_containers": true` (Profiles) also gets
-`"containers_unmeasured": true`.
+`"containers_unmeasured": true`. The runner removes the attempt's cgroup with any child cgroups
+its job made in it, deepest first, as a coordinator's sweep removes a stale one.
 
 **Not measured or enforced.**
 - *Container memory.* Containers under rootless Docker are charged to Docker's own user service,

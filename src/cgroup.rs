@@ -1,4 +1,4 @@
-//! A cgroup v2 leaf per attempt (v30 part 3), coordinator side: find the executor unit's
+//! A cgroup v2 leaf per attempt, coordinator side: find the executor unit's
 //! delegated cgroup, move into its `coordinator` leaf and enable the controllers in its subtree.
 //! The result, a [`Setup`], goes to each runner on its argv (`Setup::arguments`); the runner
 //! enters `<unit>/attempt-<id>` and measures it (`runner/src/cgroup.rs`). The layout and the
@@ -8,6 +8,7 @@
 //! refuse a job: anything short of a prepared unit is `Unavailable`, and jobs run without one.
 
 pub use patchweft_control::cgroup::{COORDINATOR, Setup, parse_self_cgroup, unavailable};
+use patchweft_control::cgroup::{kill_each, pids, remove, write};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
@@ -15,7 +16,7 @@ use std::{
     fs, io,
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 /// Enabled in the unit's `cgroup.subtree_control`; only `memory` is required. Never `cpu`: it would
@@ -165,56 +166,6 @@ pub fn prepare_coordinator(mode: Mode) -> Setup {
     Host::system().prepare_coordinator(mode)
 }
 
-fn write(path: &Path, text: &str) -> io::Result<()> {
-    fs::write(path, text)
-}
-
-const CGROUP2_SUPER_MAGIC: i64 = 0x6367_7270;
-
-/// Whether `path` is on a cgroup2 filesystem.
-fn is_cgroup2(path: &Path) -> bool {
-    let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
-        return false;
-    };
-    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
-    // `f_type`'s width differs between architectures.
-    #[allow(clippy::unnecessary_cast)]
-    unsafe {
-        libc::statfs(path.as_ptr(), &mut stat) == 0 && stat.f_type as i64 == CGROUP2_SUPER_MAGIC
-    }
-}
-
-fn pids(path: &Path) -> Vec<u32> {
-    fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| line.trim().parse().ok())
-        .collect()
-}
-
-/// A cgroup and any child cgroups a job made in it, deepest first, waiting up to `wait` for
-/// killed processes to leave. A test's fake tree holds regular files and goes at once.
-fn remove_cgroup(directory: &Path, wait: Duration) -> io::Result<()> {
-    if !is_cgroup2(directory) {
-        return fs::remove_dir_all(directory);
-    }
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            remove_cgroup(&entry.path(), wait)?;
-        }
-    }
-    let started = Instant::now();
-    loop {
-        match fs::remove_dir(directory) {
-            Err(e) if e.raw_os_error() == Some(libc::EBUSY) && started.elapsed() < wait => {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            other => return other,
-        }
-    }
-}
-
 /// Coordinator side, at start, once its ledger is taken up and before it launches anything:
 /// each `<unit>/attempt-<id>` whose attempt is not in `live` (the attempts whose supervisors are
 /// alive) is left from a supervisor that died outright. Its processes, orphans of that job, are
@@ -249,13 +200,9 @@ pub fn sweep_stale(unit: &Path, live: &BTreeSet<String>, pid: u32, wait: Duratio
             {
                 // Kernels before 5.14 have no cgroup.kill: the pids just read, one by one.
                 errors.push(format!("cgroup.kill: {e}; killed by pid"));
-                for pid in &held {
-                    unsafe {
-                        libc::kill(*pid as i32, libc::SIGKILL);
-                    }
-                }
+                kill_each(&held);
             }
-            if let Err(e) = remove_cgroup(&directory, wait) {
+            if let Err(e) = remove(&directory, wait) {
                 errors.push(format!("remove {}: {e}", directory.display()));
             }
         }

@@ -1,4 +1,4 @@
-//! A cgroup v2 leaf per attempt (v30 part 3), runner side: enter `<unit>/attempt-<id>` before the
+//! A cgroup v2 leaf per attempt, runner side: enter `<unit>/attempt-<id>` before the
 //! job's preparation, sample it while the job runs, and after the job and its cleanup read what
 //! the kernel measured, kill leftovers and remove it. The coordinator prepares `<unit>` and
 //! names it on this runner's argv (`--cgroup UNIT`, or `--cgroup-unavailable WHY`); the layout
@@ -8,15 +8,16 @@
 //! refuse a job: every path that cannot measure ends in `{"unavailable": why}` and the job runs as
 //! it would without cgroups.
 //!
-//! Self-contained (std, libc and serde_json only); nothing of the scheduler reaches it.
+//! Self-contained (std, libc, serde_json and `patchweft_control` only); nothing of the scheduler
+//! reaches it.
 
-use patchweft_control::cgroup::{COORDINATOR, parse_self_cgroup};
+use patchweft_control::cgroup::{
+    COORDINATOR, is_cgroup2, kill_each, parse_self_cgroup, pids, remove, write,
+};
 use serde_json::{Map, Value, json};
 use std::{
     collections::BTreeMap,
-    ffi::CString,
-    fs, io,
-    os::unix::ffi::OsStrExt,
+    fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, PoisonError, mpsc},
     thread::{self, JoinHandle},
@@ -29,20 +30,6 @@ pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 pub const NONCACHE_KERNEL: &str = "anon + shmem + kernel";
 /// The same on kernels whose `memory.stat` has no `kernel` key.
 pub const NONCACHE_PARTS: &str = "anon + shmem + kernel_stack + slab + percpu + sock";
-const CGROUP2_SUPER_MAGIC: i64 = 0x6367_7270;
-
-/// Whether `path` is on a cgroup2 filesystem.
-pub fn is_cgroup2(path: &Path) -> bool {
-    let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
-        return false;
-    };
-    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
-    // `f_type`'s width differs between architectures.
-    #[allow(clippy::unnecessary_cast)]
-    unsafe {
-        libc::statfs(path.as_ptr(), &mut stat) == 0 && stat.f_type as i64 == CGROUP2_SUPER_MAGIC
-    }
-}
 
 /// Supervisor-side settings; `Config::default()` is production.
 #[derive(Debug, Clone)]
@@ -149,20 +136,8 @@ pub fn noncache(stat: &BTreeMap<String, u64>) -> Option<(u64, &'static str)> {
     })
 }
 
-fn write(path: &Path, text: &str) -> io::Result<()> {
-    fs::write(path, text)
-}
-
 fn read_u64(path: &Path) -> Option<u64> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
-}
-
-fn pids(path: &Path) -> Vec<u32> {
-    fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| line.trim().parse().ok())
-        .collect()
 }
 
 fn sample(directory: &Path, track: &Mutex<Track>) {
@@ -218,7 +193,7 @@ pub fn enter_attempt_with(
     fs::create_dir(&directory).map_err(|e| format!("create {}: {e}", directory.display()))?;
     let pid = std::process::id();
     if let Err(e) = write(&directory.join("cgroup.procs"), &pid.to_string()) {
-        let _ = remove(&directory);
+        let _ = remove(&directory, Duration::ZERO);
         return Err(format!("enter {}: {e}", directory.display()));
     }
     let track = Arc::new(Mutex::new(Track::new(reservation_mb)));
@@ -250,15 +225,6 @@ pub fn enter_attempt_with(
         stop: Some(stop),
         sampler,
     })
-}
-
-fn remove(directory: &Path) -> io::Result<()> {
-    if is_cgroup2(directory) {
-        fs::remove_dir(directory)
-    } else {
-        // A test's fake tree holds regular files; a real cgroup's files go with rmdir.
-        fs::remove_dir_all(directory)
-    }
 }
 
 fn signed_seconds(at: Instant, origin: Instant) -> f64 {
@@ -384,7 +350,8 @@ impl Attempt {
                 out.insert("leftover_after_kill".into(), json!(remaining));
             }
         }
-        if let Err(e) = self.remove_patiently() {
+        // A job may have made child cgroups in it: they go first, deepest first.
+        if let Err(e) = remove(&self.directory, self.config.kill_wait) {
             errors.push(format!("remove {}: {e}", directory.display()));
         }
         if !errors.is_empty() {
@@ -433,30 +400,6 @@ impl Attempt {
                 return remaining;
             }
             thread::sleep(Duration::from_millis(20));
-        }
-    }
-
-    fn remove_patiently(&self) -> io::Result<()> {
-        let started = Instant::now();
-        loop {
-            match remove(&self.directory) {
-                Err(e)
-                    if e.raw_os_error() == Some(libc::EBUSY)
-                        && started.elapsed() < self.config.kill_wait =>
-                {
-                    thread::sleep(Duration::from_millis(20));
-                }
-                other => return other,
-            }
-        }
-    }
-}
-
-/// SIGKILL to each of `leftovers`, which never holds this process's own pid.
-fn kill_each(leftovers: &[u32]) {
-    for pid in leftovers {
-        unsafe {
-            libc::kill(*pid as i32, libc::SIGKILL);
         }
     }
 }
@@ -775,6 +718,8 @@ mod tests {
             .spawn()
             .unwrap();
         attempt.command_started();
+        // A cgroup the job made inside its own: `finish` removes it first.
+        fs::create_dir(attempt.path().join("job-made")).unwrap();
         // A process the job left behind; `finish` kills and reaps it.
         #[allow(clippy::zombie_processes)]
         let leftover = std::process::Command::new("/usr/bin/sleep")

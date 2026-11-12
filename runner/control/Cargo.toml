@@ -10,6 +10,7 @@ publish = false
 
 [dependencies]
 anyhow = "1"
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 # float_roundtrip on both sides, so the runner parses a claim's floats as the scheduler does,
 # whichever crate graph it is built in.
