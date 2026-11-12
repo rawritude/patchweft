@@ -67,6 +67,7 @@ With rustup installed:
 git clone https://github.com/rawritude/patchweft.git
 cd patchweft
 cargo build --release --locked
+scripts/install-runner.sh target/release
 ./target/release/patchweft --help
 python3 examples/shared-prep/run.py --binary ./target/release/patchweft
 ```
@@ -77,11 +78,16 @@ It verifies that the consumers receive independent copies and that only three
 executions occurred. It cleans up its temporary project after success. No
 credentials, network downloads or existing project are needed.
 
-To install the built CLI into your own bin directory:
+Jobs run in a separate binary, `patchweft-runner`, built on its own by
+`scripts/build-runner.sh`; `install-runner.sh` puts it beside `patchweft`, where `patchweft` looks
+for it (see [the runner](docs/operations.md#the-runner)). To install both into your own
+directories:
 
 ```bash
-mkdir -p "$HOME/.local/bin"
-install -m 755 target/release/patchweft "$HOME/.local/bin/patchweft"
+mkdir -p "$HOME/.local/bin" "$HOME/.local/lib/patchweft/current"
+install -m 755 target/release/patchweft "$HOME/.local/lib/patchweft/current/patchweft"
+scripts/install-runner.sh "$HOME/.local/lib/patchweft/current"
+ln -sf "$HOME/.local/lib/patchweft/current/patchweft" "$HOME/.local/bin/patchweft"
 ```
 
 Add that directory to your shell's `PATH` if needed.

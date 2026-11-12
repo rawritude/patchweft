@@ -4,7 +4,7 @@ Patchweft serves HTTP/JSON commands and queries, a resumable event stream, and a
 MCP adapter. All three use the same authenticated application handlers and durable
 mutation receipts. Local administrative commands still open the state store directly.
 The server and the local `worker` must use the same binary, state directory and host;
-remote executors use the same binary on other Linux hosts through the
+remote executors use the same binary and the same runner on other Linux hosts through the
 [executor routes](#executor-routes). Remote clients (`remote` and `mcp`) also build on
 macOS; supervised job execution requires Linux and refuses to start elsewhere.
 

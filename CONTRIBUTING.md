@@ -11,9 +11,18 @@ rustup component add rustfmt clippy
 cargo fmt --all --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked -- --test-threads=2
+(cd runner && cargo fmt --all --check)
+(cd runner && cargo clippy --locked --workspace --all-targets -- -D warnings)
+(cd runner && cargo test --locked --workspace)
+scripts/check-runner-reproducible.sh
 cargo build --release --locked
+scripts/install-runner.sh target/release
 python3 examples/shared-prep/run.py --binary ./target/release/patchweft
 ```
+
+The runner (`runner/`) is its own workspace with its own lockfile. A change under `runner/`,
+including `runner/control`, changes the runner's bytes and so every profile id: it is a runner
+release. The integration tests build it themselves and pass `--runner`.
 
 Tests use temporary, synthetic projects. Workflow tests exercise native processes,
 signals and Linux process supervision, so a sandbox that forbids those operations

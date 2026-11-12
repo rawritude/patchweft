@@ -299,10 +299,11 @@ and a denial wins. A remote executor claims nothing until jobs are placed on it
 by name; the local executor admits every job unless given an allowlist. Keep jobs
 that need the API host's network setup, such as browser tests, on `local`.
 
-Profile identity binds runner bytes, declared tool paths and bytes and platform.
-Install the identical binary and tools at the same absolute paths on every host.
-A coordinator verifies each profile before claiming its work and again before
-launching; a profile that does not match is refused and listed under
+Profile identity binds the runner's bytes, declared tool paths and bytes and platform.
+Install the identical runner and tools at the same absolute paths on every host (see
+[the runner](#the-runner)). A coordinator verifies each profile before claiming its
+work and again before launching, the second time from the runner file it then
+executes; a profile that does not match is refused and listed under
 `observed.refused` by `patchweft executors`, with `verified`, `last_seen`, the
 reported memory limit and free disk.
 
@@ -467,8 +468,9 @@ receipts belong together. Retain a copy of the exact runner binary and profile
 toolchain. Restore into a separate directory and inspect it before resuming.
 
 There is no automatic database migration or rolling-upgrade protocol. Back up
-before changing binaries. Profile and job identity bind runner bytes, so
-re-register profiles after changing the runner. Do not mix versions against a
+before changing binaries. Profile and job identity bind the runner's bytes, so
+re-register profiles after changing the runner; a release that keeps the runner
+unchanged keeps every profile (see [the runner](#the-runner)). Do not mix versions against a
 live store. Host power-loss recovery and backup/restore under arbitrary failures
 have not been established by the included tests.
 
@@ -499,6 +501,69 @@ is handed off and gated on its own, and may delete only an attempt's directory t
 past its retention, and neither a dependency of a live action nor a reused result: `logs` reads
 `attempts/<id>/output.log`, and a `local` claim reads its dependencies' artifacts from
 `attempts/<producer>/artifacts`.
+
+### The runner
+
+Patchweft is two binaries. `patchweft` serves the API, schedules, and coordinates executors. It
+never runs a job: it has no command that executes one. `patchweft-runner` runs jobs. A coordinator
+launches it once per attempt, as `patchweft-runner _supervise ROOT ATTEMPT`, and it reads only that
+attempt's control files. A profile's `engine` (and every job recipe, through it) is the sha256 of
+the runner, never of `patchweft`, so a scheduler, API or admission change leaves every profile id,
+recipe and passed key as it was.
+
+**Layout.** `patchweft` finds its runner beside itself, in a directory named by the runner's hash:
+
+```text
+<release>/patchweft
+<release>/runner/<sha256>/patchweft-runner
+```
+
+`<release>` is the directory of the running `patchweft` with symlinks resolved, such as
+`~/.local/lib/patchweft/<ver>/` behind `~/.local/bin/patchweft`. `runner/` must hold exactly that one
+hash directory, and the runner's bytes must have the hash it names; otherwise `register`, `submit`,
+`request`, `worker` and `executor` refuse. `--runner PATH`, a global option, names another runner
+file instead (tests use it). `scripts/install-runner.sh <release>` builds the runner and installs it
+there.
+
+**Hash what runs.** A coordinator hashes the runner when it starts, which is the `engine` it
+reports on `patchweft executors` and the one it verifies profiles against. Before each launch it
+opens the runner, hashes the open file, refuses the launch unless that hash is the claimed
+profile's engine, and executes that same open file (`fexecve`). A runner replaced since the start is
+refused like drifted tools: the attempt ends `runtime-mismatch`, not started, and the profile is
+refused on that executor. The runner checks itself again before the job, through `/proc/self/exe`.
+
+**Building it.** The runner is its own cargo workspace, `runner/`, with its own lockfile
+(`runner/Cargo.lock`). Its member `runner/control` (`patchweft-control`) holds the control-file
+types, job identity and the few helpers both binaries share; `patchweft` depends on it by path. The
+scheduler's dependency bumps and feature unification never reach the runner. Build it with one
+command and no other:
+
+```bash
+scripts/build-runner.sh        # prints the runner's sha256
+```
+
+It builds release, offline and locked, with the toolchain `rust-toolchain.toml` pins, and remaps the
+checkout and the cargo home out of its bytes. It carries no version string, commit or build path.
+`scripts/check-runner-reproducible.sh` copies the runner's sources into two different temporary
+directories, builds each with that command and fails unless the two are byte-equal.
+
+**"The old runner unchanged"** means byte-equal to a rebuild from the release's own tree with
+`scripts/build-runner.sh`. Rebuild it and compare the hash with the runner installed now:
+
+- Equal: a scheduler-only release. Install the new `patchweft` in a new release directory with
+  the old runner copied unchanged under its hash. Nothing is registered or repointed, and no job
+  goes cold.
+- Different: a runner release, and cold. Its runner's own sources, `runner/control`, the runner's
+  lockfile or the toolchain changed how jobs run. Upgrade as above: drain, install, re-register,
+  repoint. The rebuild also catches a `patchweft` built against other shared types than the runner
+  installed beside it.
+
+**Restarts.** Executor units run `KillMode=process`: stopping a unit ends its coordinator, not the
+runners it launched, which are in their own process groups. The next coordinator adopts every live
+supervisor from its ledger (`supervisor.json`: pid and start time) and keeps relaying stops and
+leases. So a scheduler-only release restarts `worker`, `executor` and `serve` without ending
+running attempts, as long as each coordinator is back within its executor's lease. Under the
+default `KillMode=control-group`, stopping the unit would kill every attempt.
 
 ### Cutover of the lent reserve (lumenloop-ng#4204)
 
@@ -552,7 +617,7 @@ in `job_estimates`, and v27's own rows come first, so its estimates stay sane.
 
 Use the [connection guide](connections.md) for private credential files, TLS,
 roles, receipts and event cursors. The API and `worker` must share the store's
-host, state directory and binary; executors share the binary. Non-loopback HTTP
+host, state directory and binary; executors run the same runner. Non-loopback HTTP
 listeners require TLS.
 
 Source downloads carry the reachable history a client lacks: an executor sends
