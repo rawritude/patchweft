@@ -772,7 +772,8 @@ at `runner/target/release/patchweft-runner`; any other path is refused, so neith
 `scripts/install-runner.sh` can name a stale runner. `scripts/test-runner-cargo-config.sh` checks
 the refusals and the environment, with a stand-in for cargo.
 `scripts/check-runner-reproducible.sh` copies the runner's sources into two different temporary
-directories, builds each with that command and fails unless the two are byte-equal.
+directories, builds each with that command under a different job count (`--jobs 1`, then
+`CARGO_BUILD_JOBS`, or 2), and fails unless the two are byte-equal.
 
 **"The old runner unchanged"** means byte-equal to a rebuild from the release's own tree with
 `scripts/build-runner.sh`. Rebuild it and compare the hash with the runner installed now:
