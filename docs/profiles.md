@@ -20,7 +20,7 @@ environment, report contract, artifacts, reuse policy, input list, exported
 `slots`, the profile's `inputs_file` when set, the recipes of its dependencies,
 runner binary and platform. It leaves
 out `memory_mb`, `timeout_seconds`, `slots` with `export_slots: false`, `audit`,
-and the profile's name, version and `certifying` flag; `certifying` decides the
+`uses_containers`, and the profile's name, version and `certifying` flag; `certifying` decides the
 evidence class instead. Sharing, completed reuse
 and retention compare recipes rather than profile IDs, so a reservation change
 does not change any job's identity.
@@ -272,6 +272,12 @@ not hard CPU/RSS limits. Each artifact file and each log may hold at most 1 GiB,
 and an attempt's artifacts and logs together at most 4 GiB; exceeding either
 fails the attempt on every host. Declare a bounded `cleanup` argv for external resources
 such as project-owned containers. Uncertain cleanup retains capacity for an operator.
+
+Set `"uses_containers": true` on a job that starts containers through the host's rootless
+Docker. Their memory is charged to the Docker daemon's own cgroup, not the attempt's, so the
+attempt's measured memory (Operations, "Attempt cgroups") is the job's own processes alone; the
+evidence then says `"containers_unmeasured": true`. The field never reaches the job and is not in
+its recipe, but it is in the profile definition, so setting it registers a new profile.
 
 `memory_mb`, and `slots` when `export_slots` is false, form a per-action
 reservation. A queued action shared by several profiles reserves the largest

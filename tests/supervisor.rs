@@ -202,6 +202,11 @@ impl Lab {
     /// Spawns `_supervise` as the coordinator does: cleared environment, own process group.
     /// `--state` names the root, which has no store: a supervisor must never need one.
     fn spawn(&self, claim: &ClaimFile) -> Supervisor {
+        self.spawn_with(claim, &[])
+    }
+
+    /// `spawn` with the coordinator's cgroup arguments.
+    fn spawn_with(&self, claim: &ClaimFile, cgroup: &[&str]) -> Supervisor {
         let log = fs::File::create(self.directory(claim).join("supervisor.log")).unwrap();
         Supervisor(
             Command::new(AW)
@@ -212,6 +217,7 @@ impl Lab {
                 .arg("_supervise")
                 .arg(&self.root)
                 .arg(&claim.attempt.id)
+                .args(cgroup)
                 .stdin(Stdio::null())
                 .stdout(log.try_clone().unwrap())
                 .stderr(log)
@@ -632,4 +638,53 @@ fn runtime_mismatch_is_not_started() {
     // Past registration, external cleanup still runs before the result.
     assert!(lab.root.join("cleaned").exists());
     assert!(result.drained);
+}
+
+/// A cgroup that cannot be had never fails or refuses the job: it runs as without one, and its
+/// evidence says why it was not measured.
+#[test]
+fn an_unavailable_cgroup_records_why_and_the_job_runs() {
+    let lab = Lab::new();
+    // A real directory, but no cgroup2: what a wrong unit path or an undelegated host gives.
+    let fake_unit = lab.root.join("not-a-cgroup");
+    fs::create_dir(&fake_unit).unwrap();
+    let unit = fake_unit.to_str().unwrap();
+    let cases: [(&[&str], &str); 3] = [
+        (&["--cgroup", unit], "is not on a cgroup2 filesystem"),
+        (&["--cgroup-unavailable", "off"], "off"),
+        (&[], "not passed by the coordinator"),
+    ];
+    for (arguments, why) in cases {
+        let mut claim = lab.claim("touch \"$PATCHWEFT_STATE/ran\"; exit 3", None, 60);
+        // Evidence metadata only: the recipe the claim carries still matches.
+        claim.profile.definition.jobs[0].uses_containers = arguments.is_empty();
+        lab.write(&claim);
+        let supervisor = lab.spawn_with(&claim, arguments);
+        lab.register(&claim);
+        let result = lab.result(&claim, supervisor);
+        assert_eq!(
+            (result.outcome, result.exit_code, result.drained),
+            (Outcome::Completed, 3, true),
+            "{arguments:?}: {}",
+            result.evidence
+        );
+        assert!(lab.root.join("ran").exists(), "{arguments:?}");
+        fs::remove_file(lab.root.join("ran")).unwrap();
+        let reason = result.evidence["cgroup"]["unavailable"].as_str().unwrap();
+        assert!(reason.contains(why), "{arguments:?}: {reason}");
+        assert_eq!(
+            result.evidence["containers_unmeasured"],
+            if arguments.is_empty() {
+                json!(true)
+            } else {
+                Value::Null
+            },
+            "{arguments:?}"
+        );
+    }
+    assert_eq!(
+        fs::read_dir(&fake_unit).unwrap().count(),
+        0,
+        "nothing created"
+    );
 }

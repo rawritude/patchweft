@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use patchweft::{
     api, authority, client, engine, executor, http, mcp, model, source, store::Store, worker,
 };
@@ -181,6 +181,9 @@ enum Operation {
         /// jobs.
         #[arg(long)]
         no_loopback_check: bool,
+        /// A cgroup per attempt, measured into its evidence (`auto`: where the unit is delegated).
+        #[arg(long, value_enum, default_value_t = AttemptCgroups::Auto)]
+        attempt_cgroups: AttemptCgroups,
     },
     /// Run a remote executor's coordinator against an API; --drain exits when all currently
     /// runnable work is finished. A second coordinator for the same work directory waits as a
@@ -213,6 +216,9 @@ enum Operation {
         /// jobs.
         #[arg(long)]
         no_loopback_check: bool,
+        /// A cgroup per attempt, measured into its evidence (`auto`: where the unit is delegated).
+        #[arg(long, value_enum, default_value_t = AttemptCgroups::Auto)]
+        attempt_cgroups: AttemptCgroups,
     },
     /// Register or reconfigure an executor. `local` sets the store's own budget; a remote
     /// executor runs only the jobs placed on it with --allow-job.
@@ -314,7 +320,16 @@ enum Operation {
     },
     /// Supervise one claimed attempt from its control files; never opens the store.
     #[command(name = "_supervise", hide = true)]
-    Supervise { root: PathBuf, attempt: String },
+    Supervise {
+        root: PathBuf,
+        attempt: String,
+        /// The delegated unit cgroup the attempt's own cgroup goes under.
+        #[arg(long)]
+        cgroup: Option<PathBuf>,
+        /// Why the attempt has no cgroup.
+        #[arg(long, conflicts_with = "cgroup")]
+        cgroup_unavailable: Option<String>,
+    },
 }
 
 #[derive(Args)]
@@ -422,6 +437,22 @@ fn remote(connection: &Connection, operation: &RemoteOperation) -> Result<Value>
     Ok(value)
 }
 
+/// `--attempt-cgroups`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum AttemptCgroups {
+    Auto,
+    Off,
+}
+
+impl AttemptCgroups {
+    fn mode(self) -> patchweft::cgroup::Mode {
+        match self {
+            Self::Auto => patchweft::cgroup::Mode::Auto,
+            Self::Off => patchweft::cgroup::Mode::Off,
+        }
+    }
+}
+
 fn run(cli: Cli) -> Result<Value> {
     match &cli.command {
         Operation::Serve {
@@ -444,7 +475,21 @@ fn run(cli: Cli) -> Result<Value> {
             connection,
             operation,
         } => return remote(connection, operation),
-        Operation::Supervise { root, attempt } => return worker::supervise(root, attempt),
+        Operation::Supervise {
+            root,
+            attempt,
+            cgroup,
+            cgroup_unavailable,
+        } => {
+            let setup = match (cgroup, cgroup_unavailable) {
+                (Some(unit), _) => patchweft::cgroup::Setup::Available(unit.clone()),
+                (None, Some(why)) => patchweft::cgroup::Setup::Unavailable(why.clone()),
+                (None, None) => {
+                    patchweft::cgroup::Setup::Unavailable("not passed by the coordinator".into())
+                }
+            };
+            return worker::supervise(root, attempt, &setup);
+        }
         Operation::Executor {
             connection,
             work,
@@ -456,6 +501,7 @@ fn run(cli: Cli) -> Result<Value> {
             retain_hours,
             loopback_allow,
             no_loopback_check,
+            attempt_cgroups,
         } => {
             return executor::remote(
                 || connection.open(),
@@ -464,6 +510,7 @@ fn run(cli: Cli) -> Result<Value> {
                     drain: *drain,
                     poll: Duration::from_millis(*poll_ms),
                     heartbeat: Duration::from_secs(*heartbeat_seconds),
+                    cgroups: attempt_cgroups.mode(),
                 },
                 executor::Bounds {
                     min_free: min_free_gb * GIB,
@@ -571,12 +618,14 @@ fn run(cli: Cli) -> Result<Value> {
             min_free_gb,
             loopback_allow,
             no_loopback_check,
+            attempt_cgroups,
         } => executor::local(
             &store,
             executor::Options {
                 drain,
                 poll: Duration::from_millis(poll_ms),
                 heartbeat: Duration::from_secs(heartbeat_seconds),
+                cgroups: attempt_cgroups.mode(),
             },
             executor::Guards {
                 min_free: min_free_gb * GIB,

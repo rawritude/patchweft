@@ -5,6 +5,7 @@
 use crate::{
     api::{self, MAX_HAVES, MAX_RETAINED_UPLOADS, TRANSFER_TIMEOUT_SECONDS},
     authority::{self, AuthorityError, LOCAL, MAX_LEASES, Outputs, REFUSE_ALL, Scope},
+    cgroup,
     client::{Refused, Remote},
     engine, file_hash,
     model::*,
@@ -317,6 +318,8 @@ pub struct Options {
     pub drain: bool,
     pub poll: Duration,
     pub heartbeat: Duration,
+    /// `--attempt-cgroups`: a cgroup per attempt where the unit's is delegated.
+    pub cgroups: cgroup::Mode,
 }
 
 /// Free bytes on the filesystem holding a path.
@@ -483,6 +486,8 @@ pub struct Coordinator<T> {
     engine: String,
     host: Option<String>,
     guards: Guards,
+    /// The unit cgroup each supervisor's attempt cgroup goes under, or why there is none.
+    cgroups: cgroup::Setup,
     state: Mutex<State>,
     heartbeat: Condvar,
     publisher: Condvar,
@@ -530,6 +535,7 @@ impl<T: Transport> Coordinator<T> {
             engine,
             host: worker::host(),
             guards: Guards::default(),
+            cgroups: cgroup::Setup::Unavailable("not prepared".into()),
             state: Mutex::new(State {
                 ledger: BTreeMap::new(),
                 taken_up: BTreeSet::new(),
@@ -556,6 +562,11 @@ impl<T: Transport> Coordinator<T> {
 
     fn guarded(mut self, guards: Guards) -> Self {
         self.guards = guards;
+        self
+    }
+
+    fn measured(mut self, cgroups: cgroup::Setup) -> Self {
+        self.cgroups = cgroups;
         self
     }
 
@@ -1103,12 +1114,18 @@ impl<T: Transport> Coordinator<T> {
     fn spawn(&self, attempt: &str) -> Result<Child> {
         let directory = self.transport.root().join("attempts").join(attempt);
         let log = File::create(directory.join("supervisor.log"))?;
-        Ok(Command::new(std::env::current_exe()?)
+        let mut command = Command::new(std::env::current_exe()?);
+        command
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .arg("_supervise")
             .arg(self.transport.root())
-            .arg(attempt)
+            .arg(attempt);
+        match &self.cgroups {
+            cgroup::Setup::Available(unit) => command.arg("--cgroup").arg(unit),
+            cgroup::Setup::Unavailable(why) => command.arg("--cgroup-unavailable").arg(why),
+        };
+        Ok(command
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log)
@@ -1687,6 +1704,14 @@ pub fn run<T: Transport + 'static>(
     if let Some(disk) = &guards.disk {
         disk.start(SystemTime::now())?;
     }
+    // Once, with the executor lock held: a standby never moves while the active one runs.
+    let cgroups = cgroup::prepare_coordinator(options.cgroups);
+    log(
+        json!({"event":"attempt_cgroups","executor":hello.executor,"cgroups":match &cgroups {
+            cgroup::Setup::Available(unit) => json!({"unit":unit}),
+            cgroup::Setup::Unavailable(why) => cgroup::unavailable(why),
+        }}),
+    );
     let coordinator = Arc::new(
         Coordinator::new(
             transport,
@@ -1695,7 +1720,8 @@ pub fn run<T: Transport + 'static>(
             options,
             engine,
         )
-        .guarded(guards),
+        .guarded(guards)
+        .measured(cgroups),
     );
     coordinator.verify(&hello.profiles);
     for attempt in coordinator.reconcile(false)? {
@@ -1763,6 +1789,8 @@ pub fn recover(store: &mut Store, confirmed: Option<&str>) -> Result<Value> {
             drain: true,
             poll: Duration::from_millis(100),
             heartbeat: Duration::from_secs(1),
+            // Recovery launches no supervisor.
+            cgroups: cgroup::Mode::Off,
         };
         let coordinator = Coordinator::new(
             transport,
@@ -2922,6 +2950,7 @@ mod tests {
             drain: true,
             poll: Duration::from_millis(10),
             heartbeat: Duration::from_secs(1),
+            cgroups: cgroup::Mode::Off,
         };
         Coordinator::new(fake, "mindy".into(), 10, options, "e".into())
     }
