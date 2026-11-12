@@ -778,8 +778,9 @@ const PURGE_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Lease expiry (MUST-FIX 2) and upload hygiene (MUST-FIX 3) run only in the API process: a
 /// worker's view of time must never expire another host's work.
-fn maintain(mut store: Store, started: f64, stop: &AtomicBool) {
+fn maintain(mut store: Store, started: f64, start: crate::retention::Start, stop: &AtomicBool) {
     let mut purged: Option<Instant> = None;
+    let mut retaining: Option<std::thread::JoinHandle<()>> = None;
     while !stop.load(Ordering::Relaxed) {
         if let Err(error) = authority::expire(&mut store, crate::now(), started) {
             eprintln!("Patchweft lease expiry failed: {error:#}");
@@ -789,6 +790,30 @@ fn maintain(mut store: Store, started: f64, stop: &AtomicBool) {
                 Ok(0) => {}
                 Ok(removed) => eprintln!("{}", json!({"event":"uploads_purged","removed":removed})),
                 Err(error) => eprintln!("Patchweft upload purge failed: {error:#}"),
+            }
+            // Gated on its setting (off by default) and at most hourly by the store's own clock;
+            // on its own thread and connection, so deleting many trees never delays lease expiry.
+            if retaining.as_ref().is_none_or(|round| round.is_finished()) {
+                let (root, start) = (store.root.clone(), start.clone());
+                retaining = Some(std::thread::spawn(move || {
+                    let round = Store::open(&root).and_then(|mut store| {
+                        crate::retention::round(
+                            &mut store,
+                            &start,
+                            &crate::retention::Clock::read(),
+                        )
+                    });
+                    match round {
+                        Ok(Some(summary)) if summary.get("refused").is_some() => {
+                            eprintln!("{}", json!({"event":"retention_refused","summary":summary}))
+                        }
+                        Ok(Some(summary)) => {
+                            eprintln!("{}", json!({"event":"retention_deleted","summary":summary}))
+                        }
+                        Ok(None) => {}
+                        Err(error) => eprintln!("Patchweft retention failed: {error:#}"),
+                    }
+                }));
             }
             purged = Some(Instant::now());
         }
@@ -921,6 +946,9 @@ pub fn serve(
         "non-loopback listeners require TLS"
     );
     ensure!(!origins.contains("*"), "origins must be explicit");
+    // Before anything here writes to the store: retention's first round checks the clock against
+    // what the store had recorded, which a write of this process's own would make worthless.
+    let start = crate::retention::Start::read(&Store::open(root)?.db)?;
     let api = Arc::new(Api::open(root)?);
     let maintenance = Store::open(root)?;
     let listener = bind(listen)?;
@@ -935,7 +963,7 @@ pub fn serve(
         let (stop, started) = (stop.clone(), api.started);
         std::thread::Builder::new()
             .name("maintenance".into())
-            .spawn(move || maintain(maintenance, started, &stop))?
+            .spawn(move || maintain(maintenance, started, start, &stop))?
     };
     let served = runtime.block_on(async move {
         let app = router(Service::new(api, origins));

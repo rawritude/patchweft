@@ -1,18 +1,18 @@
 pub mod authority;
+pub mod cgroup;
 pub mod declared;
 pub mod engine;
 pub mod executor;
 pub mod model;
+pub mod retention;
+pub mod runner;
 pub mod source;
 pub mod store;
 pub mod worker;
 
-use anyhow::Result;
-use serde::Serialize;
-use sha2::{Digest, Sha256};
+pub use patchweft_control::{file_hash, hash, identity};
 use std::{
     fs,
-    path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -21,29 +21,6 @@ pub fn now() -> f64 {
         .duration_since(UNIX_EPOCH)
         .expect("system clock")
         .as_secs_f64()
-}
-
-pub fn hash(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
-
-pub fn identity(value: &impl Serialize) -> Result<String> {
-    Ok(hash(&serde_json::to_vec(value)?))
-}
-
-pub fn file_hash(path: &Path) -> Result<String> {
-    use std::io::Read;
-    let mut file = fs::File::open(path)?;
-    let mut digest = Sha256::new();
-    let mut buffer = [0u8; 65536];
-    loop {
-        let count = file.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        digest.update(&buffer[..count]);
-    }
-    Ok(format!("{:x}", digest.finalize()))
 }
 
 pub fn unique() -> String {

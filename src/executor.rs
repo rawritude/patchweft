@@ -1,13 +1,15 @@
 //! The coordinator of one executor. `worker` runs it for the local executor; a remote executor
 //! runs the same code over another transport. It claims work, keeps the leases of its attempts,
-//! launches `_supervise`, relays stops in both directions and publishes results. Its supervisors
-//! reach it only through files in their attempt's `control/` directory.
+//! launches the runner's `_supervise`, relays stops in both directions and publishes results. Its
+//! supervisors reach it only through files in their attempt's `control/` directory.
 use crate::{
     api::{self, MAX_HAVES, MAX_RETAINED_UPLOADS, TRANSFER_TIMEOUT_SECONDS},
     authority::{self, AuthorityError, LOCAL, MAX_LEASES, Outputs, REFUSE_ALL, Scope},
+    cgroup,
     client::{Refused, Remote},
     engine, file_hash,
     model::*,
+    runner::{self, Runner},
     source,
     store::Store,
     unique,
@@ -20,14 +22,11 @@ use std::{
     cell::Cell,
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{self, File, OpenOptions},
-    io::{self, ErrorKind},
+    io::{self, ErrorKind, Read, Seek, SeekFrom},
     net::{IpAddr, Ipv6Addr, SocketAddr},
-    os::unix::{
-        fs::{MetadataExt, PermissionsExt},
-        process::CommandExt,
-    },
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Component, Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::Child,
     sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -234,6 +233,25 @@ impl Transport for LocalTransport {
     }
 }
 
+/// What a Lost report carries of the supervisor's own log: its last bytes, which name why a
+/// supervisor ended without a result (such as a claim it refused). Null when there is none.
+const SUPERVISOR_LOG_TAIL: u64 = 2048;
+
+fn log_tail(path: &Path) -> Value {
+    let read = || -> std::io::Result<Vec<u8>> {
+        let mut file = File::open(path)?;
+        let length = file.metadata()?.len();
+        file.seek(SeekFrom::Start(length.saturating_sub(SUPERVISOR_LOG_TAIL)))?;
+        let mut tail = Vec::new();
+        file.take(SUPERVISOR_LOG_TAIL).read_to_end(&mut tail)?;
+        Ok(tail)
+    };
+    match read() {
+        Ok(tail) if !tail.is_empty() => json!(String::from_utf8_lossy(&tail)),
+        _ => Value::Null,
+    }
+}
+
 /// What a local job used besides its evidence (`output.log`, `cleanup.log`, `supervisor.log`,
 /// `artifacts/`, `artifacts.json`, which stay in the store): its checkout, `TMPDIR` and `HOME`.
 const JOB_TREES: [&str; 3] = ["work", "scratch", "home"];
@@ -317,6 +335,8 @@ pub struct Options {
     pub drain: bool,
     pub poll: Duration,
     pub heartbeat: Duration,
+    /// `--attempt-cgroups`: a cgroup per attempt where the unit's is delegated.
+    pub cgroups: cgroup::Mode,
 }
 
 /// Free bytes on the filesystem holding a path.
@@ -479,10 +499,14 @@ pub struct Coordinator<T> {
     transport: T,
     executor: String,
     options: Options,
-    /// sha256 of this binary, the runner every profile run here must have been registered with.
+    /// sha256 of the runner, which every profile run here must have been registered with.
     engine: String,
+    /// The runner this coordinator launches; none in tests that never launch.
+    runner: Option<Runner>,
     host: Option<String>,
     guards: Guards,
+    /// The unit cgroup each supervisor's attempt cgroup goes under, or why there is none.
+    cgroups: cgroup::Setup,
     state: Mutex<State>,
     heartbeat: Condvar,
     publisher: Condvar,
@@ -528,8 +552,10 @@ impl<T: Transport> Coordinator<T> {
             executor,
             options,
             engine,
+            runner: None,
             host: worker::host(),
             guards: Guards::default(),
+            cgroups: cgroup::Setup::Unavailable("not prepared".into()),
             state: Mutex::new(State {
                 ledger: BTreeMap::new(),
                 taken_up: BTreeSet::new(),
@@ -556,6 +582,18 @@ impl<T: Transport> Coordinator<T> {
 
     fn guarded(mut self, guards: Guards) -> Self {
         self.guards = guards;
+        self
+    }
+
+    /// Launches `runner`, whose hash is this coordinator's engine.
+    fn launching(mut self, runner: Runner) -> Self {
+        self.engine = runner.sha256.clone();
+        self.runner = Some(runner);
+        self
+    }
+
+    fn measured(mut self, cgroups: cgroup::Setup) -> Self {
+        self.cgroups = cgroups;
         self
     }
 
@@ -662,6 +700,21 @@ impl<T: Transport> Coordinator<T> {
     fn wake(&self) {
         self.lock().wake = true;
         self.heartbeat.notify_all();
+    }
+
+    /// The attempts in the ledger whose supervisors are alive: the attempt cgroups in use.
+    fn live_supervisors(&self) -> BTreeSet<String> {
+        self.lock()
+            .ledger
+            .iter()
+            .filter(|(_, entry)| {
+                entry
+                    .supervisor
+                    .as_ref()
+                    .is_some_and(|s| worker::alive(s.pid, &s.start))
+            })
+            .map(|(attempt, _)| attempt.clone())
+            .collect()
     }
 
     /// Takes up this coordinator's attempts from its ledger: results are published, live
@@ -774,6 +827,7 @@ impl<T: Transport> Coordinator<T> {
                 Ok(response) => response,
                 Err(error) => return self.unclaimed(error),
             };
+            self.forget(&response.retire);
             if let Some(attempt) = response.fenced {
                 log(json!({"event":"claim_fenced","executor":self.executor,"attempt":attempt}));
                 // Unless the ledger held it, the key's attempt ended before this coordinator
@@ -842,6 +896,59 @@ impl<T: Transport> Coordinator<T> {
                     self.refuse(&mut state, profile, error);
                 }
             }
+        }
+    }
+
+    /// Deletes what is left here of attempts whose outputs retention deleted on the authority, as
+    /// retire does: renamed out of `attempts/` into `tmp/` (which every start clears) at once,
+    /// deleted off the claim loop. Never an attempt this coordinator holds or held.
+    fn forget(&self, attempts: &[String]) {
+        for attempt in attempts {
+            if !crate::retention::safe_id(attempt) || self.recorded(attempt) {
+                continue;
+            }
+            let directory = self.transport.root().join("attempts").join(attempt);
+            if fs::symlink_metadata(&directory).is_err() {
+                continue;
+            }
+            let aside = self
+                .transport
+                .root()
+                .join("tmp")
+                .join(format!("retention-{attempt}-{}", unique()));
+            let moved = aside
+                .parent()
+                .context("tmp directory")
+                .and_then(|tmp| Ok(fs::create_dir_all(tmp)?))
+                .and_then(|()| {
+                    Ok(crate::retention::set_aside(
+                        &directory,
+                        &aside,
+                        |from, to| fs::rename(from, to),
+                    )?)
+                });
+            // `tmp/` on another filesystem than `attempts/`: deleted where it is.
+            let doomed = match moved {
+                Ok(crate::retention::Aside::Missing) => continue,
+                Ok(crate::retention::Aside::Renamed) => aside,
+                Ok(crate::retention::Aside::CrossDevice) => directory,
+                Err(error) => {
+                    log(
+                        json!({"event":"retention_retire_failed","executor":self.executor,
+                               "attempt":attempt,"error":format!("{error:#}")}),
+                    );
+                    continue;
+                }
+            };
+            let (executor, attempt) = (self.executor.clone(), attempt.clone());
+            thread::spawn(move || match remove_tree(&doomed) {
+                Ok(()) => log(json!({"event":"retention_retired","executor":executor,
+                                     "attempt":attempt})),
+                Err(error) => log(
+                    json!({"event":"retention_retire_failed","executor":executor,
+                                         "attempt":attempt,"error":format!("{error:#}")}),
+                ),
+            });
         }
     }
 
@@ -1071,8 +1178,20 @@ impl<T: Transport> Coordinator<T> {
                 error: None,
             });
         }
+        // The bytes to execute, hashed from the open file that is executed: a runner replaced
+        // since this coordinator started is refused like drifted tools.
+        let runner = self
+            .runner
+            .as_ref()
+            .context("this coordinator has no runner")
+            .and_then(|runner| runner.open(&claim.profile.engine))
+            .map_err(|error| {
+                let error = format!("{error:#}");
+                self.refuse(&mut self.lock(), &claim.profile.id, error.clone());
+                not_started("runtime-mismatch", error)
+            })?;
         let child = self
-            .spawn(attempt)
+            .spawn(attempt, runner)
             .map_err(|error| give_up("launch-failed", format!("{error:#}")))?;
         let pid = child.id();
         // A supervisor that already exited is reported lost by the next poll.
@@ -1100,20 +1219,22 @@ impl<T: Transport> Coordinator<T> {
         Ok(())
     }
 
-    fn spawn(&self, attempt: &str) -> Result<Child> {
+    /// `patchweft-runner _supervise ROOT ATTEMPT --cgroup UNIT` (or `--cgroup-unavailable WHY`),
+    /// from the runner file `launch` checked.
+    fn spawn(&self, attempt: &str, runner: runner::Opened) -> Result<Child> {
         let directory = self.transport.root().join("attempts").join(attempt);
         let log = File::create(directory.join("supervisor.log"))?;
-        Ok(Command::new(std::env::current_exe()?)
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .arg("_supervise")
-            .arg(self.transport.root())
-            .arg(attempt)
-            .stdin(Stdio::null())
-            .stdout(log.try_clone()?)
-            .stderr(log)
-            .process_group(0)
-            .spawn()?)
+        let [flag, value] = self.cgroups.arguments();
+        runner.spawn(
+            &[
+                "_supervise".as_ref(),
+                self.transport.root().as_os_str(),
+                attempt.as_ref(),
+                &flag,
+                &value,
+            ],
+            log,
+        )
     }
 
     /// Transient failures are retried with backoff; any other ends the attempt.
@@ -1504,7 +1625,9 @@ impl<T: Transport> Coordinator<T> {
                     .unwrap_or(Value::Null);
                 CompleteRequest {
                     evidence: json!({"error":"supervisor exited without a result",
-                                     "supervisor":supervisor}),
+                                     "supervisor":supervisor,
+                                     "supervisor_log_tail":log_tail(
+                                         &directory.join("supervisor.log"))}),
                     // Only a command that never started is known to have left nothing behind.
                     drained: !control.join("command-started").exists(),
                     ..base
@@ -1654,7 +1777,8 @@ pub fn run<T: Transport + 'static>(
     guards: Guards,
 ) -> Result<Value> {
     fs::create_dir_all(transport.control().join("ledger"))?;
-    let engine = file_hash(&std::env::current_exe()?)?;
+    let runner = Runner::locate()?;
+    let engine = runner.sha256.clone();
     // MUST-FIX 8: nothing registers while job containers could reach an unlisted listener.
     if let Some(reason) =
         guards.loopback_refusal(&|| live_supervisors(transport.root(), transport.control()))
@@ -1687,6 +1811,18 @@ pub fn run<T: Transport + 'static>(
     if let Some(disk) = &guards.disk {
         disk.start(SystemTime::now())?;
     }
+    // Once, with the executor lock held: a standby never moves while the active one runs.
+    let cgroups = cgroup::prepare_coordinator(options.cgroups);
+    let unit = match &cgroups {
+        cgroup::Setup::Available(unit) => Some(unit.clone()),
+        cgroup::Setup::Unavailable(_) => None,
+    };
+    log(
+        json!({"event":"attempt_cgroups","executor":hello.executor,"cgroups":match &cgroups {
+            cgroup::Setup::Available(unit) => json!({"unit":unit}),
+            cgroup::Setup::Unavailable(why) => cgroup::unavailable(why),
+        }}),
+    );
     let coordinator = Arc::new(
         Coordinator::new(
             transport,
@@ -1695,10 +1831,24 @@ pub fn run<T: Transport + 'static>(
             options,
             engine,
         )
-        .guarded(guards),
+        .guarded(guards)
+        .launching(runner)
+        .measured(cgroups),
     );
     coordinator.verify(&hello.profiles);
-    for attempt in coordinator.reconcile(false)? {
+    let materialize = coordinator.reconcile(false)?;
+    // Before anything is launched: what supervisors killed outright left in the unit.
+    if let Some(unit) = &unit {
+        let live = coordinator.live_supervisors();
+        for mut swept in
+            cgroup::sweep_stale(unit, &live, std::process::id(), Duration::from_secs(2))
+        {
+            swept["event"] = json!("attempt_cgroup_swept");
+            swept["executor"] = json!(hello.executor);
+            log(swept);
+        }
+    }
+    for attempt in materialize {
         coordinator.materialize_later(attempt);
     }
     let heartbeat = {
@@ -1763,6 +1913,8 @@ pub fn recover(store: &mut Store, confirmed: Option<&str>) -> Result<Value> {
             drain: true,
             poll: Duration::from_millis(100),
             heartbeat: Duration::from_secs(1),
+            // Recovery launches no supervisor.
+            cgroups: cgroup::Mode::Off,
         };
         let coordinator = Coordinator::new(
             transport,
@@ -2418,7 +2570,7 @@ impl Disk {
 }
 
 /// Removes a directory tree, including directories a job left read-only.
-fn remove_tree(path: &Path) -> Result<()> {
+pub(crate) fn remove_tree(path: &Path) -> Result<()> {
     match fs::remove_dir_all(path) {
         Ok(()) => return Ok(()),
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
@@ -2722,6 +2874,7 @@ fn socket_address(text: &str) -> Option<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::{Command, Stdio};
 
     #[derive(Debug, Clone)]
     enum Call {
@@ -2794,6 +2947,7 @@ mod tests {
                     claim: None,
                     fenced: None,
                     unverified: vec![],
+                    retire: vec![],
                 }))
         }
         fn renew(&self, request: &RenewRequest) -> Result<RenewResponse, TransportError> {
@@ -2922,6 +3076,7 @@ mod tests {
             drain: true,
             poll: Duration::from_millis(10),
             heartbeat: Duration::from_secs(1),
+            cgroups: cgroup::Mode::Off,
         };
         Coordinator::new(fake, "mindy".into(), 10, options, "e".into())
     }
@@ -3110,6 +3265,30 @@ mod tests {
         // Its job may have left processes or external resources: capacity stays held.
         assert!(!requests[0].drained);
         assert!(!control.join("stop").exists());
+        assert_eq!(requests[0].evidence["supervisor_log_tail"], Value::Null);
+    }
+
+    #[test]
+    fn a_lost_supervisor_carries_the_tail_of_its_log() {
+        let temp = tempfile::tempdir().unwrap();
+        let coordinator = coordinator(fake(temp.path()));
+        let control = launched(&coordinator, "a1", Some(&dead()));
+        let log = format!(
+            "{}{}",
+            "x".repeat(5000),
+            r#"{"error":"unsupported claim version 2"}"#
+        );
+        fs::write(control.parent().unwrap().join("supervisor.log"), &log).unwrap();
+        assert!(coordinator.reconcile(false).unwrap().is_empty());
+        coordinator.publish_queued().unwrap();
+        let requests = completions(&coordinator);
+        assert_eq!(requests[0].outcome, Outcome::Lost);
+        let tail = requests[0].evidence["supervisor_log_tail"]
+            .as_str()
+            .unwrap();
+        assert_eq!(tail.len(), 2048);
+        assert!(log.ends_with(tail));
+        assert!(tail.ends_with(r#"unsupported claim version 2"}"#), "{tail}");
     }
 
     #[test]
@@ -3222,11 +3401,13 @@ mod tests {
                 claim: None,
                 fenced: None,
                 unverified: vec![],
+                retire: vec![],
             },
             ClaimResponse {
                 claim: Some(claim("a1")),
                 fenced: None,
                 unverified: vec![],
+                retire: vec![],
             },
         ]);
         let coordinator = coordinator(fake);
@@ -3260,6 +3441,7 @@ mod tests {
             claim: None,
             fenced: Some(attempt.into()),
             unverified: vec![],
+            retire: vec![],
         }
     }
 
@@ -3361,6 +3543,7 @@ mod tests {
             claim: Some(claim("a1")),
             fenced: None,
             unverified: vec![],
+            retire: vec![],
         });
         let coordinator = coordinator(fake);
         fs::write(
@@ -3398,6 +3581,7 @@ mod tests {
                     claim: Some(claim(attempt)),
                     fenced: None,
                     unverified: vec![],
+                    retire: vec![],
                 });
             assert_eq!(coordinator.claim().unwrap(), Claimed::Retry, "{attempt}");
             assert!(!pending.exists());
@@ -3405,6 +3589,91 @@ mod tests {
         assert!(coordinator.lock().ledger["a2"].registered);
         assert!(!coordinator.lock().ledger.contains_key("a3"));
         assert!(!coordinator.ledger("a3").exists());
+    }
+
+    #[test]
+    fn a_claim_response_retires_what_retention_deleted_and_nothing_held() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake = fake(temp.path());
+        let root = fake.root.clone();
+        for attempt in ["gone", "held", "taken", "ledgered"] {
+            let directory = root.join("attempts").join(attempt);
+            fs::create_dir_all(directory.join("work")).unwrap();
+            fs::write(directory.join("output.log"), "log").unwrap();
+        }
+        fs::create_dir_all(root.join("escape")).unwrap();
+        fake.claims.lock().unwrap().push_back(ClaimResponse {
+            retire: [
+                "gone",
+                "held",
+                "taken",
+                "ledgered",
+                "missing",
+                "..",
+                "../escape",
+            ]
+            .map(String::from)
+            .to_vec(),
+            ..ClaimResponse::default()
+        });
+        let coordinator = coordinator(fake);
+        coordinator
+            .lock()
+            .ledger
+            .insert("held".into(), Entry::new(claim("held"), Phase::Launched));
+        coordinator.lock().taken_up.insert("taken".into());
+        fs::write(
+            coordinator.ledger("ledgered"),
+            serde_json::to_vec(&claim("ledgered")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(coordinator.claim().unwrap(), Claimed::Idle);
+        assert!(!root.join("attempts").join("gone").exists());
+        // Deleted off the claim loop, from `tmp/`, which every start clears.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while fs::read_dir(root.join("tmp")).unwrap().next().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "the retired tree was not deleted"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        for attempt in ["held", "taken", "ledgered"] {
+            assert!(root.join("attempts").join(attempt).exists(), "{attempt}");
+        }
+        assert!(root.join("escape").exists());
+    }
+
+    #[test]
+    fn an_executor_that_predates_retire_ignores_it_and_a_new_one_reads_its_absence() {
+        /// `ClaimResponse` exactly as v29 (main 8531edf) declares it.
+        #[derive(serde::Deserialize)]
+        struct V29ClaimResponse {
+            claim: Option<Claim>,
+            fenced: Option<String>,
+            unverified: Vec<String>,
+        }
+        let response = ClaimResponse {
+            claim: Some(claim("a1")),
+            fenced: None,
+            unverified: vec!["p-ok".into()],
+            retire: vec!["old-1".into(), "old-2".into()],
+        };
+        // As the API sends it and `Remote::executor` decodes it.
+        let wire = json!({"result": response});
+        assert_eq!(wire["result"]["retire"], json!(["old-1", "old-2"]));
+        let old: V29ClaimResponse = serde_json::from_value(wire["result"].clone()).unwrap();
+        assert_eq!(old.claim.unwrap().attempt.id, "a1");
+        assert_eq!(
+            (old.fenced, old.unverified),
+            (None, vec!["p-ok".to_string()])
+        );
+        // A v29 authority's answer: no field, nothing to retire.
+        let v29 = json!({"claim":null,"fenced":"a9","unverified":[]});
+        let new: ClaimResponse = serde_json::from_value(v29.clone()).unwrap();
+        assert!(new.retire.is_empty());
+        // Nothing to retire is not on the wire: such answers are what v29 sent.
+        assert_eq!(serde_json::to_value(&new).unwrap(), v29);
     }
 
     #[test]
@@ -3457,6 +3726,7 @@ mod tests {
             claim: None,
             fenced: None,
             unverified: vec!["p-ok".into(), "p-bad".into(), "p-gone".into()],
+            retire: vec![],
         });
         let coordinator = Arc::new(coordinator(fake));
         assert_eq!(
@@ -3622,6 +3892,7 @@ mod tests {
                 claim: Some(claim("a1")),
                 fenced: None,
                 unverified: vec![],
+                retire: vec![],
             });
         other.store(900, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(coordinator.claim().unwrap(), Claimed::Attempt("a1".into()));
@@ -3642,6 +3913,7 @@ mod tests {
             claim: Some(claim("a1")),
             fenced: None,
             unverified: vec![],
+            retire: vec![],
         });
         let coordinator = coordinator(fake).guarded(Guards {
             min_free: 1,

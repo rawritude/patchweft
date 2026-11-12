@@ -5,3 +5,4 @@ __pycache__/
 *.pyc
 *.credential
 *.pem
+/runner/target/

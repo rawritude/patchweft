@@ -264,8 +264,8 @@ latency guarantees are not implemented.
 
 ## Executors
 
-Each executor runs one coordinator, which launches one supervisor per attempt.
-`worker` is the coordinator of the `local` executor on the store's host; `executor`
+Each executor runs one coordinator, which launches one supervisor per attempt: the runner,
+`patchweft-runner _supervise` (see [the runner](#the-runner)). `worker` is the coordinator of the `local` executor on the store's host; `executor`
 runs a remote one, which reaches the store only through the API. Both claim, renew,
 complete and verify the same way. A second coordinator for the same executor
 waits as a standby until the first exits.
@@ -299,10 +299,11 @@ and a denial wins. A remote executor claims nothing until jobs are placed on it
 by name; the local executor admits every job unless given an allowlist. Keep jobs
 that need the API host's network setup, such as browser tests, on `local`.
 
-Profile identity binds runner bytes, declared tool paths and bytes and platform.
-Install the identical binary and tools at the same absolute paths on every host.
-A coordinator verifies each profile before claiming its work and again before
-launching; a profile that does not match is refused and listed under
+Profile identity binds the runner's bytes, declared tool paths and bytes and platform.
+Install the identical runner and tools at the same absolute paths on every host (see
+[the runner](#the-runner)). A coordinator verifies each profile before claiming its
+work and again before launching, the second time from the runner file it then
+executes; a profile that does not match is refused and listed under
 `observed.refused` by `patchweft executors`, with `verified`, `last_seen`, the
 reported memory limit and free disk.
 
@@ -391,6 +392,129 @@ is recorded and it has drained, its job trees (`work/`, `scratch/`, `home/`) are
 `worker` sweeps any drained attempt that still has them when it starts. Logs of a
 remote attempt are available only after it completes.
 
+### Attempt cgroups
+
+Each attempt runs in its own cgroup v2, and its evidence records what the kernel measured there,
+so reservations can be set from measured peaks. Nothing is enforced: no `memory.max`, no CPU
+limit; `memory_mb` stays an admission unit.
+
+The work is split as the binaries are. The coordinator (`patchweft worker` or `executor`)
+prepares the executor unit's cgroup once at start and hands the result to every runner it
+launches; the runner (`patchweft-runner`) enters the attempt's own cgroup, measures it and writes
+the numbers into the evidence. The measuring is part of the runner's bytes, so changing it is a
+runner release ([the runner](#the-runner)); the preparation is not.
+
+**Setup, per host.** The coordinator's user unit needs a drop-in, applied as the executor account
+(no sudo):
+
+| Host | Unit | Drop-in |
+|---|---|---|
+| mauve | `patchweft-worker` (local) | `~/.config/systemd/user/patchweft-worker.service.d/cgroups.conf` |
+| each remote executor host | `patchweft-executor` | `~/.config/systemd/user/patchweft-executor.service.d/cgroups.conf` |
+
+```ini
+[Service]
+Delegate=memory pids
+DelegateSubgroup=coordinator
+```
+
+Then `systemctl --user daemon-reload` and restart the unit, drained. `DelegateSubgroup=` needs
+systemd 254 or later (`systemctl --version`): mauve and mindy run 259, pw-robin 255. The hosts
+run cgroup v2 with `memory pids` in `user@1001.service`'s `cgroup.subtree_control`. Check with
+`systemctl --user show patchweft-executor -p Delegate -p DelegateSubgroup` and
+`cat /proc/$(systemctl --user show -p MainPID --value patchweft-executor)/cgroup`, which must end in
+`/coordinator`.
+
+**How it works.** At start the coordinator finds its unit's cgroup from `/proc/self/cgroup`. It
+must be delegated: either the coordinator started in `<unit>/coordinator`, where systemd puts it
+only for a delegated unit with `DelegateSubgroup=coordinator`, or the unit's cgroup carries
+systemd's `user.delegate`/`trusted.delegate` mark (systemd 255's user manager sets none, so the
+drop-in's second line is what proves delegation there). A coordinator started in the unit's own
+cgroup moves itself into `<unit>/coordinator`. It then writes `+memory +pids` to the unit's
+`cgroup.subtree_control`. Never `+cpu`: the cpu controller would share CPU between attempts by
+their equal `cpu.weight`, which changes how they are scheduled, and this measures only. Without
+it every cgroup still has `cpu.stat` (`usage_usec`) and `cpu.pressure`, which is what is read. It
+logs `{"event":"attempt_cgroups",…}` with the unit, or why not, and passes the result to each
+runner it launches: `patchweft-runner _supervise ROOT ATTEMPT --cgroup UNIT`, or
+`--cgroup-unavailable WHY`. A runner given neither records `not passed by the coordinator`; it
+refuses any other argument. Once registered, each runner creates `<unit>/attempt-<id>`, moves
+itself there before the job's preparation, samples `memory.stat` every 5 seconds, and at the end,
+after the job's processes and its cleanup are gone, reads the counters, moves back to
+`<unit>/coordinator`, confirms from `/proc/self/cgroup` that it left, kills what is left and
+removes the attempt's cgroup.
+
+The `coordinator` leaf is why `DelegateSubgroup=` is needed and not just tidy. Once the unit's
+subtree enables a controller, cgroup v2 lets no process join the unit's own cgroup (`EBUSY`). With
+`KillMode=process`, supervisors outlive a coordinator restart in their attempt cgroups, so systemd
+could not start the new coordinator in the unit's cgroup; with `DelegateSubgroup=coordinator` it
+starts it in the leaf.
+
+`--attempt-cgroups auto|off` on `worker` and `executor` (default `auto`). `off`, an undelegated
+unit, a missing memory controller, or any failure of the runner to create or enter the attempt's
+cgroup records
+`"cgroup": {"unavailable": "<why>"}` and the job runs exactly as without cgroups: measuring never
+fails, refuses or delays a job.
+
+**Evidence.** Every attempt whose supervisor got past registration has `evidence.cgroup`:
+
+```json
+"cgroup": {
+  "memory_peak_bytes": 162656256, "swap_peak_bytes": 0,
+  "noncache_peak_bytes": 161792000, "noncache_peak_at_seconds": 4.87,
+  "noncache_formula": "anon + shmem + kernel",
+  "seconds_above_90pct": 5.0, "reservation_mb": 128, "sample_seconds": 5.0, "samples": 3,
+  "oom": 0, "oom_kill": 0, "cpu_usec": 1458331, "pids_peak": 5,
+  "memory_pressure_full_usec": 0, "cpu_pressure_some_usec": 4306,
+  "includes_supervisor": true
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `memory_peak_bytes` | `memory.peak`: the most the cgroup was charged, **page cache included**. A job that unpacks or reads many files shows gigabytes here; do not size reservations from it. |
+| `swap_peak_bytes` | `memory.swap.peak` where the kernel has it, else null. Swapped memory is missing from `memory.peak`. |
+| `noncache_peak_bytes` | The highest sampled `anon + shmem + kernel` from `memory.stat` (`anon + shmem + kernel_stack + slab + percpu + sock` on kernels without `kernel`; `noncache_formula` says which). What a reservation must cover. `kernel` includes reclaimable slab (dentries, inodes), so a job touching many files carries some of that. |
+| `noncache_peak_at_seconds` | When that peak was sampled, in seconds from the command's start; negative when it came during preparation (checkout, dependency copies), and from the cgroup's entry when the command never started. |
+| `seconds_above_90pct` | Seconds with non-cache memory at or above 90% of the job's `memory_mb`, to one sample interval: each sample at or above counts the interval since the previous one. A spike reads about 5, a plateau its length. Null when the reservation is 0. |
+| `reservation_mb`, `sample_seconds`, `samples` | The reservation the 90% mark is from, the interval and the number of successful samples. |
+| `oom`, `oom_kill` | `memory.events`: times the cgroup hit a limit and processes the OOM killer killed in it (a host-wide OOM kill of one of its processes counts too). |
+| `cpu_usec` | `cpu.stat` `usage_usec`: CPU time used (present without the cpu controller). |
+| `pids_peak` | `pids.peak` where present: most tasks (threads included) at once. |
+| `memory_pressure_full_usec` | `memory.pressure` `full total=`: microseconds every task of the cgroup stalled on memory. |
+| `cpu_pressure_some_usec` | `cpu.pressure` `some total=`: microseconds some task waited for a core, what stretches durations on a loaded host. |
+| `leftover_pids` | Present only when processes were still in the cgroup after the job, its cleanup and the supervisor's own kill of its descendants: `{"count": N, "pids": [first 10]}`. They are killed with `cgroup.kill` (by pid on kernels before 5.14). |
+| `leftover_after_kill` | Present only when some were still there 2 seconds after the kill. |
+| `errors` | Present only when leaving or removing the cgroup failed. A supervisor that could not leave (its unit has no `coordinator` leaf) never writes `cgroup.kill`, which would end it too: it kills the leftovers by pid and says so here. |
+
+Unreadable or missing files give null. A job with `"uses_containers": true` (Profiles) also gets
+`"containers_unmeasured": true`. The runner removes the attempt's cgroup with any child cgroups
+its job made in it, deepest first, as a coordinator's sweep removes a stale one.
+
+**Not measured or enforced.**
+- *Container memory.* Containers under rootless Docker are charged to Docker's own user service,
+  not to the attempt; the attempt's numbers are the job's own processes alone. Take such jobs'
+  real peak from elsewhere until the daemon's cgroup parent is set per job.
+- *Supervisor overhead is included, not excluded.* The runner runs in the attempt's cgroup
+  with the job, so the numbers include it (a few MiB, and its threads in `pids_peak`), as well as
+  the attempt's preparation (checkout, dependency copies, mostly page cache) and its external
+  cleanup. Putting the job alone in a child cgroup would need the move between `fork` and `exec`
+  and would miss the preparation and cleanup the attempt also costs the host.
+- *Spikes shorter than the 5-second sampling* are missed by `noncache_peak_bytes` (never by
+  `memory_peak_bytes`).
+- *Attempts that never ran:* a supervisor stopped before registration, or a launch that failed in
+  the coordinator, has no `cgroup` field.
+- *A supervisor killed outright* (SIGKILL) leaves its attempt's cgroup behind, with any orphan of
+  its job in it, until the next coordinator starts: once its ledger is taken up and before it
+  launches anything, it kills what is in each `<unit>/attempt-<id>` whose supervisor is not
+  alive (`cgroup.kill`), removes the cgroup and logs `{"event":"attempt_cgroup_swept",…}` with
+  the count of pids. A live attempt's cgroup is never touched. Supervisors from before v30 (the
+  scheduler's own `_supervise`) run in no attempt cgroup; drain them at the cutover.
+- *A job can leave its cgroup.* A job runs as the executor's own uid, and the unit's cgroups are
+  that uid's, so a job can write its pid into `<unit>/coordinator/cgroup.procs` (or anywhere else
+  in the unit) and run on unmeasured, out of reach of the attempt's `cgroup.kill`. The trust model
+  does not cover this: jobs are trusted not to work against the executor that runs them, and the
+  cgroups measure cooperating jobs, they do not contain hostile ones.
+
 ## Failure and recovery
 
 `cancel ACTION_ID --owner NAME` detaches that owner's interests. The last
@@ -467,8 +591,9 @@ receipts belong together. Retain a copy of the exact runner binary and profile
 toolchain. Restore into a separate directory and inspect it before resuming.
 
 There is no automatic database migration or rolling-upgrade protocol. Back up
-before changing binaries. Profile and job identity bind runner bytes, so
-re-register profiles after changing the runner. Do not mix versions against a
+before changing binaries. Profile and job identity bind the runner's bytes, so
+re-register profiles after changing the runner; a release that keeps the runner
+unchanged keeps every profile (see [the runner](#the-runner)). Do not mix versions against a
 live store. Host power-loss recovery and backup/restore under arbitrary failures
 have not been established by the included tests.
 
@@ -491,14 +616,239 @@ promotion checks them against their original key. They are never shared or
 retained, so the first run of each profile after an upgrade executes every job.
 
 Logs, revisions, events, attempts and artifacts are retained in the store.
-`serve` deletes uploads nobody consumed within 24 hours; other automatic retention
-and garbage collection are not implemented. Monitor disk space. Deleting files
-inside the state store can invalidate evidence or replay; there is no supported
-selective pruning command. Nothing prunes the store, on NG's hosts or elsewhere. A future pruner
-is handed off and gated on its own, and may delete only an attempt's directory that is drained,
-past its retention, and neither a dependency of a live action nor a reused result: `logs` reads
-`attempts/<id>/output.log`, and a `local` claim reads its dependencies' artifacts from
-`attempts/<producer>/artifacts`.
+`serve` deletes uploads nobody consumed within 24 hours. Old attempts' logs and artifacts go only
+under [retention](#retention), which is off by default; nothing else prunes the store, and
+revisions, events and attempt rows are never deleted. Monitor disk space. Deleting files inside
+the state store by hand can invalidate evidence or replay.
+
+### Retention
+
+`patchweft --state DIR retention --days N` turns on attempt-store retention: the authority deletes
+the logs and artifacts (the whole `attempts/<id>` directory) of attempts that ended more than N
+days ago and that nothing can use any more. N is at least 30, since job logs are read up to three
+weeks back; `--days 0` turns it off again. With no setting, which is the default, nothing is ever
+deleted. The setting is store state with an `executor.retention` event, like `reserve` and `share`.
+
+`patchweft --state DIR retention --days N --dry` deletes and records nothing. It lists what N
+days would delete now, with its bytes, per executor and per job, split by the passed-key rule
+below: `reused_key` (used within N days, kept), `unused_key` (retires with its attempt) and
+`no_key`. Run it before setting N.
+
+An attempt's outputs go only when it has drained, ended more than N days ago, and is none of
+these (the `kept` reasons):
+
+- `reused_key`: the passing attempt behind a passed key used within N days. Every request that
+  resolves to a key records a use: created, reused, shared or retained. Keys from before v30
+  count as used when they were created, or at their latest recorded reuse when that is later, and a
+  key a v29 binary reused after a rollback counts as used at that reuse once v30 runs again. A key
+  unused for N days retires with its attempt: it is never reused again, so an identical request
+  runs cold, but receipts that reused it still read it.
+- `live_dependency`: an artifact source of a queued, running or stopping action. A `local` claim
+  reads its dependencies' artifacts from `attempts/<producer>/artifacts`.
+- `open_candidate`: an attempt of an action a candidate still open requires.
+- `frontier`: an attempt of an action the validated frontier requires, or one its certificate
+  names.
+- `action_key`: the passing attempt of an `exact` or `files` job, which a request shares by its
+  action key. A pass whose outputs retention deleted (by an older rule, or by hand) is never
+  shared: the request runs the job again.
+- `unreadable_profile`: the passing attempt of an action whose profile this binary cannot parse
+  (one a later binary registered, say): it may be an `exact` or `files` job, so it is kept.
+
+Only `serve` deletes, in its maintenance loop, at most once an hour by the store's clock, and on
+its own thread, so deleting many trees never delays lease expiry. One transaction marks the
+attempts and retires their unused keys; their directories are renamed aside and deleted after it
+commits (deleted in place when the rename crosses filesystems, `EXDEV`), and a removal that fails
+is retried next round. Each round logs and records `retention.deleted` with counts, bytes, the
+kept reasons and any failures.
+
+**A clock it cannot trust deletes nothing.** Every cutoff is the clock minus N days, so a clock
+jumped forward would make every key look unused and every attempt old, and the authority's own
+writes at the jumped time (lease expiry runs every second) follow at once, so the store's newest
+record proves nothing. Each round that runs or refuses records its clocks with
+`retention_last_run`: the wall clock, `CLOCK_BOOTTIME` (monotonic, counting suspend) and the boot
+id. The next round compares: the wall clock must have moved as boottime did, within five minutes
+(`RETENTION_CLOCK_SLACK_SECONDS`, 300: NTP slews at most 500 ppm). With no reading from this boot
+(after a reboot, or the first round ever), the anchor is the reading `serve` took at start. It is
+trusted only if the boot began, by that clock (the wall clock less boottime), within a day of the
+newest record from *before* the boot: attempts' `created`, `started` and `ended`, events' `time`
+(other than retention's own) and candidates' `created`. Records from since the boot never count,
+whoever wrote them (a local `worker` may claim before `serve` starts): they carry the very clock
+under test. A store with nothing from before the boot trusts the clock. A last run recorded later
+than the clock is a fault too.
+
+On a fault the round refuses: it deletes and retires nothing, records `retention.refused` with the
+times it compared and logs `{"event":"retention_refused",…}`. It records its own clocks as the
+last run, so the next round checks against them and the hourly gate counts from there, and it
+widens every later cutoff by how far the clock moved (`widened_seconds`). Times recorded around a
+fault may be off by that much either way: a key used while the clock was behind is stamped early,
+so after the clock is corrected it would look unused. Each fault adds its size to the widening,
+which lapses once N days and the widening itself have passed on a clock that agreed with boottime;
+the round's summary and `--dry` carry `widened_seconds` while it holds. `--dry` reports a fault
+under `refused`, and records nothing.
+
+The widening is capped at a year (`WIDENING_CAP_SECONDS`): a clock off by more is a reset (a dead
+RTC battery, a firmware epoch), not a step the store's times can be corrected for. Past the cap
+every round refuses, once an hour, with `cap_seconds` in its `retention.refused`, rather than run
+and delete nothing for decades. Setting the retention again, `retention --days N` with N of 30 or
+more (the same N will do), is the operator accepting the clock as it is: it clears the widening
+and records `cleared_widening_seconds` in its `executor.retention` event. Anything stamped while
+the clock was off is then dated by it, so a key used then may retire. `--days 0` keeps the
+widening.
+
+The attempt row stays, with its evidence, so history, durations and certificates keep
+working; its body gains `deleted_by_retention` and `retention_days`. Reading what is gone says so:
+`logs` (CLI) and the `logs` query answer "deleted by retention after N days" (HTTP 410
+`log_deleted`); the artifact manifest is 410 `artifacts_deleted` and `deliver` refuses. Nothing
+hands out missing artifacts: `--retain-from` a candidate whose outputs were deleted leaves that
+job `not_retained` ("predecessor outputs were deleted by retention"), so it runs again, and `retry`
+of a job whose dependency's outputs were deleted refuses: submit the revision again. The
+`--retain-from` check is made again in the transaction that records the retention, so a round
+that runs between the two still leaves the job `not_retained`.
+
+A remote executor deletes its own copy of an attempt once it is acknowledged and drained (see
+[executors](#executors)); for any `attempts/<id>` still left there, each claim response carries
+`retire`, the ids of that executor's attempts whose outputs the authority deleted, each sent at
+most three times. The coordinator renames each such `attempts/<id>` into `tmp/` (which every start
+clears; across filesystems it deletes it in place) and deletes it off its claim loop, never one
+its ledger holds or held. An executor that
+predates the field ignores it. Retention is all scheduler-side, in `serve` and the coordinator; the
+runner takes no part and never opens the store.
+
+### The runner
+
+Patchweft is two binaries. `patchweft` serves the API, schedules, and coordinates executors. It
+never runs a job: it has no command that executes one. `patchweft-runner` runs jobs. A coordinator
+launches it once per attempt, as `patchweft-runner _supervise ROOT ATTEMPT --cgroup UNIT` (or
+`--cgroup-unavailable WHY`, see [attempt cgroups](#attempt-cgroups)), and it reads only that
+attempt's control files. A profile's `engine` (and every job recipe, through it) is the sha256 of
+the runner, never of `patchweft`, so a scheduler, API or admission change leaves every profile id,
+recipe and passed key as it was.
+
+**Layout.** `patchweft` finds its runner beside itself, in a directory named by the runner's hash:
+
+```text
+<release>/patchweft
+<release>/runner/<sha256>/patchweft-runner
+```
+
+`<release>` is the directory of the running `patchweft` with symlinks resolved, such as
+`~/.local/lib/patchweft/<ver>/` behind `~/.local/bin/patchweft`. `runner/` must hold exactly that one
+hash directory, and the runner's bytes must have the hash it names; otherwise `register`, `submit`,
+`request`, `worker` and `executor` refuse. `--runner PATH`, a global option, names another runner
+file instead (tests use it). `scripts/install-runner.sh <release>` builds the runner and installs it
+there.
+
+**Hash what runs.** A coordinator hashes the runner when it starts, which is the `engine` it
+reports on `patchweft executors` and the one it verifies profiles against. Before each launch it
+copies the runner's bytes into a memfd sealed against any change (`F_SEAL_WRITE`, `F_SEAL_GROW`,
+`F_SEAL_SHRINK`, `F_SEAL_SEAL`), hashes the memfd, refuses the launch unless that hash is the
+claimed profile's engine, and executes that same memfd (`fexecve`), so neither a replacement nor
+an in-place rewrite of the file can change what runs. Its argv[0] is still the runner's path, so
+`ps` shows it by that path; its `/proc/<pid>/exe` reads `/memfd:patchweft-runner (deleted)`. A
+runner replaced since the start is refused like drifted tools: the attempt ends
+`runtime-mismatch`, not started, and the profile is refused on that executor. The runner checks
+itself again before the job, hashing the content of `/proc/self/exe`.
+
+The memfd is made with `MFD_EXEC`, so a host with `vm.memfd_noexec=1` still executes it; a kernel
+before 6.3 refuses that flag with EINVAL, and the memfd is made again without it (memfds are
+always executable there). Under `vm.memfd_noexec=2` no memfd may be executed and every launch
+fails, so leave it at 0 or 1 on executors.
+
+A runner checks a claim's control `version` before anything else in it, so one written by a
+newer coordinator fails as `unsupported claim version N`. A supervisor that ends without a result
+is reported Lost with the last 2 KiB of its `supervisor.log` as `supervisor_log_tail` in the
+evidence, which names such a refusal.
+
+**Building it.** The runner is its own cargo workspace, `runner/`, with its own lockfile
+(`runner/Cargo.lock`). Its member `runner/control` (`patchweft-control`) holds the control-file
+types, job identity and the few helpers both binaries share; `patchweft` depends on it by path. The
+scheduler's dependency bumps and feature unification never reach the runner. Build it with one
+command and no other:
+
+```bash
+scripts/build-runner.sh        # prints the runner's sha256
+```
+
+It builds release, offline and locked, with the toolchain `rust-toolchain.toml` pins, and remaps the
+checkout and the cargo home out of its bytes. It carries no version string, commit or build path.
+No cargo config file may reach the build: it refuses, naming the file, when a `.cargo/config.toml`
+or `.cargo/config` is in `runner/` or any directory above it, or a `config.toml` or `config` in the
+cargo home (`$CARGO_HOME`, default `~/.cargo`); move it aside to build. The cargo home itself is
+used, for its registry. It also passes the release profile explicitly (`opt-level`, `debug`, `lto`,
+`codegen-units`, `panic`, `strip`, `incremental`, as `runner/Cargo.toml` and cargo's defaults have
+them). Cargo runs under `env -i` with only `PATH`, `HOME`, `CARGO_HOME` and `RUSTUP_HOME` from the
+caller, so `CARGO_BUILD_TARGET`, `CARGO_PROFILE_RELEASE_*`, `CARGO_TARGET_<triple>_*`,
+`RUSTC_WRAPPER` and the like never reach it; `CARGO_BUILD_JOBS` is passed on as `--jobs`, which
+does not change the bytes. The sha256 it prints is of the executable cargo reports it just built,
+at `runner/target/release/patchweft-runner`; any other path is refused, so neither it nor
+`scripts/install-runner.sh` can name a stale runner. `scripts/test-runner-cargo-config.sh` checks
+the refusals and the environment, with a stand-in for cargo.
+`scripts/check-runner-reproducible.sh` copies the runner's sources into two different temporary
+directories, builds each with that command under a different job count (`--jobs 1`, then
+`CARGO_BUILD_JOBS`, or 2), and fails unless the two are byte-equal.
+
+**"The old runner unchanged"** means byte-equal to a rebuild from the release's own tree with
+`scripts/build-runner.sh`. Rebuild it and compare the hash with the runner installed now:
+
+- Equal: a scheduler-only release. Install the new `patchweft` in a new release directory with
+  the old runner copied unchanged under its hash. Nothing is registered or repointed, and no job
+  goes cold.
+- Different: a runner release, and cold. Its runner's own sources, `runner/control`, the runner's
+  lockfile or the toolchain changed how jobs run. Upgrade as above: drain, install, re-register,
+  repoint. The rebuild also catches a `patchweft` built against other shared types than the runner
+  installed beside it.
+
+**Restarts.** Executor units run `KillMode=process`: stopping a unit ends its coordinator, not the
+runners it launched, which are in their own process groups. The next coordinator adopts every live
+supervisor from its ledger (`supervisor.json`: pid and start time) and keeps relaying stops and
+leases. So a scheduler-only release restarts `worker`, `executor` and `serve` without ending
+running attempts, as long as each coordinator is back within its executor's lease. Under the
+default `KillMode=control-group`, stopping the unit would kill every attempt.
+
+### Rolling back v30
+
+v30 changes no existing table's shape: it adds tables (`passed_key_uses`, `retired_keys`,
+`retention_deleted`, `retention_retire`) and settings, which v29 ignores, and `passed_keys` keeps
+its shape. So a v29 binary opens a store v30 ran, with these differences:
+
+1. **Clear retention first**, while still on v30: `patchweft --state DIR retention --days 0`.
+   v29 never deletes, but a setting left behind would start deleting again on the next upgrade
+   without anyone deciding it.
+2. **Drain**, as for an upgrade: finish or drain every active attempt, so no v30 runner is left
+   running under a v29 coordinator.
+3. **Profiles.** A v30 profile's `engine` is the runner's sha256, a v29 one's is `patchweft`'s own,
+   so v29 refuses v30 profiles and their queued actions as drifted. v29's own profile, still
+   registered from before the upgrade, is the one to use (grant it again wherever its grants were
+   moved to v30's).
+
+   A profile registered under v30 with a job that sets `"uses_containers": true` does not even
+   parse in v29 (`deny_unknown_fields`), and v29 parses profiles in more places than its queue.
+   Cancelling its queued work is not enough. Under v29, each of these fails with a parse error:
+   - an executor's hello (the profiles it verifies), while any queued action names the profile
+     and the executor is granted it. **Cancel its queued work.**
+   - the `profiles` query, for every principal granted the profile. **Take it out of every
+     policy's `profiles`** (`patchweft policy`).
+   - `patchweft share`, which parses every profile with an action queued *or created in the last
+     seven days*, in any state. **Set shares before rolling back**, or wait seven days after the
+     profile's last action. Shares already set keep applying, because a claim reads the
+     reservation each action recorded.
+   - `status` of a candidate submitted under the profile, its `retry` and `promote`, and
+     `--retain-from` a candidate whose actions ran under it. Plain `patchweft status` fails too,
+     because it reads every candidate, and candidates are never deleted. **There is no way around
+     this one.** Until a rollback to v29 is ruled out, register no profile with
+     `uses_containers`.
+
+   **Registering a profile with `uses_containers` is the point of no return for a v29 rollback.**
+4. **Retired keys run cold.** Keys retention retired are gone from `passed_keys`, so under v29 an
+   identical request runs again instead of reusing.
+5. **No deleted check.** v29 does not know what retention deleted. Once a round has run, do not
+   `--retain-from` a candidate older than the retention, and do not `retry` a job whose
+   dependencies' outputs were deleted: v29 would hand out artifacts that are gone. Submit the
+   revision again instead. `logs` of a deleted attempt fails to read the file instead of saying
+   it was deleted.
+
+The cgroups drop-in can stay: a v29 coordinator starts in `<unit>/coordinator` and its
+supervisors run there with it, unmeasured.
 
 ### Cutover of the lent reserve (lumenloop-ng#4204)
 
@@ -552,7 +902,7 @@ in `job_estimates`, and v27's own rows come first, so its estimates stay sane.
 
 Use the [connection guide](connections.md) for private credential files, TLS,
 roles, receipts and event cursors. The API and `worker` must share the store's
-host, state directory and binary; executors share the binary. Non-loopback HTTP
+host, state directory and binary; executors run the same runner. Non-loopback HTTP
 listeners require TLS.
 
 Source downloads carry the reachable history a client lacks: an executor sends

@@ -5,61 +5,20 @@ use crate::{
     store::{Store, event, insert},
     unique,
 };
-use anyhow::{Context, Result, bail, ensure};
+// Shared with the runner, which checks a job's source out and captures its outputs.
+use anyhow::{Context, Result, ensure};
 use fs2::FileExt;
+pub use patchweft_control::git::{
+    checked, checkout_from, git, git_command, protected, relative_path,
+};
 use rusqlite::{OptionalExtension, params};
 use serde_json::json;
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
-    path::{Component, Path, PathBuf},
-    process::{Command, Output, Stdio},
+    path::{Path, PathBuf},
+    process::Stdio,
 };
-
-pub fn git_command(repo: &Path) -> Command {
-    let mut command = Command::new("/usr/bin/git");
-    command
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .env("LANG", "C.UTF-8")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        // /etc/gitattributes would change checkout bytes outside every declared input (pw#11 gate P3).
-        .env("GIT_ATTR_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .args([
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "commit.gpgsign=false",
-            // Checkouts write the tree's bytes as declared inputs hash them: line-ending conversion
-            // comes only from tracked .gitattributes, which are inputs (pw#11 gate P2-2).
-            "-c",
-            "core.autocrlf=false",
-            "-C",
-        ])
-        .arg(repo);
-    command
-}
-
-pub fn checked(output: Output, operation: &str) -> Result<String> {
-    if !output.status.success() {
-        bail!(
-            "{operation}: {}",
-            String::from_utf8_lossy(&output.stderr)
-                .chars()
-                .take(4000)
-                .collect::<String>()
-        );
-    }
-    Ok(String::from_utf8(output.stdout)?
-        .trim_end_matches('\n')
-        .to_owned())
-}
-
-pub fn git(repo: &Path, args: &[&str]) -> Result<String> {
-    checked(git_command(repo).args(args).output()?, args[0])
-}
 
 pub fn repository(store: &Store, project: &str) -> PathBuf {
     store.root.join("repos").join(project)
@@ -228,37 +187,6 @@ pub fn checkout(store: &Store, revision: &str, destination: &Path) -> Result<()>
     checkout_from(&repository(store, &row.project), &row.commit, destination)
 }
 
-/// Checks `commit` out of whichever repository holds it: the store's, or an executor's mirror.
-pub fn checkout_from(repository: &Path, commit: &str, destination: &Path) -> Result<()> {
-    ensure!(!destination.exists(), "checkout destination exists");
-    // git runs in the destination's parent, where a relative path would mean something else.
-    ensure!(
-        repository.is_absolute() && destination.is_absolute(),
-        "checkout paths must be absolute"
-    );
-    let parent = destination
-        .parent()
-        .context("checkout destination parent")?;
-    let args = [
-        "-c",
-        "protocol.file.allow=always",
-        "clone",
-        "--quiet",
-        "--shared",
-        "--no-checkout",
-    ];
-    checked(
-        git_command(parent)
-            .args(args)
-            .arg(repository)
-            .arg(destination)
-            .output()?,
-        "clone",
-    )?;
-    git(destination, &["checkout", "--quiet", "--detach", commit])?;
-    Ok(())
-}
-
 pub fn workspace(store: &mut Store, revision: &str, owner: &str) -> Result<Workspace> {
     ensure!(!owner.is_empty(), "owner must be nonempty");
     let row = store.revision(revision)?;
@@ -312,30 +240,6 @@ pub fn commit_tree(
         .context("commit stdin")?
         .write_all(format!("{message}\n").as_bytes())?;
     checked(child.wait_with_output()?, "commit-tree")
-}
-
-pub fn protected(path: &Path) -> bool {
-    path.components().any(|c| {
-        let name = c.as_os_str().to_string_lossy();
-        name.starts_with(".env")
-            || name == ".secrets"
-            || name == ".ssh"
-            || name == ".aws"
-            || name == ".git"
-    })
-}
-
-pub fn relative_path(path: &str) -> Result<PathBuf> {
-    let value = PathBuf::from(path);
-    ensure!(
-        !path.is_empty()
-            && value
-                .components()
-                .all(|c| matches!(c, Component::Normal(_))),
-        "paths must be relative without traversal: {path}"
-    );
-    ensure!(!protected(&value), "protected path refused: {path}");
-    Ok(value)
 }
 
 pub fn checkpoint(store: &mut Store, workspace_id: &str, message: &str) -> Result<Revision> {

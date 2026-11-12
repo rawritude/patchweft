@@ -285,6 +285,7 @@ pub struct Api {
 pub fn prepare(store: &Store) -> Result<()> {
     store.db.execute_batch(SCHEMA)?;
     crate::authority::prepare(&store.db)?;
+    crate::retention::prepare(&store.db)?;
     store.db.execute(
         "INSERT OR IGNORE INTO api_settings VALUES ('version','1')",
         [],
@@ -1156,6 +1157,15 @@ fn query_inner(
                     "Log limit must be 1–65536 bytes.",
                 ));
             }
+            if let Some(note) =
+                crate::retention::deleted_note(&store.db, &row.id).map_err(ApiError::internal)?
+            {
+                return Err(ApiError::new(
+                    410,
+                    "log_deleted",
+                    &format!("The log was {note}."),
+                ));
+            }
             let path = store.root.join("attempts").join(&row.id).join("output.log");
             let mut file = File::open(path).map_err(|_| {
                 ApiError::new(404, "log_unavailable", "The log is not available yet.")
@@ -1317,13 +1327,12 @@ fn upload_path(store: &Store, principal: &str, sha256: &str) -> PathBuf {
 }
 pub const MAX_BUNDLE: usize = 1024 * 1024 * 1024;
 pub const MAX_RETAINED_UPLOADS: u64 = 4 * MAX_BUNDLE as u64;
-/// Per artifact or log file, so a result recorded on one host is deliverable from every host.
-pub const MAX_ARTIFACT_BYTES: u64 = MAX_BUNDLE as u64;
-/// Per attempt: artifacts and logs together.
-pub const MAX_ATTEMPT_OUTPUT_BYTES: u64 = MAX_RETAINED_UPLOADS;
-/// A result's artifact manifest, serialized; every host enforces it at capture, so a result that
-/// passes locally is deliverable from a remote executor too (review P2-3).
-pub const MAX_MANIFEST_BYTES: u64 = 12 * 1024 * 1024;
+/// The output limits the runner enforces at capture, shared so the API accepts what it captured.
+pub use patchweft_control::{MAX_ARTIFACT_BYTES, MAX_ATTEMPT_OUTPUT_BYTES, MAX_MANIFEST_BYTES};
+// Per artifact or log file a bundle's size; per attempt what retained uploads may hold.
+const _: () = assert!(
+    MAX_ARTIFACT_BYTES == MAX_BUNDLE as u64 && MAX_ATTEMPT_OUTPUT_BYTES == MAX_RETAINED_UPLOADS
+);
 /// The one limit on JSON either side reads (gate P2-1): `executor/complete` requests, which carry
 /// a manifest twice, and responses such as claims, which inline their dependencies' manifests.
 pub const MAX_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
@@ -1475,12 +1484,17 @@ impl Api {
         }
         let mut store = Store::open(&self.root).map_err(ApiError::internal)?;
         let (principal, scope) = executor(&store, token)?;
-        Ok(authority::claim_for(
-            &mut store,
-            &principal.id,
-            &scope,
-            request,
-        )?)
+        let mut response = authority::claim_for(&mut store, &principal.id, &scope, request)?;
+        // Never fails a claim: the list is sent again on a later one.
+        match crate::retention::retire_list(&mut store, &principal.id) {
+            Ok(retire) => response.retire = retire,
+            Err(error) => eprintln!(
+                "{}",
+                json!({"event":"retention_retire_list_failed","executor":principal.id,
+                       "error":format!("{error:#}")})
+            ),
+        }
+        Ok(response)
     }
 
     pub fn executor_renew(&self, token: &str, request: &RenewRequest) -> ApiResult<RenewResponse> {
@@ -1803,6 +1817,15 @@ fn artifact_manifest(store: &Store, action: &str) -> ApiResult<Value> {
             r.get(0)
         })
         .map_err(ApiError::internal)?;
+    if let Some(note) =
+        crate::retention::deleted_note(&store.db, &attempt).map_err(ApiError::internal)?
+    {
+        return Err(ApiError::new(
+            410,
+            "artifacts_deleted",
+            &format!("The action's artifacts were {note}."),
+        ));
+    }
     let row = store.attempt(&attempt).map_err(ApiError::internal)?;
     let files = row
         .result

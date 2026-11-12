@@ -13,6 +13,11 @@ categories = ["development-tools"]
 name = "patchweft"
 path = "src/main.rs"
 
+# The runner (`runner/`) is its own workspace with its own lockfile, built only by
+# scripts/build-runner.sh. Its member `runner/control` holds the types both binaries share.
+[workspace]
+exclude = ["runner"]
+
 [dependencies]
 anyhow = "1"
 async-stream = "0.3"
@@ -24,7 +29,7 @@ fs2 = "0.4"
 futures-core = "0.3"
 http-body-util = "0.1"
 libc = "0.2"
-quick-xml = "0.37"
+patchweft-control = { path = "runner/control" }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 schemars = "1"

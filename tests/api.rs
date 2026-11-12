@@ -1,3 +1,5 @@
+#[path = "support/runner.rs"]
+mod support;
 use axum::{
     body::Body,
     http::{Request, StatusCode},
@@ -16,6 +18,7 @@ use std::{
     process::Command as Process,
     sync::Arc,
 };
+use support::patchweft;
 use tower::ServiceExt;
 
 // Public synthetic test strings; no deployment credential is loaded by these tests.
@@ -58,6 +61,8 @@ fn git(path: &Path, args: &[&str]) -> String {
 }
 impl Lab {
     fn new() -> Self {
+        // In-process registration and submits check the same runner the CLI launches.
+        patchweft::runner::set_override(support::runner()).unwrap();
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path().join("repo");
         fs::create_dir(&repo).unwrap();
@@ -712,7 +717,7 @@ async fn unavailable_artifacts_are_a_scoped_state_error_and_failed_logs_remain_r
              "artifacts":["report.txt"],"report":{"kind":"command"}}
         ]}).to_string(),
     ).unwrap();
-    let registered = Process::new(env!("CARGO_BIN_EXE_patchweft"))
+    let registered = patchweft()
         .arg("--state")
         .arg(&lab.root)
         .arg("register")
@@ -727,7 +732,7 @@ async fn unavailable_artifacts_are_a_scoped_state_error_and_failed_logs_remain_r
     let profile: Value = serde_json::from_slice(&registered.stdout).unwrap();
     let profile_id = profile["id"].as_str().unwrap();
     let request = |job: &str| {
-        let output = Process::new(env!("CARGO_BIN_EXE_patchweft"))
+        let output = patchweft()
             .arg("--state")
             .arg(&lab.root)
             .args([
@@ -755,7 +760,7 @@ async fn unavailable_artifacts_are_a_scoped_state_error_and_failed_logs_remain_r
     let digest = hash(b"artifact\n");
     for after_execution in [false, true] {
         if after_execution {
-            let output = Process::new(env!("CARGO_BIN_EXE_patchweft"))
+            let output = patchweft()
                 .arg("--state")
                 .arg(&lab.root)
                 .args(["worker", "--drain", "--no-loopback-check"])
@@ -2274,7 +2279,7 @@ fn stale_uploads_and_staging_are_purged() {
 }
 
 fn cli(lab: &Lab, args: &[&str]) -> std::process::Output {
-    Process::new(env!("CARGO_BIN_EXE_patchweft"))
+    patchweft()
         .arg("--state")
         .arg(&lab.root)
         .args(args)

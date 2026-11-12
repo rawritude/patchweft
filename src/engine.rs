@@ -1,13 +1,17 @@
 use crate::{
     authority,
     declared::{self, Declared},
-    file_hash, identity,
+    identity,
     model::*,
-    now, source,
-    store::{Store, event, passed_key_of, prepare_passed_keys, record},
+    now, runner, source,
+    store::{Store, event, passed_key_of, prepare_passed_keys, record, touch_passed_key},
     unique,
 };
+// Job identity is shared with the runner, which recomputes a job's recipe before it runs it.
 use anyhow::{Context, Result, ensure};
+pub use patchweft_control::recipe::{
+    job, platform, recipes_for, tool_identity, verify_runtime_for,
+};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::{
@@ -15,14 +19,6 @@ use std::{
     fs,
     path::Path,
 };
-
-pub fn tool_identity(profile: &Profile) -> Result<BTreeMap<String, String>> {
-    profile
-        .tools
-        .iter()
-        .map(|(name, path)| Ok((name.clone(), file_hash(path)?)))
-        .collect()
-}
 
 pub fn validate_profile(profile: &Profile, capacity: (u32, u32)) -> Result<()> {
     ensure!(
@@ -149,7 +145,8 @@ pub fn register(store: &mut Store, path: &Path) -> Result<RegisteredProfile> {
     }
     validate_profile(&definition, store.capacity()?)?;
     let tools = tool_identity(&definition)?;
-    let engine = file_hash(&std::env::current_exe()?)?;
+    // The runner's bytes, not this binary's: a scheduler-only release keeps every profile id.
+    let engine = runner::Runner::locate()?.sha256;
     let platform = platform();
     let id = profile_id(&definition, &tools, &engine, &platform)?;
     let profile = RegisteredProfile {
@@ -174,10 +171,6 @@ pub fn register(store: &mut Store, path: &Path) -> Result<RegisteredProfile> {
     Ok(profile)
 }
 
-pub fn platform() -> String {
-    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
-}
-
 pub fn profile_id(
     definition: &Profile,
     tools: &BTreeMap<String, String>,
@@ -187,25 +180,9 @@ pub fn profile_id(
     identity(&json!({"definition":definition,"tools":tools,"engine":engine,"platform":platform}))
 }
 
+/// Checks the profile against this host's tools, platform and installed runner.
 pub fn verify_runtime(profile: &RegisteredProfile) -> Result<()> {
-    verify_runtime_for(profile, &file_hash(&std::env::current_exe()?)?)
-}
-
-/// `engine` is the sha256 of the runner binary that will execute the profile's jobs.
-pub fn verify_runtime_for(profile: &RegisteredProfile, engine: &str) -> Result<()> {
-    ensure!(
-        tool_identity(&profile.definition)? == profile.tools,
-        "declared tool bytes changed; register a new profile"
-    );
-    ensure!(
-        engine == profile.engine,
-        "runner binary changed; register a new profile"
-    );
-    ensure!(
-        profile.platform == platform(),
-        "platform changed; register a new profile"
-    );
-    Ok(())
+    verify_runtime_for(profile, &runner::Runner::locate()?.sha256)
 }
 
 pub fn class(profile: &RegisteredProfile) -> &'static str {
@@ -218,104 +195,6 @@ pub fn class(profile: &RegisteredProfile) -> &'static str {
 
 pub fn recipes(profile: &RegisteredProfile) -> Result<BTreeMap<String, String>> {
     recipes_for(profile, JOB_RECIPE)
-}
-
-/// Promote and the worker recompute recorded recipes, so the builder for a tag never changes.
-pub fn recipes_for(profile: &RegisteredProfile, version: &str) -> Result<BTreeMap<String, String>> {
-    ensure!(
-        version == JOB_RECIPE,
-        "unknown job recipe version: {version}"
-    );
-    // Exhaustive destructuring: a new field fails to compile here until it is classified as
-    // identity or as metadata that never reaches a job's execution.
-    let RegisteredProfile {
-        id: _,
-        definition,
-        tools: tool_hashes,
-        engine,
-        platform,
-    } = profile;
-    let Profile {
-        version: _,
-        name: _,
-        certifying: _,
-        tools: tool_paths,
-        environment: profile_environment,
-        jobs,
-        inputs_file,
-    } = definition;
-    // Every tool directory is on every job's PATH, so every tool is part of every recipe.
-    let tools = tool_paths
-        .iter()
-        .map(|(name, path)| {
-            let sha256 = tool_hashes.get(name).context("tool identity missing")?;
-            Ok((name.clone(), json!({"path":path,"sha256":sha256})))
-        })
-        .collect::<Result<BTreeMap<_, _>>>()?;
-    let mut memo: BTreeMap<String, String> = BTreeMap::new();
-    while memo.len() < jobs.len() {
-        let before = memo.len();
-        for job in jobs {
-            let Job {
-                name,
-                command,
-                dependencies,
-                slots,
-                // Reservations: scheduling only, never seen by the job.
-                memory_mb: _,
-                // In the action key, not the recipe (decision D6).
-                timeout_seconds: _,
-                reuse,
-                inputs,
-                // Why reuse is sound; wording is not identity.
-                audit: _,
-                environment: job_environment,
-                artifacts,
-                cleanup,
-                report,
-                export_slots,
-            } = job;
-            let Report {
-                kind,
-                path,
-                minimum,
-                allow_skips,
-            } = report;
-            if memo.contains_key(name) || !dependencies.iter().all(|d| memo.contains_key(d)) {
-                continue;
-            }
-            let mut environment = profile_environment.clone();
-            environment.extend(job_environment.clone());
-            let dependencies: BTreeMap<_, _> = dependencies
-                .iter()
-                .map(|d| (d.clone(), memo[d].clone()))
-                .collect();
-            let mut recipe = json!({
-                "recipe": JOB_RECIPE,
-                "job": name,
-                "command": command,
-                "cleanup": cleanup,
-                "tools": tools,
-                "environment": environment,
-                "report": {"kind":kind,"path":path,"minimum":minimum,"allow_skips":allow_skips},
-                "artifacts": artifacts,
-                "reuse": reuse,
-                "inputs": inputs,
-                "slots": if *export_slots { Some(*slots) } else { None },
-                "dependencies": dependencies,
-                "engine": engine,
-                "platform": platform,
-            });
-            // Only when set, so every recipe recorded under this tag before it existed still holds.
-            if let Some(file) = inputs_file {
-                recipe["inputs_file"] = json!(file);
-            }
-            let recipe = identity(&recipe)?;
-            memo.insert(name.clone(), recipe);
-        }
-        ensure!(memo.len() != before, "profile contains a dependency cycle");
-    }
-    Ok(memo)
 }
 
 pub fn action_key(
@@ -431,15 +310,6 @@ fn legacy_key(
 ) -> Result<String> {
     identity(&json!({"project":project,"profile":profile,"job":job,
                           "inputs":inputs, "dependencies":dependencies}))
-}
-
-pub fn job<'a>(profile: &'a RegisteredProfile, name: &str) -> Result<&'a Job> {
-    profile
-        .definition
-        .jobs
-        .iter()
-        .find(|j| j.name == name)
-        .context("unknown job")
 }
 
 /// The profile's declarations at the revision, read only when one of its jobs is declared.
@@ -582,6 +452,10 @@ fn retainable(
     let Some(evidence) = store.attempt(&attempt)?.result.filter(|_| drained) else {
         return refuse("predecessor obligation has not passed");
     };
+    // Its dependents would be handed artifacts that are gone.
+    if crate::retention::deleted(&store.db, &attempt)?.is_some() {
+        return refuse("predecessor outputs were deleted by retention");
+    }
     if identity.class != class(request.profile) {
         return refuse("evidence class differs");
     }
@@ -626,6 +500,38 @@ fn retainable(
     Ok(Ok(action))
 }
 
+/// What of `retainable` can change between its check and the retention itself: the action still
+/// passed, and retention has not deleted its attempt's outputs. Read in the transaction that
+/// records the retention.
+fn still_retainable(db: &Connection, action: &str) -> Result<Result<(), String>> {
+    let attempt: Option<String> = db
+        .query_row(
+            "SELECT attempt FROM actions WHERE id=? AND state='passed'",
+            [action],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    let Some(attempt) = attempt else {
+        return Ok(Err("predecessor obligation has not passed".into()));
+    };
+    if crate::retention::deleted(db, &attempt)?.is_some() {
+        return Ok(Err("predecessor outputs were deleted by retention".into()));
+    }
+    Ok(Ok(()))
+}
+
+#[cfg(test)]
+type Between = Box<dyn FnOnce(&mut Store)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Runs once between `retainable`'s check and the transaction that retains, as another
+    /// writer could.
+    static BETWEEN_CHECK_AND_RETAIN: std::cell::RefCell<Option<Between>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn request_job(store: &mut Store, request: &mut Requester, name: &str) -> Result<String> {
     if let Some(id) = request.requested.get(name) {
         return Ok(id.clone());
@@ -665,9 +571,25 @@ fn request_job(store: &mut Store, request: &mut Requester, name: &str) -> Result
         None => None,
     };
     if let (Some(outcome), Some(retention)) = (outcome, request.retention.as_mut()) {
+        #[cfg(test)]
+        if outcome.is_ok()
+            && let Some(between) = BETWEEN_CHECK_AND_RETAIN.with(|hook| hook.borrow_mut().take())
+        {
+            between(store);
+        }
+        // Checked again where the interest is recorded: a retention round may have deleted the
+        // predecessor's outputs since `retainable` looked, and the job would run on missing
+        // artifacts.
+        let transaction = store.transaction()?;
+        let outcome = match outcome {
+            Ok(action) => match still_retainable(&transaction, &action.id)? {
+                Ok(()) => Ok(action),
+                Err(reason) => Err(reason),
+            },
+            refused => refused,
+        };
         match outcome {
             Ok(action) => {
-                let transaction = store.transaction()?;
                 transaction.execute("INSERT INTO interests VALUES (?,?,?,1) ON CONFLICT(action,owner,context) DO UPDATE SET active=1",
                                     params![action.id, owner, context])?;
                 event(
@@ -678,6 +600,10 @@ fn request_job(store: &mut Store, request: &mut Requester, name: &str) -> Result
                             "requesting_profile":profile.id,"executed_under":action.profile,
                             "recipe":recipe}),
                 )?;
+                if passed.is_some() {
+                    prepare_passed_keys(&transaction)?;
+                    touch_passed_key(&transaction, &action.id, now())?;
+                }
                 transaction.commit()?;
                 retention.retained.push(name.into());
                 if let Some(reused) = retention.source.reused.get(name)
@@ -689,13 +615,17 @@ fn request_job(store: &mut Store, request: &mut Requester, name: &str) -> Result
                 return Ok(action.id);
             }
             Err(reason) => {
+                drop(transaction);
                 retention.not_retained.insert(name.into(), reason);
             }
         }
     }
     if let Some(passed) = &passed {
         prepare_passed_keys(&store.db)?;
-        if let Some(action) = reusable(&store.db, passed)? {
+        // Looked up inside the transaction that records the use, so retention never retires
+        // the key between the two (it retires keys in its own write transaction).
+        let transaction = store.transaction()?;
+        if let Some(action) = reusable(&transaction, passed)? {
             let reused = Reused {
                 action: action.id.clone(),
                 from_candidate: action
@@ -705,7 +635,6 @@ fn request_job(store: &mut Store, request: &mut Requester, name: &str) -> Result
                     .unwrap_or_default(),
                 from_revision: action.revision.clone(),
             };
-            let transaction = store.transaction()?;
             transaction.execute("INSERT INTO interests VALUES (?,?,?,1) ON CONFLICT(action,owner,context) DO UPDATE SET active=1",
                                 params![action.id, owner, context])?;
             event(
@@ -715,6 +644,7 @@ fn request_job(store: &mut Store, request: &mut Requester, name: &str) -> Result
                 &json!({"candidate":context,"owner":owner,"from":reused.from_candidate,
                         "recipe":recipe,"key":passed}),
             )?;
+            touch_passed_key(&transaction, &action.id, now())?;
             transaction.commit()?;
             request.reused.insert(name.into(), reused);
             request.requested.insert(name.into(), action.id.clone());
@@ -776,6 +706,13 @@ fn request_job(store: &mut Store, request: &mut Requester, name: &str) -> Result
                     }
                 }
                 _ => {
+                    // A pass whose outputs retention deleted is no longer shared: its dependents
+                    // would be handed artifacts that are gone.
+                    if let Some(attempt) = &attempt
+                        && crate::retention::deleted(&transaction, attempt)?.is_some()
+                    {
+                        continue;
+                    }
                     action_id = Some(id);
                     break;
                 }
@@ -814,6 +751,7 @@ fn request_job(store: &mut Store, request: &mut Requester, name: &str) -> Result
         )?;
         if let Some(passed) = &passed {
             transaction.execute("INSERT INTO passed_keys VALUES (?,?)", params![id, passed])?;
+            touch_passed_key(&transaction, &id, action.created)?;
         }
         event(
             &transaction,
@@ -824,6 +762,9 @@ fn request_job(store: &mut Store, request: &mut Requester, name: &str) -> Result
     }
     transaction.execute("INSERT INTO interests VALUES (?,?,?,1) ON CONFLICT(action,owner,context) DO UPDATE SET active=1",
                         params![id, owner, context])?;
+    if shared && passed.is_some() {
+        touch_passed_key(&transaction, &id, now())?;
+    }
     event(
         &transaction,
         if shared {
@@ -1219,6 +1160,20 @@ pub fn retry_owned(
             "attempt still owns capacity; confirmed drain is required"
         );
         let mut action: Action = record(&transaction, "actions", id)?;
+        for dependency in &action.dependencies {
+            let producer: Option<String> = transaction.query_row(
+                "SELECT attempt FROM actions WHERE id=?",
+                [dependency],
+                |r| r.get(0),
+            )?;
+            if let Some(producer) = producer {
+                ensure!(
+                    crate::retention::deleted(&transaction, &producer)?.is_none(),
+                    "{name}'s dependency {dependency} has its outputs deleted by retention; \
+                     submit the revision again"
+                );
+            }
+        }
         if action.identity.is_some() {
             // The retrying candidate's reservation applies, e.g. an OOM fix on a shared action.
             let requirement = Reservation::from(job(&profile, name)?);
@@ -1674,8 +1629,9 @@ mod identity_tests {
         fn build(p: &mut RegisteredProfile) -> &mut Job {
             &mut p.definition.jobs[0]
         }
-        let unchanged: [Edit; 6] = [
+        let unchanged: [Edit; 7] = [
             ("memory_mb", &|p| build(p).memory_mb = 4096),
+            ("uses_containers", &|p| build(p).uses_containers = true),
             ("timeout_seconds", &|p| build(p).timeout_seconds = 7),
             ("profile name", &|p| p.definition.name = "renamed".into()),
             ("certifying", &|p| p.definition.certifying = false),
@@ -1758,15 +1714,32 @@ mod identity_tests {
         assert!(!changed(&|p| p.definition.jobs[1].memory_mb = 1, "build"));
     }
 
+    /// Unset, the field is not in a definition, so no existing profile id moves; set, it is, so a
+    /// profile that sets it is a new profile (its recipes unchanged, above).
+    #[test]
+    fn uses_containers_is_absent_from_a_definition_until_set() {
+        let job: Job = serde_json::from_value(json!({"name":"j","command":["x"]})).unwrap();
+        assert!(!job.uses_containers);
+        assert_eq!(
+            serde_json::to_value(&job).unwrap().get("uses_containers"),
+            None
+        );
+        let job: Job =
+            serde_json::from_value(json!({"name":"j","command":["x"],"uses_containers":true}))
+                .unwrap();
+        assert_eq!(serde_json::to_value(&job).unwrap()["uses_containers"], true);
+    }
+
     #[test]
     fn platform_mismatch_refuses_at_prepare() {
+        runner::stand_in_for_tests();
         let mut profile = RegisteredProfile {
             id: "fixture".into(),
             definition: serde_json::from_value(json!({"version":1,"name":"p",
                 "tools":{},"jobs":[{"name":"j","command":["x"]}]}))
             .unwrap(),
             tools: BTreeMap::new(),
-            engine: file_hash(&std::env::current_exe().unwrap()).unwrap(),
+            engine: runner::Runner::locate().unwrap().sha256,
             platform: platform(),
         };
         verify_runtime(&profile).unwrap();
@@ -1788,6 +1761,7 @@ mod identity_tests {
 
     impl Lab {
         fn new() -> Self {
+            runner::stand_in_for_tests();
             let temp = tempfile::tempdir().unwrap();
             let repo = temp.path().join("repo");
             fs::create_dir(&repo).unwrap();
@@ -1960,6 +1934,7 @@ mod declared_tests {
 
     impl Lab {
         fn new() -> Self {
+            runner::stand_in_for_tests();
             let temp = tempfile::tempdir().unwrap();
             let repo = temp.path().join("repo");
             fs::create_dir(&repo).unwrap();
@@ -2644,6 +2619,235 @@ mod declared_tests {
         assert_eq!(
             check.declared_inputs, None,
             "no passed key, no PATCHWEFT_INPUTS"
+        );
+    }
+
+    fn last_used(lab: &Lab, action: &str) -> Option<f64> {
+        lab.store
+            .db
+            .query_row(
+                "SELECT last_used FROM passed_key_uses WHERE action=?",
+                [action],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    /// Candidates and their uses dated long ago, so only the rule under test keeps anything.
+    fn age(lab: &Lab) {
+        lab.store
+            .db
+            .execute_batch(
+                "UPDATE candidates SET body=json_set(body,'$.created',1.0);
+                 UPDATE passed_key_uses SET last_used=1.0;",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_submit_records_each_passed_keys_use_and_a_retired_key_runs_cold() {
+        let mut lab = Lab::new();
+        let profile = lab.profile();
+        let first = lab.commit(&[(FILE, Some(DECLARATIONS))]);
+        let a = lab.submit(&first, &profile);
+        let solo = a.required["solo"].clone();
+        let created = lab.store.action(&solo).unwrap().created;
+        assert_eq!(
+            last_used(&lab, &solo),
+            Some(created),
+            "a new key is used when made"
+        );
+        assert_eq!(
+            last_used(&lab, &a.required["census"]),
+            None,
+            "census has no key"
+        );
+        lab.pass_all(&a);
+        age(&lab);
+        let revision = lab.commit(&[("README", Some("one"))]);
+        let b = lab.submit(&revision, &profile);
+        assert_eq!(b.required["solo"], solo);
+        let reused = last_used(&lab, &solo).unwrap();
+        assert!(reused >= created, "a reuse is a use");
+        lab.pass_all(&b);
+        crate::retention::set_retention(&mut lab.store, 30).unwrap();
+        lab.store
+            .db
+            .execute(
+                "UPDATE candidates SET body=json_set(body,'$.created',1.0)",
+                [],
+            )
+            .unwrap();
+        let start = now();
+        let kept = crate::retention::round_at(&mut lab.store, start)
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept["kept"]["reused_key"], 3, "{kept}");
+        let attempt = lab.store.action(&solo).unwrap();
+        let attempt: String = lab
+            .store
+            .db
+            .query_row(
+                "SELECT attempt FROM actions WHERE id=?",
+                [&attempt.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            crate::retention::deleted(&lab.store.db, &attempt)
+                .unwrap()
+                .is_none()
+        );
+        // Unused for longer than the retention: the key retires with its attempt.
+        age(&lab);
+        let summary = crate::retention::round_at(&mut lab.store, start + 3600.0)
+            .unwrap()
+            .unwrap();
+        assert!(summary["keys_retired"].as_u64().unwrap() >= 3, "{summary}");
+        assert!(
+            crate::retention::deleted(&lab.store.db, &attempt)
+                .unwrap()
+                .is_some()
+        );
+        let revision = lab.commit(&[("README", Some("two"))]);
+        let c = lab.submit(&revision, &profile);
+        assert_ne!(c.required["solo"], solo, "an identical request runs cold");
+        assert!(c.reused.is_empty());
+        // The receipt that reused it still checks against its key.
+        assert!(passed_key_of(&lab.store.db, &solo).unwrap().is_some());
+        // Retaining from a candidate whose outputs are gone runs cold too.
+        let retained = submit_retaining(
+            &mut lab.store,
+            &first.id,
+            &profile.id,
+            "agent",
+            vec![],
+            Some(&a.id),
+        )
+        .unwrap();
+        assert!(retained.retained.is_empty());
+        assert_eq!(
+            retained.not_retained["solo"],
+            "predecessor outputs were deleted by retention"
+        );
+    }
+
+    #[test]
+    fn retaining_rechecks_retention_where_it_records_the_interest() {
+        let mut lab = Lab::new();
+        let profile = lab.profile();
+        let first = lab.commit(&[(FILE, Some(DECLARATIONS))]);
+        let a = lab.submit(&first, &profile);
+        lab.pass_all(&a);
+        crate::retention::set_retention(&mut lab.store, 30).unwrap();
+        age(&lab);
+        // A round between the check and the retention deletes every pass of `a`.
+        let ran = std::rc::Rc::new(std::cell::Cell::new(false));
+        let observed = std::rc::Rc::clone(&ran);
+        BETWEEN_CHECK_AND_RETAIN.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |store: &mut Store| {
+                let summary = crate::retention::round_at(store, now()).unwrap().unwrap();
+                assert!(summary["attempts"].as_u64().unwrap() > 0, "{summary}");
+                observed.set(true);
+            }))
+        });
+        let retained = submit_retaining(
+            &mut lab.store,
+            &first.id,
+            &profile.id,
+            "agent",
+            vec![],
+            Some(&a.id),
+        )
+        .unwrap();
+        assert!(ran.get(), "the round ran between the two");
+        assert!(retained.retained.is_empty(), "{:?}", retained.retained);
+        assert!(!retained.not_retained.is_empty());
+        for (job, reason) in &retained.not_retained {
+            assert_eq!(
+                reason, "predecessor outputs were deleted by retention",
+                "{job}"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_refuses_a_job_whose_dependency_outputs_retention_deleted() {
+        let mut lab = Lab::new();
+        let profile = lab.profile();
+        let revision = lab.commit(&[(FILE, Some(DECLARATIONS))]);
+        let candidate = lab.submit(&revision, &profile);
+        lab.pass(&candidate.required["prep"]);
+        lab.set(&candidate.required["check"], "failed");
+        let producer: String = lab
+            .store
+            .db
+            .query_row(
+                "SELECT attempt FROM actions WHERE id=?",
+                [&candidate.required["prep"]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        crate::retention::prepare(&lab.store.db).unwrap();
+        lab.store
+            .db
+            .execute(
+                "INSERT INTO retention_deleted VALUES (?,'local',1.0,30,1.0)",
+                [&producer],
+            )
+            .unwrap();
+        let error = retry(&mut lab.store, &candidate.id, &["check".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("deleted by retention"), "{error}");
+        assert_eq!(
+            action_state(&lab.store.db, &candidate.required["check"]).unwrap(),
+            "failed"
+        );
+    }
+
+    /// An `exact` job's pass is shared by its action key, as `still_retainable` would allow a
+    /// retained one: only while retention has not deleted its outputs.
+    #[test]
+    fn an_exact_pass_whose_outputs_retention_deleted_is_not_shared() {
+        let mut lab = Lab::new();
+        let profile = lab.register("pinned", json!([job("pinned", "exact", &[])]));
+        let revision = lab.commit(&[(FILE, Some(DECLARATIONS))]);
+        let a = lab.submit(&revision, &profile);
+        lab.pass_all(&a);
+        let first = a.required["pinned"].clone();
+        // Another profile with the same job, at the same commit: the same action key.
+        let second = lab.register("pinned-b", json!([job("pinned", "exact", &[])]));
+        let b = lab.submit(&revision, &second);
+        assert_eq!(
+            b.required["pinned"], first,
+            "shared while its outputs stand"
+        );
+        let attempt: String = lab
+            .store
+            .db
+            .query_row("SELECT attempt FROM actions WHERE id=?", [&first], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        crate::retention::prepare(&lab.store.db).unwrap();
+        lab.store
+            .db
+            .execute(
+                "INSERT INTO retention_deleted VALUES (?,'local',1.0,30,1.0)",
+                [&attempt],
+            )
+            .unwrap();
+        let third = lab.register("pinned-c", json!([job("pinned", "exact", &[])]));
+        let c = lab.submit(&revision, &third);
+        assert_ne!(
+            c.required["pinned"], first,
+            "its outputs are gone: it runs again"
+        );
+        assert_eq!(
+            action_state(&lab.store.db, &c.required["pinned"]).unwrap(),
+            "queued"
         );
     }
 }

@@ -1,7 +1,8 @@
 use anyhow::{Result, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use patchweft::{
-    api, authority, client, engine, executor, http, mcp, model, source, store::Store, worker,
+    api, authority, client, engine, executor, http, mcp, model, runner, source, store::Store,
+    worker,
 };
 use serde_json::{Value, json};
 use std::{
@@ -23,6 +24,10 @@ const GIB: u64 = 1024 * 1024 * 1024;
 struct Cli {
     #[arg(long, global = true, default_value = ".state")]
     state: PathBuf,
+    /// The runner (`patchweft-runner`) to register profiles for and launch, instead of the one
+    /// installed beside this binary as `runner/<sha256>/patchweft-runner`.
+    #[arg(long, global = true)]
+    runner: Option<PathBuf>,
     #[command(subcommand)]
     command: Operation,
 }
@@ -71,6 +76,15 @@ enum Operation {
         slots: u32,
         #[arg(long)]
         memory_mb: u32,
+    },
+    /// Delete the logs and artifacts of attempts that ended more than N days ago and nothing
+    /// still uses (off by default; 0 clears it; at least 30). `--dry` only lists what N days
+    /// would delete now, with its bytes.
+    Retention {
+        #[arg(long)]
+        days: u32,
+        #[arg(long)]
+        dry: bool,
     },
     /// Replace an existing principal's scope without rotating its credentials.
     Policy {
@@ -181,6 +195,9 @@ enum Operation {
         /// jobs.
         #[arg(long)]
         no_loopback_check: bool,
+        /// A cgroup per attempt, measured into its evidence (`auto`: where the unit is delegated).
+        #[arg(long, value_enum, default_value_t = AttemptCgroups::Auto)]
+        attempt_cgroups: AttemptCgroups,
     },
     /// Run a remote executor's coordinator against an API; --drain exits when all currently
     /// runnable work is finished. A second coordinator for the same work directory waits as a
@@ -213,6 +230,9 @@ enum Operation {
         /// jobs.
         #[arg(long)]
         no_loopback_check: bool,
+        /// A cgroup per attempt, measured into its evidence (`auto`: where the unit is delegated).
+        #[arg(long, value_enum, default_value_t = AttemptCgroups::Auto)]
+        attempt_cgroups: AttemptCgroups,
     },
     /// Register or reconfigure an executor. `local` sets the store's own budget; a remote
     /// executor runs only the jobs placed on it with --allow-job.
@@ -312,9 +332,6 @@ enum Operation {
         #[arg(value_parser=["projects","revisions","workspaces","profiles"])]
         kind: String,
     },
-    /// Supervise one claimed attempt from its control files; never opens the store.
-    #[command(name = "_supervise", hide = true)]
-    Supervise { root: PathBuf, attempt: String },
 }
 
 #[derive(Args)]
@@ -422,7 +439,26 @@ fn remote(connection: &Connection, operation: &RemoteOperation) -> Result<Value>
     Ok(value)
 }
 
+/// `--attempt-cgroups`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum AttemptCgroups {
+    Auto,
+    Off,
+}
+
+impl AttemptCgroups {
+    fn mode(self) -> patchweft::cgroup::Mode {
+        match self {
+            Self::Auto => patchweft::cgroup::Mode::Auto,
+            Self::Off => patchweft::cgroup::Mode::Off,
+        }
+    }
+}
+
 fn run(cli: Cli) -> Result<Value> {
+    if let Some(path) = &cli.runner {
+        runner::set_override(path)?;
+    }
     match &cli.command {
         Operation::Serve {
             listen,
@@ -444,7 +480,6 @@ fn run(cli: Cli) -> Result<Value> {
             connection,
             operation,
         } => return remote(connection, operation),
-        Operation::Supervise { root, attempt } => return worker::supervise(root, attempt),
         Operation::Executor {
             connection,
             work,
@@ -456,6 +491,7 @@ fn run(cli: Cli) -> Result<Value> {
             retain_hours,
             loopback_allow,
             no_loopback_check,
+            attempt_cgroups,
         } => {
             return executor::remote(
                 || connection.open(),
@@ -464,6 +500,7 @@ fn run(cli: Cli) -> Result<Value> {
                     drain: *drain,
                     poll: Duration::from_millis(*poll_ms),
                     heartbeat: Duration::from_secs(*heartbeat_seconds),
+                    cgroups: attempt_cgroups.mode(),
                 },
                 executor::Bounds {
                     min_free: min_free_gb * GIB,
@@ -486,8 +523,7 @@ fn run(cli: Cli) -> Result<Value> {
         Operation::Serve { .. }
         | Operation::Remote { .. }
         | Operation::Mcp { .. }
-        | Operation::Executor { .. }
-        | Operation::Supervise { .. } => unreachable!(),
+        | Operation::Executor { .. } => unreachable!(),
         Operation::Grant {
             policy,
             credential_file,
@@ -515,6 +551,15 @@ fn run(cli: Cli) -> Result<Value> {
             &executor,
             model::Reservation { slots, memory_mb },
         )?,
+        Operation::Retention { days, dry: true } => patchweft::retention::dry_run(
+            &store,
+            &patchweft::retention::Start::read(&store.db)?,
+            days,
+            &patchweft::retention::Clock::read(),
+        )?,
+        Operation::Retention { days, dry: false } => {
+            patchweft::retention::set_retention(&mut store, days)?
+        }
         Operation::Policy { policy } => {
             api::update_policy(&store, serde_json::from_slice(&fs::read(policy)?)?)?
         }
@@ -571,12 +616,14 @@ fn run(cli: Cli) -> Result<Value> {
             min_free_gb,
             loopback_allow,
             no_loopback_check,
+            attempt_cgroups,
         } => executor::local(
             &store,
             executor::Options {
                 drain,
                 poll: Duration::from_millis(poll_ms),
                 heartbeat: Duration::from_secs(heartbeat_seconds),
+                cgroups: attempt_cgroups.mode(),
             },
             executor::Guards {
                 min_free: min_free_gb * GIB,
@@ -652,6 +699,9 @@ fn run(cli: Cli) -> Result<Value> {
         Operation::Events { after } => serde_json::to_value(store.events(after)?)?,
         Operation::Logs { attempt } => {
             let row = store.attempt(&attempt)?;
+            if let Some(note) = patchweft::retention::deleted_note(&store.db, &row.id)? {
+                return Ok(json!({"attempt":row,"output":null,"log":note}));
+            }
             let path = store.root.join("attempts").join(&row.id).join("output.log");
             json!({"attempt":row,"output":fs::read_to_string(path).unwrap_or_default()})
         }

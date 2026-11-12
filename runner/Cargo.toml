@@ -1,0 +1,38 @@
+[package]
+name = "patchweft-runner"
+# Fixed, and never printed: the version is part of the runner's symbol hashes, so a bump would
+# change its bytes. A runner release is told apart by its sha256 alone.
+version = "0.0.0"
+edition = "2024"
+description = "Runs one claimed Patchweft attempt from its control files"
+license = "MIT"
+publish = false
+
+# Its own workspace and lockfile: the scheduler's dependency bumps and feature unification never
+# reach the runner. Build it only with scripts/build-runner.sh. `control` is a member, so cargo
+# hashes its path relative to this directory, not the checkout's absolute path.
+[workspace]
+members = [".", "control"]
+
+[[bin]]
+name = "patchweft-runner"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+libc = "0.2"
+patchweft-control = { path = "control" }
+quick-xml = "0.37"
+serde_json = { version = "1", features = ["float_roundtrip"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true
+
+# The runner hashes its own bytes before every job; unoptimized, that takes seconds.
+[profile.dev.package.sha2]
+opt-level = 3

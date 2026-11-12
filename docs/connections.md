@@ -4,14 +4,15 @@ Patchweft serves HTTP/JSON commands and queries, a resumable event stream, and a
 MCP adapter. All three use the same authenticated application handlers and durable
 mutation receipts. Local administrative commands still open the state store directly.
 The server and the local `worker` must use the same binary, state directory and host;
-remote executors use the same binary on other Linux hosts through the
+remote executors use the same binary and the same runner on other Linux hosts through the
 [executor routes](#executor-routes). Remote clients (`remote` and `mcp`) also build on
 macOS; supervised job execution requires Linux and refuses to start elsewhere.
 
 This is a single-store service for cooperating agents. Its scoped network API does
 not isolate executed code: trusted registered profiles still run with the executing
-account's Unix privileges. Automatic store retention, replication, OAuth
-provisioning and a hostile-code sandbox are not implemented.
+account's Unix privileges. Replication, OAuth provisioning and a hostile-code sandbox
+are not implemented; store retention is an operator setting, off by default
+([retention](operations.md#retention)).
 
 ## Start a connection
 
