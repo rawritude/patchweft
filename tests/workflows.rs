@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     thread,
@@ -2833,8 +2834,17 @@ fn a_scheduler_only_release_restarts_the_coordinator_without_ending_its_attempt(
         .join("runner")
         .join(sha256(support::runner()))
         .join("patchweft-runner");
+    // It runs from a sealed memfd of the runner's bytes; argv[0] names the runner for `ps`.
     assert_eq!(
         fs::read_link(format!("/proc/{pid}/exe")).unwrap(),
+        Path::new("/memfd:patchweft-runner (deleted)")
+    );
+    let executing = sha256(Path::new(&format!("/proc/{pid}/exe")));
+    assert_eq!(executing, sha256(support::runner()));
+    let cmdline = fs::read(format!("/proc/{pid}/cmdline")).unwrap();
+    let argv0 = cmdline.split(|b| *b == 0).next().unwrap();
+    assert_eq!(
+        Path::new(std::ffi::OsStr::from_bytes(argv0)),
         runner.canonicalize().unwrap()
     );
     coordinator.kill().unwrap();

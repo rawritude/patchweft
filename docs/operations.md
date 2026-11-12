@@ -779,8 +779,8 @@ its shape. So a v29 binary opens a store v30 ran, with these differences:
    running under a v29 coordinator.
 3. **Profiles.** A v30 profile's `engine` is the runner's sha256, a v29 one's is `patchweft`'s own,
    so v29 refuses v30 profiles and their queued actions as drifted. v29's own profile, still
-   registered from before the upgrade, is the one to use: grant it again where v30's took its
-   place. A profile registered under v30 with `"uses_containers": true` does not even parse in v29
+   registered from before the upgrade, is the one to use (grant it again wherever its grants were
+   moved to v30's). A profile registered under v30 with `"uses_containers": true` does not even parse in v29
    (`deny_unknown_fields`): cancel or resubmit its queued work before rolling back.
 4. **Retired keys run cold.** Keys retention retired are gone from `passed_keys`, so under v29 an
    identical request runs again instead of reusing.

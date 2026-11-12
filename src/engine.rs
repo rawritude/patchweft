@@ -522,10 +522,13 @@ fn still_retainable(db: &Connection, action: &str) -> Result<Result<(), String>>
 }
 
 #[cfg(test)]
+type Between = Box<dyn FnOnce(&mut Store)>;
+
+#[cfg(test)]
 thread_local! {
     /// Runs once between `retainable`'s check and the transaction that retains, as another
     /// writer could.
-    static BETWEEN_CHECK_AND_RETAIN: std::cell::RefCell<Option<Box<dyn FnOnce(&mut Store)>>> =
+    static BETWEEN_CHECK_AND_RETAIN: std::cell::RefCell<Option<Between>> =
         const { std::cell::RefCell::new(None) };
 }
 
