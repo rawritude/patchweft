@@ -706,6 +706,13 @@ fn request_job(store: &mut Store, request: &mut Requester, name: &str) -> Result
                     }
                 }
                 _ => {
+                    // A pass whose outputs retention deleted is no longer shared: its dependents
+                    // would be handed artifacts that are gone.
+                    if let Some(attempt) = &attempt
+                        && crate::retention::deleted(&transaction, attempt)?.is_some()
+                    {
+                        continue;
+                    }
                     action_id = Some(id);
                     break;
                 }
@@ -2794,6 +2801,50 @@ mod declared_tests {
         assert_eq!(
             action_state(&lab.store.db, &candidate.required["check"]).unwrap(),
             "failed"
+        );
+    }
+
+    /// An `exact` job's pass is shared by its action key, as `still_retainable` would allow a
+    /// retained one: only while retention has not deleted its outputs.
+    #[test]
+    fn an_exact_pass_whose_outputs_retention_deleted_is_not_shared() {
+        let mut lab = Lab::new();
+        let profile = lab.register("pinned", json!([job("pinned", "exact", &[])]));
+        let revision = lab.commit(&[(FILE, Some(DECLARATIONS))]);
+        let a = lab.submit(&revision, &profile);
+        lab.pass_all(&a);
+        let first = a.required["pinned"].clone();
+        // Another profile with the same job, at the same commit: the same action key.
+        let second = lab.register("pinned-b", json!([job("pinned", "exact", &[])]));
+        let b = lab.submit(&revision, &second);
+        assert_eq!(
+            b.required["pinned"], first,
+            "shared while its outputs stand"
+        );
+        let attempt: String = lab
+            .store
+            .db
+            .query_row("SELECT attempt FROM actions WHERE id=?", [&first], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        crate::retention::prepare(&lab.store.db).unwrap();
+        lab.store
+            .db
+            .execute(
+                "INSERT INTO retention_deleted VALUES (?,'local',1.0,30,1.0)",
+                [&attempt],
+            )
+            .unwrap();
+        let third = lab.register("pinned-c", json!([job("pinned", "exact", &[])]));
+        let c = lab.submit(&revision, &third);
+        assert_ne!(
+            c.required["pinned"], first,
+            "its outputs are gone: it runs again"
+        );
+        assert_eq!(
+            action_state(&lab.store.db, &c.required["pinned"]).unwrap(),
+            "queued"
         );
     }
 }

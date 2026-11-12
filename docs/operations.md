@@ -647,7 +647,10 @@ these (the `kept` reasons):
 - `frontier`: an attempt of an action the validated frontier requires, or one its certificate
   names.
 - `action_key`: the passing attempt of an `exact` or `files` job, which a request shares by its
-  action key.
+  action key. A pass whose outputs retention deleted (by an older rule, or by hand) is never
+  shared: the request runs the job again.
+- `unreadable_profile`: the passing attempt of an action whose profile this binary cannot parse
+  (one a later binary registered, say): it may be an `exact` or `files` job, so it is kept.
 
 Only `serve` deletes, in its maintenance loop, at most once an hour by the store's clock, and on
 its own thread, so deleting many trees never delays lease expiry. One transaction marks the

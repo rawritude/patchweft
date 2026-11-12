@@ -8,7 +8,8 @@
 //! - an artifact source of a queued, running or stopping action;
 //! - an attempt of an action a candidate still open requires;
 //! - an attempt of an action the validated frontier requires, or one its certificate names;
-//! - the passing attempt of an `exact` or `files` job, which a request shares by its action key.
+//! - the passing attempt of an `exact` or `files` job, which a request shares by its action key;
+//! - the passing attempt of an action whose profile this binary cannot parse, which may be one.
 
 use crate::{
     authority::LOCAL,
@@ -204,7 +205,9 @@ fn consider(db: &Connection, cutoff: f64) -> Result<Vec<Considered>> {
     // Each passed action's current attempt: the one its dependents are handed.
     let mut passing: BTreeMap<String, String> = BTreeMap::new();
     let mut shareable: BTreeSet<String> = BTreeSet::new();
-    let mut reuse_of: BTreeMap<String, BTreeMap<String, Reuse>> = BTreeMap::new();
+    let mut unreadable: BTreeSet<String> = BTreeSet::new();
+    // Each profile's jobs' reuse; None for a profile this binary cannot parse.
+    let mut reuse_of: BTreeMap<String, Option<BTreeMap<String, Reuse>>> = BTreeMap::new();
     {
         let mut statement = db.prepare(
             "SELECT id, attempt, json_extract(body,'$.profile'), json_extract(body,'$.job')
@@ -223,22 +226,26 @@ fn consider(db: &Connection, cutoff: f64) -> Result<Vec<Considered>> {
             if let (Some(profile), Some(job)) = (profile, job) {
                 if !reuse_of.contains_key(&profile) {
                     let jobs = record::<RegisteredProfile>(db, "profiles", &profile)
+                        .ok()
                         .map(|p| {
                             p.definition
                                 .jobs
                                 .into_iter()
                                 .map(|j| (j.name, j.reuse))
                                 .collect()
-                        })
-                        .unwrap_or_default();
+                        });
                     reuse_of.insert(profile.clone(), jobs);
                 }
-                // A request shares a passed action of these by its action key (`request_job`).
-                if matches!(
-                    reuse_of[&profile].get(&job),
-                    Some(Reuse::Exact | Reuse::Files)
-                ) {
-                    shareable.insert(attempt.clone());
+                match &reuse_of[&profile] {
+                    // Its jobs' reuse is unknown, so any of its passes may be shared: kept.
+                    None => {
+                        unreadable.insert(attempt.clone());
+                    }
+                    // A request shares a passed action of these by its action key (`request_job`).
+                    Some(jobs) if matches!(jobs.get(&job), Some(Reuse::Exact | Reuse::Files)) => {
+                        shareable.insert(attempt.clone());
+                    }
+                    Some(_) => {}
                 }
             }
             passing.insert(attempt, action);
@@ -374,6 +381,8 @@ fn consider(db: &Connection, cutoff: f64) -> Result<Vec<Considered>> {
             Some("frontier")
         } else if shareable.contains(&attempt) {
             Some("action_key")
+        } else if unreadable.contains(&attempt) {
+            Some("unreadable_profile")
         } else {
             None
         };
@@ -1435,6 +1444,45 @@ mod tests {
             assert!(lab.present(attempt) && !lab.deleted(attempt), "{attempt}");
         }
         assert!(!lab.present(&closed) && lab.deleted(&closed));
+    }
+
+    /// A profile row this binary cannot parse (an unknown field, a later binary's) may hold an
+    /// `exact` or `files` job: its passes are kept, never let go as unshareable.
+    #[test]
+    fn a_pass_under_a_profile_it_cannot_parse_is_kept() {
+        let mut lab = Lab::new();
+        let profile = json!({"id":"g","engine":"e","platform":"linux-x86_64","tools":{},
+            "definition":{"version":1,"name":"g","tools":{},"jobs":[
+                {"name":"pinned","command":["sh"],"reuse":"exact","future_field":true}]}});
+        crate::store::insert(lab.db(), "profiles", "g", &profile).unwrap();
+        assert!(record::<RegisteredProfile>(lab.db(), "profiles", "g").is_err());
+        let action = json!({"id":"x","key":"x","revision":"r","profile":"g","job":"pinned",
+            "dependencies":[],"created":OLD});
+        lab.db()
+            .execute(
+                "INSERT INTO actions VALUES ('x','x','passed',NULL,?,?)",
+                params![action.to_string(), OLD],
+            )
+            .unwrap();
+        lab.attempt("x-t", "x", "passed", OLD, LOCAL);
+        // A failed attempt under it is shared by no rule, and goes.
+        lab.attempt("x-0", "x", "failed", OLD, LOCAL);
+        lab.db()
+            .execute("UPDATE actions SET attempt='x-t' WHERE id='x'", [])
+            .unwrap();
+        // The same job under the parseable profile `f` is kept as shareable, a `build` pass not.
+        let pinned = lab.passed("y", "pinned", OLD);
+        let plain = lab.passed("z", "build", OLD);
+        lab.on();
+        let summary = lab.round(now()).unwrap();
+        assert_eq!(
+            summary["kept"],
+            json!({"action_key":1,"unreadable_profile":1}),
+            "{summary}"
+        );
+        assert!(lab.present("x-t") && !lab.deleted("x-t"));
+        assert!(lab.present(&pinned) && !lab.deleted(&pinned));
+        assert!(lab.deleted("x-0") && lab.deleted(&plain));
     }
 
     #[test]
