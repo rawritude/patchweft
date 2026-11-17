@@ -85,8 +85,9 @@ a different command returns HTTP 409. No HTTP connection must stay open while a 
 
 | `op` | Fields | Result / authority |
 |---|---|---|
-| `request` | `revision`, `profile`, `job` | Action; write |
-| `submit` | `revision`, `profile`, optional `requires` candidate IDs, optional `retain_from` candidate of the same revision | Candidate; write, plus a grant for the `retain_from` candidate's profile |
+| `request` | `revision`, `profile`, `job`, optional `admission` preferences | Action; write |
+| `submit` | `revision`, `profile`, optional `requires` candidate IDs, optional `retain_from` candidate of the same revision, optional `admission` preferences | Candidate; write, plus a grant for the `retain_from` candidate's profile |
+| `set_admission` | `project`, `check`, nullable `priority`, increasing `version` | Updates or releases caller-owned check preferences; write |
 | `cancel` | `action` | Detaches only caller's interests; write |
 | `retry` | `candidate`, optional `jobs` | Retries unsuccessful obligations with confirmed drain; write plus caller association |
 | `compose` | `base`, `changes`, `message` | Revision, or durable conflict repair handle; write |
@@ -323,3 +324,38 @@ all blocking capacity; it is not a latency guarantee. Slow request bodies can
 occupy a principal's shared HTTP budget, authentication has its own finite budget,
 and cancellation still waits for an in-progress database writer. Multiple busy
 principals, event polls, storage and host load can also exhaust shared resources.
+
+### Admission preferences
+
+`request` and `submit` accept an optional `admission` object, for example
+`{"check":"review-42","priority":1,"jobs":{"scan":2,"integration":1}}`. The check
+name belongs to the authenticated principal and is bound to one project. Job names
+must exist in the requested profile; check and job priorities are integers from
+-1000 to 1000. Omission preserves the existing request serialization and behavior.
+Use a new idempotency key when adding preferences to a previously submitted request.
+
+Preferences attach in the same transaction as the requested work. Admission orders
+operator owner priority first, then check priority, owner fair share, job priority,
+measured critical path and age. A check cannot outrank an operator's higher-priority
+owner or gain access to reserved capacity. Pending roots carry their preference
+through queued dependencies. Shared actions use the highest check/job pair for each
+interested owner; another owner's preference never transfers to yours. A job with
+a different preference does not backfill beside a blocked head at the same owner
+priority. This conservative rule keeps the preferred head from being delayed.
+
+`{"op":"set_admission","project":"PROJECT","check":"review-42","priority":0,"version":1}`
+changes your check's priority while retaining its job preferences. Set `priority` to
+`null` to release the check's marks, including those on shared actions. Versions
+must increase, starting at 1, and fit a positive signed 64-bit integer. Persist the
+version and request key before sending and reuse both after a lost response. A
+delayed older update is rejected. A released check cannot be revived: use a new
+check name for new work. Release when the check ends or is superseded; completed or
+detached roots stop affecting scheduling automatically. Check tombstones remain to
+fence delayed requests; passed root metadata is reclaimed on later submissions. Failed, canceled and
+interrupted roots retain their marks for explicit retry and automatic drain recovery.
+
+This is scheduling metadata only. It changes no profile, runner, recipe, action or
+candidate identity, reuse or freshness rule, dependency, timeout or running attempt.
+A client decides which checks deserve priority; the engine does not interpret code
+review results. These additive API fields require a scheduler version supporting
+admission preferences. Install that scheduler before enabling clients that send them.

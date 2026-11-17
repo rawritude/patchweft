@@ -119,6 +119,7 @@ impl Lab {
     }
     fn command(&self) -> Command {
         Command::Request {
+            admission: None,
             revision: self.a.clone(),
             profile: self.profile.clone(),
             job: "root".into(),
@@ -231,6 +232,7 @@ fn local_and_api_candidate_submission_share_one_transaction_order() {
             ALICE,
             "submit",
             &Command::Submit {
+                admission: None,
                 revision: lab.a.clone(),
                 profile: lab.profile.clone(),
                 requires: vec![],
@@ -306,6 +308,7 @@ fn principal_scope_covers_replays_dependencies_roles_and_cancellation() {
                 ALICE,
                 "cross",
                 &Command::Submit {
+                    admission: None,
                     revision: lab.a.clone(),
                     profile: lab.profile.clone(),
                     requires: vec![prerequisite.id],
@@ -533,6 +536,7 @@ fn policy_update_keeps_max_pending_when_omitted_and_grant_and_revoke_are_audited
 fn durable_domain_rejection_replays_without_creating_partial_work() {
     let lab = Lab::new();
     let command = Command::Request {
+        admission: None,
         revision: lab.a.clone(),
         profile: lab.profile.clone(),
         job: "absent".into(),
@@ -1078,6 +1082,7 @@ fn shared_candidate_retry_uses_association_without_reviving_other_owners() {
             ALICE,
             "attach",
             &Command::Submit {
+                admission: None,
                 revision: lab.a.clone(),
                 profile: lab.profile.clone(),
                 requires: vec![],
@@ -1144,6 +1149,7 @@ fn admission_counts_actual_leaf_work_and_rolls_back_excess_dependencies() {
     assert_eq!(lab.rows("actions"), 0);
     assert_eq!(lab.rows("api_receipts"), 0);
     let leaf = Command::Request {
+        admission: None,
         revision: lab.a.clone(),
         profile: lab.profile.clone(),
         job: "dep".into(),
@@ -1428,6 +1434,7 @@ fn submit_without_retain_serializes_unchanged() {
     // Pre-upgrade receipts hash this exact serialization; a changed form would turn a replay
     // into an idempotency conflict.
     let submit = Command::Submit {
+        admission: None,
         revision: "r".into(),
         profile: "p".into(),
         requires: vec!["c".into()],
@@ -1488,6 +1495,7 @@ async fn submit_retain_from_is_project_scoped() {
         )
         .unwrap();
     let submit = |source: &str| Command::Submit {
+        admission: None,
         revision: lab.a.clone(),
         profile: granted.clone(),
         requires: vec![],
@@ -2592,4 +2600,201 @@ async fn invalid_have_is_400() {
             .status,
         400
     );
+}
+
+#[test]
+fn admission_preferences_are_atomic_durable_and_outside_candidate_identity() {
+    let lab = Lab::new();
+    let plain: Command =
+        serde_json::from_value(json!({"op":"submit","revision":lab.a,"profile":lab.profile}))
+            .unwrap();
+    let first = lab.api.command(ALICE, "plain-submit", &plain).unwrap();
+    let marked: Command =
+        serde_json::from_value(json!({"op":"submit","revision":lab.a,"profile":lab.profile,
+        "admission":{"check":"check-1","priority":1,"jobs":{"root":2}}}))
+        .unwrap();
+    let result = lab.api.command(ALICE, "marked-submit", &marked).unwrap();
+    assert_eq!(result["status"], 200);
+    assert_eq!(result["result"], first["result"]);
+    assert_eq!(lab.rows("actions"), 2);
+    assert_eq!(lab.rows("admission_roots"), 2);
+    let restarted = Api::open(&lab.root).unwrap();
+    let replay = restarted.command(ALICE, "marked-submit", &marked).unwrap();
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(replay["result"], result["result"]);
+    assert_eq!(lab.rows("admission_roots"), 2);
+    let store = Store::open(&lab.root).unwrap();
+    let actions = result["result"]["required"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|a| store.action(a.as_str().unwrap()).unwrap())
+        .collect::<Vec<_>>();
+    let ranks = patchweft::admission::ranks(&store.db, &actions).unwrap();
+    for action in &actions {
+        assert_eq!(
+            ranks.get(&(action.id.clone(), "api:alice".into())),
+            Some(&(1, 2))
+        );
+    }
+}
+
+#[test]
+fn admission_preferences_reject_unknown_jobs_and_roll_back_queue_limits() {
+    let lab = Lab::new();
+    let command = |jobs: Value| {
+        serde_json::from_value::<Command>(json!({"op":"request","revision":lab.a,
+        "profile":lab.profile,"job":"root","admission":{"check":"one","priority":1,"jobs":jobs}}))
+        .unwrap()
+    };
+    assert_eq!(
+        lab.api
+            .command(ALICE, "unknown", &command(json!({"missing":1})))
+            .unwrap()["status"],
+        409
+    );
+    assert_eq!(lab.rows("actions"), 0);
+    let store = Store::open(&lab.root).unwrap();
+    store
+        .db
+        .execute(
+            "UPDATE api_principals SET body=json_set(body,'$.max_pending',1) WHERE id='alice'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        lab.api
+            .command(ALICE, "limited", &command(json!({"root":1})))
+            .unwrap_err()
+            .status,
+        429
+    );
+    assert_eq!(lab.rows("actions"), 0);
+    let tables: i64 = store
+        .db
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='admission_checks'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(tables, 0);
+}
+
+#[test]
+fn admission_preferences_updates_are_owner_and_project_scoped_and_release_shared_marks() {
+    let lab = Lab::new();
+    let request: Command = serde_json::from_value(
+        json!({"op":"request","revision":lab.a,"profile":lab.profile,"job":"root",
+        "admission":{"check":"same-name","priority":1,"jobs":{"root":3}}}),
+    )
+    .unwrap();
+    let result = lab.api.command(ALICE, "marked", &request).unwrap();
+    assert_eq!(result["status"], 200);
+    let update = |project: &str, priority: Option<i64>, version: u64| Command::SetAdmission {
+        project: project.into(),
+        check: "same-name".into(),
+        priority,
+        version,
+    };
+    assert_eq!(
+        lab.api
+            .command(BOB, "steal", &update(&lab.pa, Some(9), 1))
+            .unwrap_err()
+            .status,
+        403
+    );
+    assert_eq!(
+        lab.api
+            .command(BOB, "unrelated", &update(&lab.pb, Some(9), 1))
+            .unwrap()["status"],
+        409
+    );
+    assert_eq!(
+        lab.api
+            .command(BOB, "clear-own", &update(&lab.pb, None, 1))
+            .unwrap()["status"],
+        200
+    );
+    assert_eq!(lab.rows("admission_roots"), 1);
+    assert_eq!(
+        lab.api
+            .command(ALICE, "lower", &update(&lab.pa, Some(0), 2))
+            .unwrap()["status"],
+        200
+    );
+    let store = Store::open(&lab.root).unwrap();
+    let action = store
+        .action(result["result"]["id"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(
+        patchweft::admission::ranks(&store.db, std::slice::from_ref(&action))
+            .unwrap()
+            .get(&(action.id.clone(), "api:alice".into())),
+        Some(&(0, 3))
+    );
+    assert_eq!(
+        lab.api
+            .command(ALICE, "release", &update(&lab.pa, None, 3))
+            .unwrap()["status"],
+        200
+    );
+    assert_eq!(lab.rows("admission_roots"), 0);
+    assert_eq!(lab.rows("actions"), 2);
+    assert_eq!(
+        patchweft::engine::action_state(&store.db, &action.id).unwrap(),
+        "queued"
+    );
+}
+
+#[test]
+fn admission_preferences_fence_delayed_updates_and_late_requests_after_release() {
+    let lab = Lab::new();
+    let marked: Command = serde_json::from_value(
+        json!({"op":"request","revision":lab.a,"profile":lab.profile,"job":"root",
+        "admission":{"check":"one","priority":1,"jobs":{}}}),
+    )
+    .unwrap();
+    assert_eq!(
+        lab.api.command(ALICE, "initial", &marked).unwrap()["status"],
+        200
+    );
+    let update = |version, priority| Command::SetAdmission {
+        project: lab.pa.clone(),
+        check: "one".into(),
+        version,
+        priority,
+    };
+    assert_eq!(
+        lab.api
+            .command(ALICE, "lower", &update(2, Some(0)))
+            .unwrap()["status"],
+        200
+    );
+    assert_eq!(
+        lab.api.command(ALICE, "late", &update(1, Some(1))).unwrap()["status"],
+        409
+    );
+    assert_eq!(
+        lab.api.command(ALICE, "release", &update(3, None)).unwrap()["status"],
+        200
+    );
+    assert_eq!(
+        lab.api
+            .command(ALICE, "revive", &update(4, Some(1)))
+            .unwrap()["status"],
+        409
+    );
+    assert_eq!(
+        lab.api.command(ALICE, "late-request", &marked).unwrap()["status"],
+        409
+    );
+    assert_eq!(lab.rows("actions"), 2);
+    assert_eq!(lab.rows("admission_roots"), 0);
+    // An acknowledged old receipt still replays, but never re-applies its former boost.
+    assert_eq!(
+        lab.api.command(ALICE, "initial", &marked).unwrap()["replayed"],
+        true
+    );
+    assert_eq!(lab.rows("admission_roots"), 0);
 }

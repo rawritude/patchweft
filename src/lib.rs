@@ -1,3 +1,4 @@
+pub mod admission;
 pub mod authority;
 pub mod cgroup;
 pub mod declared;
