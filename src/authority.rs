@@ -373,12 +373,14 @@ fn held_attempts(db: &Connection, executor: &str) -> Result<Vec<HeldAttempt>> {
 }
 
 /// Admissible work for one of its owners; `select` orders these by priority, fair share,
-/// critical-path rank and age.
+/// check preference, fair share, job preference, critical-path rank and age.
 #[derive(Clone)]
 pub struct Choice {
     pub owner: String,
     /// The owner's scheduling priority.
     pub priority: i64,
+    /// Caller-owned check and job preference, below the operator's owner priority.
+    pub admission: (i64, i64),
     pub action: Action,
     pub reservation: Reservation,
     pub timeout_seconds: u64,
@@ -453,7 +455,7 @@ pub struct Later {
 }
 
 /// The head of one executor's queue: work it may run and could ever fit, ordered by owner
-/// priority, then fair share, then critical-path rank, then age. An unverified head admits
+/// priority, check preference, fair share, job preference, critical-path rank, then age. An unverified head admits
 /// nothing until it is verified, so verification lag never reorders admission.
 pub fn select(
     db: &Connection,
@@ -485,6 +487,7 @@ pub fn select(
         .map(|action| action.profile.clone())
         .collect();
     let priorities = owner_priorities(db)?;
+    let preferences = crate::admission::ranks(db, &queued)?;
     let reserve = applied(reserve(db, &record.id)?, capacity);
     let share = share_state(db, record, (capacity, scope), reserve)?.applied;
     // What a share leaves prioritized work: a prioritized job larger can never run here.
@@ -665,6 +668,10 @@ pub fn select(
                 .optional()?
                 .unwrap_or(0.0);
             let choice = Choice {
+                admission: preferences
+                    .get(&(action.id.clone(), owner.clone()))
+                    .copied()
+                    .unwrap_or_default(),
                 owner,
                 priority,
                 action: action.clone(),
@@ -677,18 +684,18 @@ pub fn select(
             choices.push((priority, served, rank, trusted, choice));
         }
     }
-    // Higher operator priority first (a landing-ready train), then fair share between owners.
-    // Among work of equal fair share (one owner's, or owners not yet served), the job ahead of
-    // the longest chain left: once a train's prepare passes, a slot that frees goes to its long
-    // cross shard, not to short shards queued before it (#4204, train 59). Owners never served
-    // tie on fair share too, so rank decides between them before age. Age never comes before
-    // rank: a superseded train's leftovers, which NG's driver leaves queued under the same owner,
-    // would then go ahead of the new train's longer work. With no history every rank is 0 and the
-    // oldest goes first. A long head that does not fit yet drains its executor for longer
-    // (`claim_for`).
+    // Higher operator priority first, then caller check priority and fair share between owners.
+    // Job preference breaks a fair-share tie before measured critical-path rank.
+    // Among work of equal fair share, prefer the job ahead of the longest remaining chain.
+    // Owners never served tie on fair share too, so rank decides between them before age.
+    // Otherwise older work from a superseded check could delay a newer check's longer chain.
+    // With no history every rank is 0 and the oldest goes first. A long head that does not fit
+    // yet drains its executor for longer (`claim_for`).
     choices.sort_by(|a, b| {
         b.0.cmp(&a.0)
+            .then(b.4.admission.0.cmp(&a.4.admission.0))
             .then(a.1.total_cmp(&b.1))
+            .then(b.4.admission.1.cmp(&a.4.admission.1))
             .then(b.2.total_cmp(&a.2))
             .then(a.4.action.created.total_cmp(&b.4.action.created))
             .then(a.4.owner.cmp(&b.4.owner))
@@ -2020,7 +2027,9 @@ fn backfill(
         }
         let choice = &later.choice;
         let eligible = if choice.priority == head.priority {
-            alone || choice.owner != head.owner
+            // A different preference can pass this head after fair share moves. Do not let
+            // such work occupy capacity beside it without a separate backfill proof.
+            choice.admission == head.admission && (alone || choice.owner != head.owner)
         } else {
             // Below a prioritized head only, short, never ahead of higher work that fits now.
             choice.priority < head.priority
@@ -4931,8 +4940,190 @@ mod tests {
         );
     }
 
-    /// A train (priority 1) whose shard waits on its prepare, beside a lane's eligible job, on
-    /// mindy (8 slots, 8192 MiB). `prepare` is the prepare action's state.
+    fn prefer(store: &Store, owner: &str, check: &str, priority: i64, roots: &[(&str, i64)]) {
+        let actions: Vec<_> = roots
+            .iter()
+            .map(|(id, _)| store.action(id).unwrap())
+            .collect();
+        let preference = crate::admission::Preference {
+            check: check.into(),
+            priority,
+            jobs: actions
+                .iter()
+                .zip(roots)
+                .map(|(a, (_, p))| (a.job.clone(), *p))
+                .collect(),
+        };
+        crate::admission::attach(store, owner, "project-a", &preference, &actions).unwrap();
+    }
+
+    #[test]
+    fn admission_preferences_preserve_train_then_check_then_fair_share_then_job() {
+        let (_root, mut store) = lab();
+        register(&store.db, "executor-a", 6, 4096);
+        for (id, owner, job, created) in [
+            ("old", "alice", "test", 1.0),
+            ("ordinary", "carol", "test", 2.0),
+            ("gate", "alice", "test", 3.0),
+            ("urgent", "alice", "build", 4.0),
+            ("fair", "bob", "test", 5.0),
+            ("train", "train", "test", 6.0),
+        ] {
+            queue(
+                &store.db,
+                Queue {
+                    id,
+                    owner,
+                    job,
+                    created,
+                    ..Queue::default()
+                },
+            );
+        }
+        store
+            .db
+            .execute_batch("INSERT INTO dispatches VALUES ('alice',100),('bob',50)")
+            .unwrap();
+        crate::worker::set_priority(&store, "train", 1).unwrap();
+        prefer(
+            &store,
+            "alice",
+            "ready",
+            1000,
+            &[("gate", 0), ("urgent", 1)],
+        );
+        prefer(&store, "bob", "ready", 1000, &[("fair", 0)]);
+        let mut order = Vec::new();
+        for index in 0..6 {
+            let response = claim_for(
+                &mut store,
+                "executor-a",
+                &Scope::all(),
+                &ask(&format!("p{index}"), &["f-1"]),
+            )
+            .unwrap();
+            order.push(claimed(&response).unwrap().to_owned());
+        }
+        assert_eq!(
+            order,
+            ["train", "fair", "urgent", "gate", "ordinary", "old"]
+        );
+    }
+
+    #[test]
+    fn admission_preferences_inherit_to_dependencies_and_release_only_one_check() {
+        let (_root, store) = lab();
+        for (id, deps) in [
+            ("dep", &[][..]),
+            ("high", &["dep"][..]),
+            ("low", &["dep"][..]),
+        ] {
+            queue(
+                &store.db,
+                Queue {
+                    id,
+                    owner: "alice",
+                    dependencies: deps,
+                    ..Queue::default()
+                },
+            );
+        }
+        prefer(&store, "alice", "high-check", 1, &[("high", 4)]);
+        prefer(&store, "alice", "low-check", 0, &[("low", 7)]);
+        let queued = ["dep", "high", "low"].map(|id| store.action(id).unwrap());
+        let rank = || crate::admission::ranks(&store.db, &queued).unwrap();
+        assert_eq!(rank().get(&("dep".into(), "alice".into())), Some(&(1, 4)));
+        assert!(!rank().contains_key(&("dep".into(), "bob".into())));
+        crate::admission::set(&store, "alice", "project-a", "high-check", None, 1).unwrap();
+        assert_eq!(rank().get(&("dep".into(), "alice".into())), Some(&(0, 7)));
+        store
+            .db
+            .execute("UPDATE interests SET active=0 WHERE action='low'", [])
+            .unwrap();
+        assert!(rank().is_empty());
+    }
+
+    #[test]
+    fn admission_preferences_do_not_grant_operator_reserved_capacity() {
+        let (_root, mut store) = lab();
+        register(&store.db, "executor-a", 5, 4096);
+        set_reserve(&mut store, "executor-a", need((3, 1024))).unwrap();
+        queue(
+            &store.db,
+            Queue {
+                id: "big",
+                owner: "alice",
+                reservation: Some((3, 1024)),
+                ..Queue::default()
+            },
+        );
+        prefer(&store, "alice", "ready", 1000, &[("big", 1000)]);
+        let response = claim_for(
+            &mut store,
+            "executor-a",
+            &Scope::all(),
+            &ask("reserved", &["f-1"]),
+        )
+        .unwrap();
+        assert!(response.claim.is_none());
+        assert_eq!(store.action("big").unwrap().id, "big");
+        assert_eq!(engine::action_state(&store.db, "big").unwrap(), "queued");
+    }
+
+    #[test]
+    fn admission_preferences_survive_interruption_and_resumption_between_submissions() {
+        let (_root, store) = lab();
+        wants(&store, "healing", "alice", 1.0, (1, 512));
+        prefer(&store, "alice", "ready", 1, &[("healing", 2)]);
+        for state in ["interrupted", "canceled", "failed"] {
+            store
+                .db
+                .execute("UPDATE actions SET state=? WHERE id='healing'", [state])
+                .unwrap();
+            let other = format!("other-{state}");
+            wants(&store, &other, "alice", 2.0, (1, 512));
+            prefer(&store, "alice", &other, 0, &[(&other, 0)]);
+            store
+                .db
+                .execute("UPDATE actions SET state='queued' WHERE id='healing'", [])
+                .unwrap();
+            let queued = [store.action("healing").unwrap()];
+            assert_eq!(
+                crate::admission::ranks(&store.db, &queued)
+                    .unwrap()
+                    .get(&("healing".into(), "alice".into())),
+                Some(&(1, 2)),
+                "{state}"
+            );
+        }
+    }
+
+    #[test]
+    fn admission_preferences_hold_back_other_preferences_beside_a_blocked_head() {
+        for (check, job) in [(1, 0), (0, 1)] {
+            let (_root, mut store) = lab();
+            register(&store.db, "worker", 8, 8192);
+            hold(&store.db, "existing", Some("worker"), 6, 6144);
+            wants(&store, "head", "a", 1.0, (4, 4096));
+            wants(&store, "small", "b", 2.0, (1, 1024));
+            prefer(&store, "a", "ready", check, &[("head", job)]);
+            let first = claim_for(
+                &mut store,
+                "worker",
+                &Scope::all(),
+                &ask("blocked", &["f-1"]),
+            )
+            .unwrap();
+            assert!(first.claim.is_none());
+            ends(&store, "existing");
+            let next =
+                claim_for(&mut store, "worker", &Scope::all(), &ask("free", &["f-1"])).unwrap();
+            assert_eq!(claimed(&next), Some("head"));
+        }
+    }
+
+    /// A priority-1 owner's shard waits on preparation beside another owner's eligible job.
+    /// `prepare` is the preparation action's state.
     fn train_beside_lane(
         prepare: &str,
         shard: (u32, u32),
@@ -8476,6 +8667,7 @@ mod tests {
             freed: Vec::new(),
         };
         let choice = |priority: i64| Choice {
+            admission: (0, 0),
             owner: "lane".into(),
             priority,
             action: action(&Queue {

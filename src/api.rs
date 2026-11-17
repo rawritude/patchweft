@@ -57,6 +57,8 @@ pub enum Command {
         revision: String,
         profile: String,
         job: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        admission: Option<crate::admission::Preference>,
     },
     Submit {
         revision: String,
@@ -68,6 +70,17 @@ pub enum Command {
         // Skipped when absent: receipts hash the re-serialized command.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retain_from: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        admission: Option<crate::admission::Preference>,
+    },
+    /// Update or release this principal's own check's admission preferences.
+    SetAdmission {
+        project: String,
+        check: String,
+        /// Null releases the check's preferences; zero keeps its per-job preferences.
+        priority: Option<i64>,
+        /// Strictly increasing per check; delayed older updates cannot restore a boost.
+        version: u64,
     },
     Cancel {
         action: String,
@@ -625,6 +638,10 @@ fn authorize(store: &Store, principal: &Principal, command: &Command) -> ApiResu
                     }
                     Ok(p)
                 }
+                Command::SetAdmission { project: p, .. } => {
+                    project(principal, p)?;
+                    Ok(p.clone())
+                }
                 Command::Cancel { action } => action_project(store, principal, action),
                 Command::Retry { candidate, .. } => {
                     let p = candidate_projects(store, principal, candidate, &mut BTreeSet::new())?;
@@ -874,20 +891,63 @@ fn apply(store: &mut Store, principal: &Principal, command: &Command) -> Result<
             revision,
             profile,
             job,
-        } => serde_json::to_value(engine::request(store, revision, profile, job, &owner)?)?,
+            admission,
+        } => {
+            if let Some(preference) = admission {
+                crate::admission::validate(store, preference, profile)?;
+            }
+            let action = engine::request(store, revision, profile, job, &owner)?;
+            if let Some(preference) = admission {
+                crate::admission::attach(
+                    store,
+                    &owner,
+                    &store.revision(revision)?.project,
+                    preference,
+                    std::slice::from_ref(&action),
+                )?;
+            }
+            serde_json::to_value(action)?
+        }
         Command::Submit {
             revision,
             profile,
             requires,
             retain_from,
-        } => serde_json::to_value(engine::submit_retaining(
-            store,
-            revision,
-            profile,
-            &owner,
-            requires.clone(),
-            retain_from.as_deref(),
-        )?)?,
+            admission,
+        } => {
+            if let Some(preference) = admission {
+                crate::admission::validate(store, preference, profile)?;
+            }
+            let candidate = engine::submit_retaining(
+                store,
+                revision,
+                profile,
+                &owner,
+                requires.clone(),
+                retain_from.as_deref(),
+            )?;
+            if let Some(preference) = admission {
+                let roots = candidate
+                    .required
+                    .values()
+                    .map(|id| store.action(id))
+                    .collect::<Result<Vec<_>>>()?;
+                crate::admission::attach(
+                    store,
+                    &owner,
+                    &store.revision(revision)?.project,
+                    preference,
+                    &roots,
+                )?;
+            }
+            serde_json::to_value(candidate)?
+        }
+        Command::SetAdmission {
+            project,
+            check,
+            priority,
+            version,
+        } => crate::admission::set(store, &owner, project, check, *priority, *version)?,
         Command::Cancel { action } => engine::cancel(store, action, &owner)?,
         Command::Retry { candidate, jobs } => {
             engine::retry_owned(store, candidate, jobs, Some(&owner))?
@@ -1255,6 +1315,9 @@ fn repair_value(store: &Store, id: &str) -> Result<Value> {
 
 fn event_project(store: &Store, row: &Value) -> Result<Option<String>> {
     let kind = row["kind"].as_str().context("event kind")?;
+    if kind.starts_with("admission.") {
+        return Ok(row["detail"]["project"].as_str().map(Into::into));
+    }
     let subject = row["subject"].as_str().context("event subject")?;
     let revision = if kind.starts_with("revision.") {
         Some(subject.to_owned())
